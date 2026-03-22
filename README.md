@@ -28,7 +28,7 @@
 ## 快速开始
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/PPTconvert.git
+git clone https://github.com/BlueSky0329/PPTconvert.git
 cd PPTconvert
 pip install -r requirements.txt
 python main.py
