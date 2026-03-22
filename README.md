@@ -145,6 +145,13 @@ python main.py -i exam.docx --layout grid --font-size 20
 
 ---
 
+## 仓库说明
+
+- 根目录下的 **`*.docx` / `*.pptx`** 默认被 [`.gitignore`](.gitignore) 忽略（避免误提交个人试卷或大体积导出）。`templates/` 中的模板可随仓库分享。
+- 若需公开 **样例 Word**，可放在例如 `examples/sample.docx` 并单独 `git add`。
+
+---
+
 ## 开源协议
 
 本项目以 [MIT License](LICENSE) 发布。
