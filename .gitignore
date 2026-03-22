@@ -1,0 +1,18 @@
+.venv/
+venv/
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.spec.bak
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 根目录下的本地试卷/导出（体积大或含隐私，不纳入仓库；需要分享样例可放到 examples/）
+/*.docx
+/*.pptx

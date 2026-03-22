@@ -1,0 +1,797 @@
+import os
+import threading
+from typing import Optional
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, colorchooser
+
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from ttkbootstrap.scrolled import ScrolledFrame
+
+from core.word_parser import WordParser
+from core.ppt_generator import PPTGenerator, PPTConfig
+from core.ppt_style import parse_hex_color
+from core.models import Question
+from gui.font_data import build_font_values
+from gui import ui_constants as U
+
+_PAD = 14
+
+
+class PPTConvertApp:
+    """Word 转 PPT 图形界面"""
+
+    def __init__(self):
+        self.root = ttk.Window(
+            title=U.APP_TITLE,
+            themename=U.THEME_NAME,
+            size=(960, 840),
+            minsize=(760, 680),
+            resizable=(True, True),
+        )
+        self.root.place_window_center()
+
+        # ── tk vars ──
+        self.word_path = tk.StringVar()
+        self.template_path = tk.StringVar()
+        self.output_path = tk.StringVar()
+        self.use_template = tk.BooleanVar(value=False)
+        self.option_layout = tk.StringVar(value="grid")
+        self.font_size_stem = tk.IntVar(value=20)
+        self.font_size_option = tk.IntVar(value=18)
+
+        self.margin_left = tk.DoubleVar(value=0.8)
+        self.margin_right = tk.DoubleVar(value=0.8)
+        self.margin_top = tk.DoubleVar(value=0.5)
+        self.stem_h_img = tk.DoubleVar(value=1.5)
+        self.stem_h_no = tk.DoubleVar(value=2.5)
+        self.gap_stem = tk.DoubleVar(value=0.2)
+        self.gap_img = tk.DoubleVar(value=0.15)
+        self.gap_opts = tk.DoubleVar(value=0.2)
+        self.stem_align = tk.StringVar(value="left")
+        self.image_align = tk.StringVar(value="center")
+        self.image_max_w = tk.DoubleVar(value=5.0)
+        self.image_max_h = tk.DoubleVar(value=2.5)
+        self.grid_layout = tk.StringVar(value="ab_cd")
+        self.grid_row_h = tk.DoubleVar(value=0.9)
+        self.grid_col_gap = tk.DoubleVar(value=0.15)
+        self.list_row_h = tk.DoubleVar(value=0.7)
+        self.option_align = tk.StringVar(value="left")
+        self.font_name = tk.StringVar(value="微软雅黑")
+        self.stem_bold = tk.BooleanVar(value=True)
+        self.option_letter_bold = tk.BooleanVar(value=True)
+        self.option_text_bold = tk.BooleanVar(value=False)
+        self.color_stem = tk.StringVar(value="#1A1A2E")
+        self.color_option = tk.StringVar(value="#2D2D2D")
+        self.color_letter = tk.StringVar(value="#006BBD")
+        self.one_row_h = tk.DoubleVar(value=0.55)
+        self.one_row_gap = tk.DoubleVar(value=0.06)
+        self.preview_has_image = tk.BooleanVar(value=True)
+
+        self._font_list = build_font_values()
+        self._preview_after: Optional[str] = None
+        self.questions: list[Question] = []
+        self.parser: WordParser | None = None
+
+        self._build_ui()
+        self._bind_preview_updates()
+        self._schedule_preview_refresh()
+
+    # ════════════════════════════════════════════
+    #  UI 构建
+    # ════════════════════════════════════════════
+
+    def _build_ui(self):
+        outer = ttk.Frame(self.root)
+        outer.pack(fill=BOTH, expand=YES)
+
+        self._build_action_bar(outer)
+
+        self._scroll = ScrolledFrame(outer, padding=_PAD, autohide=True)
+        self._scroll.pack(fill=BOTH, expand=YES)
+        try:
+            self._scroll.enable_scrolling()
+        except Exception:
+            pass
+
+        main = self._scroll
+
+        self._build_header(main)
+        self._build_file_section(main)
+        self._build_template_section(main)
+        self._build_config_section(main)
+        self._build_question_table(main)
+
+    # ── header ──
+
+    def _build_header(self, parent):
+        hdr = ttk.Frame(parent, padding=(20, 16, 20, 12))
+        hdr.pack(fill=X, pady=(0, 6))
+
+        top_row = ttk.Frame(hdr)
+        top_row.pack(fill=X)
+        ttk.Label(top_row, text=U.APP_TITLE, font=("", 17, "bold")).pack(side=LEFT)
+        ttk.Label(
+            top_row, text=U.STEP_HINT,
+            font=("", 9), bootstyle="secondary",
+        ).pack(side=RIGHT)
+
+        ttk.Label(
+            hdr, text=U.HERO_SUB,
+            wraplength=880, font=("", 10), bootstyle="secondary",
+        ).pack(anchor=W, pady=(4, 0))
+
+        ttk.Separator(hdr, orient=HORIZONTAL).pack(fill=X, pady=(10, 0))
+
+    # ── 1. files ──
+
+    def _build_file_section(self, parent):
+        frame = ttk.Labelframe(parent, text=" ① 选择文件 ", bootstyle="primary", padding=_PAD)
+        frame.pack(fill=X, pady=(0, 10))
+
+        self._file_row(frame, "Word 文档", self.word_path,
+                       self._browse_word, "浏览…")
+        self._file_row(frame, "输出 PPT", self.output_path,
+                       self._browse_output, "另存为…", pady=(6, 0))
+
+    def _file_row(self, parent, label, var, cmd, btn_text, pady=(0, 0)):
+        row = ttk.Frame(parent)
+        row.pack(fill=X, pady=pady)
+        ttk.Label(row, text=label, width=10).pack(side=LEFT)
+        ttk.Entry(row, textvariable=var).pack(side=LEFT, fill=X, expand=YES, padx=(0, 8))
+        ttk.Button(row, text=btn_text, command=cmd,
+                   bootstyle="outline", width=9).pack(side=RIGHT)
+
+    # ── 2. template ──
+
+    def _build_template_section(self, parent):
+        frame = ttk.Labelframe(parent, text=" ② 模板（可选） ", bootstyle="info", padding=_PAD)
+        frame.pack(fill=X, pady=(0, 10))
+
+        row = ttk.Frame(frame)
+        row.pack(fill=X)
+        ttk.Checkbutton(
+            row, text="使用 .pptx 模板", variable=self.use_template,
+            command=self._toggle_template, bootstyle="round-toggle",
+        ).pack(side=LEFT)
+        self.template_entry = ttk.Entry(row, textvariable=self.template_path, state=DISABLED)
+        self.template_entry.pack(side=LEFT, fill=X, expand=YES, padx=(12, 8))
+        self.template_btn = ttk.Button(
+            row, text="选择…", command=self._browse_template,
+            state=DISABLED, bootstyle="info-outline", width=8,
+        )
+        self.template_btn.pack(side=RIGHT)
+
+        self._tpl_hint = ttk.Label(
+            frame,
+            text=(
+                "勾选后，字号 / 颜色 / 对齐均以模板第一页为准，下方版式设置不生效。\n"
+                "占位方式：在模板第一页放 [题干]、[图片]、[选项A]～[选项D] 文本框；\n"
+                "或按自上而下顺序放 1 个题干 + 4 个选项框。同一框写 A.…D. 会自动拆为 2×2。"
+            ),
+            bootstyle="secondary", font=("", 9), wraplength=860, justify=LEFT,
+        )
+        self._tpl_hint.pack(anchor=W, pady=(8, 0))
+        self._tpl_hint.pack_forget()
+
+    # ── 3. config ──
+
+    def _build_config_section(self, parent):
+        self._config_frame = ttk.Labelframe(
+            parent, text=" ③ 版式与样式（非模板模式） ", bootstyle="primary", padding=(2, 8),
+        )
+        self._config_frame.pack(fill=X, pady=(0, 10))
+
+        self._tpl_overlay_label = ttk.Label(
+            self._config_frame,
+            text="已启用模板 — 版式与样式以模板第一页为准，此处设置不参与生成。",
+            font=("", 10), bootstyle="warning", padding=(16, 12),
+        )
+
+        nb = ttk.Notebook(self._config_frame, bootstyle="primary")
+        nb.pack(fill=X, padx=8, pady=(4, 8))
+        self._config_notebook = nb
+
+        tab_layout = ttk.Frame(nb, padding=10)
+        tab_options = ttk.Frame(nb, padding=10)
+        tab_font = ttk.Frame(nb, padding=10)
+        tab_preview = ttk.Frame(nb, padding=10)
+        nb.add(tab_layout, text=" 布局 ")
+        nb.add(tab_options, text=" 选项排列 ")
+        nb.add(tab_font, text=" 字体与颜色 ")
+        nb.add(tab_preview, text=" 示意图 ")
+
+        self._build_tab_layout(tab_layout)
+        self._build_tab_options(tab_options)
+        self._build_tab_font(tab_font)
+        self._build_tab_preview(tab_preview)
+
+    # ── 4. question table ──
+
+    def _build_question_table(self, parent):
+        frame = ttk.Labelframe(
+            parent,
+            text=" ④ 解析结果 ",
+            bootstyle="primary", padding=(2, 8),
+        )
+        frame.pack(fill=BOTH, expand=YES, pady=(0, 6))
+        inner = ttk.Frame(frame, padding=(10, 8))
+        inner.pack(fill=BOTH, expand=YES)
+
+        cols = ("num", "stem", "options", "image")
+        self.tree = ttk.Treeview(inner, columns=cols, show="headings", height=7,
+                                 bootstyle="info")
+        self.tree.heading("num", text="#")
+        self.tree.heading("stem", text="题干摘要")
+        self.tree.heading("options", text="选项")
+        self.tree.heading("image", text="配图")
+        self.tree.column("num", width=40, anchor=CENTER)
+        self.tree.column("stem", width=460)
+        self.tree.column("options", width=50, anchor=CENTER)
+        self.tree.column("image", width=56, anchor=CENTER)
+
+        sb = ttk.Scrollbar(inner, orient=VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        sb.pack(side=RIGHT, fill=Y)
+
+        ttk.Label(
+            frame, text=U.TIP_SECONDARY, font=("", 9), bootstyle="secondary",
+        ).pack(anchor=W, padx=10, pady=(2, 4))
+
+    # ── action bar ──
+
+    def _build_action_bar(self, parent):
+        bar = ttk.Frame(parent, padding=(16, 12))
+        bar.pack(side=BOTTOM, fill=X)
+
+        self.progress = ttk.Progressbar(bar, mode="determinate", bootstyle="success-striped")
+        self.progress.pack(fill=X, pady=(0, 10))
+
+        row = ttk.Frame(bar)
+        row.pack(fill=X)
+
+        self.status_label = ttk.Label(row, text="就绪", anchor=W, bootstyle="secondary")
+        self.status_label.pack(side=LEFT, fill=X, expand=YES, padx=(0, 12))
+
+        ttk.Button(row, text="清空", command=self._clear_all,
+                   bootstyle="secondary-outline", width=7).pack(side=RIGHT, padx=3)
+        ttk.Button(row, text="生成 PPT", command=self._generate_ppt,
+                   bootstyle="success-outline", width=10).pack(side=RIGHT, padx=3)
+        ttk.Button(row, text="解析 Word", command=self._parse_preview,
+                   bootstyle="info-outline", width=10).pack(side=RIGHT, padx=3)
+        ttk.Button(row, text="一键生成", command=self._convert_all,
+                   bootstyle="success", width=10).pack(side=RIGHT, padx=3)
+
+    # ════════════════════════════════════════════
+    #  Tabs
+    # ════════════════════════════════════════════
+
+    def _spin_row(self, parent, label, var, lo, hi, step, width=6):
+        f = ttk.Frame(parent)
+        f.pack(fill=X, pady=2)
+        ttk.Label(f, text=label, width=22).pack(side=LEFT)
+        ttk.Spinbox(f, from_=lo, to=hi, increment=step, textvariable=var,
+                    width=width, format="%.2f").pack(side=LEFT)
+
+    def _radio_row(self, parent, label, var, choices):
+        f = ttk.Frame(parent)
+        f.pack(fill=X, pady=3)
+        ttk.Label(f, text=label, width=22).pack(side=LEFT)
+        for val, txt in choices:
+            ttk.Radiobutton(f, text=txt, variable=var, value=val).pack(side=LEFT, padx=4)
+
+    # tab: layout
+
+    def _build_tab_layout(self, p):
+        ttk.Label(p, text="页面边距（英寸）", font=("", 9, "bold")).pack(anchor=W)
+        self._spin_row(p, "左边距", self.margin_left, 0.1, 2.0, 0.05)
+        self._spin_row(p, "右边距", self.margin_right, 0.1, 2.0, 0.05)
+        self._spin_row(p, "上边距", self.margin_top, 0.1, 2.0, 0.05)
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        ttk.Label(p, text="题干区高度（英寸）", font=("", 9, "bold")).pack(anchor=W)
+        self._spin_row(p, "有图时", self.stem_h_img, 0.5, 4.0, 0.1)
+        self._spin_row(p, "无图时", self.stem_h_no, 0.5, 5.0, 0.1)
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        ttk.Label(p, text="间距（英寸）", font=("", 9, "bold")).pack(anchor=W)
+        self._spin_row(p, "题干↔下方", self.gap_stem, 0.0, 1.0, 0.05)
+        self._spin_row(p, "图片间", self.gap_img, 0.0, 1.0, 0.05)
+        self._spin_row(p, "图片↔选项区", self.gap_opts, 0.0, 1.5, 0.05)
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        self._radio_row(p, "题干对齐", self.stem_align,
+                        [("left", "左"), ("center", "中"), ("right", "右")])
+        self._radio_row(p, "图片位置", self.image_align,
+                        [("left", "左"), ("center", "中"), ("right", "右")])
+        self._spin_row(p, "图片最大宽（英寸）", self.image_max_w, 1.0, 12.0, 0.1)
+        self._spin_row(p, "图片最大高（英寸）", self.image_max_h, 0.5, 6.0, 0.1)
+
+    # tab: options
+
+    def _build_tab_options(self, p):
+        self._radio_row(p, "排列方式", self.option_layout,
+                        [("grid", "2×2 网格"), ("list", "竖排"), ("one_row", "一行四个")])
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        ttk.Label(p, text="网格", font=("", 9, "bold")).pack(anchor=W)
+        f = ttk.Frame(p)
+        f.pack(fill=X, pady=3)
+        ttk.Radiobutton(f, text="AB / CD", variable=self.grid_layout, value="ab_cd").pack(side=LEFT, padx=4)
+        ttk.Radiobutton(f, text="AC / BD", variable=self.grid_layout, value="ac_bd").pack(side=LEFT, padx=4)
+        self._spin_row(p, "网格行高", self.grid_row_h, 0.4, 2.0, 0.05)
+        self._spin_row(p, "网格列间距", self.grid_col_gap, 0.0, 1.0, 0.05)
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        ttk.Label(p, text="竖排 / 一行", font=("", 9, "bold")).pack(anchor=W)
+        self._spin_row(p, "列表行高", self.list_row_h, 0.4, 2.0, 0.05)
+        self._spin_row(p, "一行四列行高", self.one_row_h, 0.35, 1.5, 0.05)
+        self._spin_row(p, "一行四列间距", self.one_row_gap, 0.0, 0.5, 0.02)
+
+        ttk.Separator(p).pack(fill=X, pady=6)
+        self._radio_row(p, "选项文字对齐", self.option_align,
+                        [("left", "左"), ("center", "中"), ("right", "右")])
+
+    # tab: font & color
+
+    def _build_tab_font(self, p):
+        # font family
+        r0 = ttk.Frame(p)
+        r0.pack(fill=X, pady=4)
+        ttk.Label(r0, text="字体", width=14).pack(side=LEFT)
+        self._font_combo = ttk.Combobox(r0, textvariable=self.font_name,
+                                        values=self._font_list, width=24, state="readonly")
+        self._font_combo.pack(side=LEFT, padx=4)
+        self._font_combo.bind("<<ComboboxSelected>>", lambda e: self._schedule_preview_refresh())
+
+        # sizes
+        r1 = ttk.Frame(p)
+        r1.pack(fill=X, pady=4)
+        ttk.Label(r1, text="题干字号", width=14).pack(side=LEFT)
+        ttk.Spinbox(r1, from_=10, to=48, textvariable=self.font_size_stem, width=5).pack(side=LEFT, padx=4)
+        ttk.Label(r1, text="选项字号").pack(side=LEFT, padx=(16, 0))
+        ttk.Spinbox(r1, from_=8, to=40, textvariable=self.font_size_option, width=5).pack(side=LEFT, padx=4)
+
+        # bold
+        r2 = ttk.Frame(p)
+        r2.pack(fill=X, pady=4)
+        ttk.Checkbutton(r2, text="题干加粗", variable=self.stem_bold).pack(side=LEFT, padx=(0, 12))
+        ttk.Checkbutton(r2, text="字母加粗", variable=self.option_letter_bold).pack(side=LEFT, padx=(0, 12))
+        ttk.Checkbutton(r2, text="正文加粗", variable=self.option_text_bold).pack(side=LEFT)
+
+        # live preview
+        ttk.Separator(p).pack(fill=X, pady=8)
+        pv = ttk.Labelframe(p, text=" 字体预览 ", bootstyle="info", padding=10)
+        pv.pack(fill=X, pady=(0, 6))
+        self._pv_stem = tk.Label(pv, text="1. 示例题干（2020·上海）…", anchor=W, justify=LEFT, wraplength=500)
+        self._pv_stem.pack(fill=X)
+        self._pv_body = tk.Label(pv, text="选项正文：示例文字", anchor=W)
+        self._pv_body.pack(fill=X, pady=(4, 0))
+        self._pv_letter = tk.Label(pv, text="A.  B.  C.  D.", anchor=W)
+        self._pv_letter.pack(fill=X, pady=(2, 0))
+
+        # colors
+        ttk.Separator(p).pack(fill=X, pady=8)
+        ttk.Label(p, text="颜色（点击色块选色）", font=("", 9, "bold")).pack(anchor=W)
+        self._swatch("题干", self.color_stem, p)
+        self._swatch("选项正文", self.color_option, p)
+        self._swatch("选项字母", self.color_letter, p)
+
+        ttk.Button(p, text="恢复默认", command=self._reset_defaults,
+                   bootstyle="secondary-outline").pack(anchor=E, pady=(10, 0))
+
+    def _swatch(self, label, var, parent):
+        row = ttk.Frame(parent)
+        row.pack(fill=X, pady=4)
+        ttk.Label(row, text=label, width=14).pack(side=LEFT)
+        sw = tk.Frame(row, width=40, height=28, relief=tk.SOLID, bd=1)
+        sw.pack(side=LEFT, padx=4)
+        sw.pack_propagate(False)
+
+        def pick():
+            c = colorchooser.askcolor(color=var.get(), title=label)
+            if c and c[1]:
+                var.set(c[1].upper())
+
+        sw.bind("<Button-1>", lambda e: pick())
+        ttk.Button(row, text="选色", command=pick, bootstyle="info-outline", width=6).pack(side=LEFT, padx=4)
+
+        def sync(*_):
+            hx = var.get().strip()
+            try:
+                sw.configure(bg=hx[:7] if hx.startswith("#") and len(hx) >= 7 else "#ccc")
+            except tk.TclError:
+                sw.configure(bg="#ccc")
+
+        var.trace_add("write", lambda *_: sync())
+        sync()
+
+    # tab: layout preview
+
+    def _build_tab_preview(self, p):
+        ctrl = ttk.Frame(p)
+        ctrl.pack(fill=X, pady=(0, 4))
+        ttk.Checkbutton(ctrl, text="显示图片占位", variable=self.preview_has_image,
+                        bootstyle="round-toggle").pack(side=LEFT)
+        ttk.Label(ctrl, text="（示意图，非真实比例）", font=("", 9),
+                  bootstyle="secondary").pack(side=LEFT, padx=8)
+
+        self._layout_canvas = tk.Canvas(p, width=560, height=315, bg="#f0f4f8",
+                                        highlightthickness=0)
+        self._layout_canvas.pack(pady=4)
+        self._layout_canvas.bind("<Configure>", lambda e: self._schedule_preview_refresh())
+
+    # ════════════════════════════════════════════
+    #  Preview refresh
+    # ════════════════════════════════════════════
+
+    def _bind_preview_updates(self):
+        watched = [
+            self.margin_left, self.margin_right, self.margin_top,
+            self.stem_h_img, self.stem_h_no, self.gap_stem, self.gap_img, self.gap_opts,
+            self.option_layout, self.grid_layout,
+            self.grid_row_h, self.grid_col_gap, self.list_row_h,
+            self.one_row_h, self.one_row_gap, self.preview_has_image,
+            self.font_name, self.font_size_stem, self.font_size_option,
+            self.color_stem, self.color_option, self.color_letter,
+            self.stem_bold, self.option_letter_bold, self.option_text_bold,
+        ]
+        for v in watched:
+            try:
+                v.trace_add("write", lambda *_: self._schedule_preview_refresh())
+            except Exception:
+                pass
+
+    def _schedule_preview_refresh(self, *_):
+        if self._preview_after is not None:
+            try:
+                self.root.after_cancel(self._preview_after)
+            except Exception:
+                pass
+        self._preview_after = self.root.after(80, self._do_refresh)
+
+    def _do_refresh(self):
+        self._preview_after = None
+        self._refresh_layout_canvas()
+        self._refresh_font_preview()
+
+    def _refresh_font_preview(self):
+        if not getattr(self, "_pv_stem", None):
+            return
+        fn = self.font_name.get().strip() or "微软雅黑"
+        sz_s = max(10, self.font_size_stem.get() - 4)
+        sz_o = max(9, self.font_size_option.get() - 2)
+
+        def font(sz, w):
+            try:
+                return tkfont.Font(family=fn, size=sz, weight=w)
+            except tk.TclError:
+                return tkfont.Font(size=sz, weight=w)
+
+        cs = self.color_stem.get().strip()
+        co = self.color_option.get().strip()
+        cl = self.color_letter.get().strip()
+        if not cs.startswith("#"): cs = "#1A1A2E"
+        if not co.startswith("#"): co = "#2D2D2D"
+        if not cl.startswith("#"): cl = "#006BBD"
+
+        ws = "bold" if self.stem_bold.get() else "normal"
+        wl = "bold" if self.option_letter_bold.get() else "normal"
+        wb = "bold" if self.option_text_bold.get() else "normal"
+
+        self._pv_stem.configure(font=font(sz_s, ws), fg=cs)
+        self._pv_body.configure(font=font(sz_o, wb), fg=co)
+        self._pv_letter.configure(font=font(sz_o, wl), fg=cl)
+
+    def _refresh_layout_canvas(self):
+        cvs = getattr(self, "_layout_canvas", None)
+        if cvs is None:
+            return
+        cvs.delete("all")
+        W = int(cvs.cget("width")) or 560
+        H = int(cvs.cget("height")) or 315
+        sx, sy = W / 13.333, H / 7.5
+
+        ml = self.margin_left.get() * sx
+        mt = self.margin_top.get() * sy
+        mr = self.margin_right.get() * sx
+        cw = W - ml - mr
+
+        sh_in = self.stem_h_img.get() if self.preview_has_image.get() else self.stem_h_no.get()
+        sh = sh_in * sy
+        gap1 = self.gap_stem.get() * sy
+        img_h = min(self.image_max_h.get(), 2.2) * sy * 0.35 if self.preview_has_image.get() else 0
+        gap_img = self.gap_img.get() * sy if self.preview_has_image.get() else 0
+        gap_opts = self.gap_opts.get() * sy
+
+        y0 = mt
+        y_stem_end = y0 + sh
+        y_img_end = y_stem_end + gap1 + (img_h + gap_img if img_h else 0)
+        oy = y_img_end + gap_opts
+        oh = max(28, H - oy - 10)
+
+        # slide bg
+        cvs.create_rectangle(0, 0, W, H, fill="#eaeef3", outline="#b0b8c4", width=2)
+        # stem
+        cvs.create_rectangle(ml, y0, ml + cw, y_stem_end, fill="#d4e8ff", outline="#4a90d9", width=2)
+        cvs.create_text(ml + 8, y0 + 8, anchor=tk.NW, text="题干", fill="#1a4d80", font=("", 10, "bold"))
+        # image
+        if self.preview_has_image.get() and img_h > 0:
+            iy = y_stem_end + gap1
+            cvs.create_rectangle(ml, iy, ml + cw, iy + img_h, fill="#fff8e6", outline="#d9a84a", width=2, dash=(4, 3))
+            cvs.create_text(ml + cw / 2, iy + img_h / 2, text="图片", fill="#996600")
+        # options
+        ol = self.option_layout.get()
+        ox, ow = ml, cw
+        self._draw_options(cvs, ol, ox, oy, ow, oh, sx)
+        cvs.create_text(W / 2, H - 5, text="示意图", fill="#999", font=("", 8))
+
+    def _draw_options(self, cvs, layout, ox, oy, ow, oh, sx):
+        fills = ["#e3f2fd", "#e8f5e9", "#fce4ec", "#fff3e0"]
+        outlines = ["#1976d2", "#43a047", "#c62828", "#e65100"]
+        labels = ["A", "B", "C", "D"]
+
+        if layout == "list":
+            rh = oh / 4
+            for i in range(4):
+                cvs.create_rectangle(ox, oy + i * rh, ox + ow, oy + (i + 1) * rh - 2,
+                                     fill=fills[i], outline=outlines[i])
+                cvs.create_text(ox + 8, oy + i * rh + 6, anchor=tk.NW,
+                                text=f"选项 {labels[i]}", fill=outlines[i])
+        elif layout == "one_row":
+            g = self.one_row_gap.get() * sx
+            cw4 = (ow - g * 3) / 4
+            for i in range(4):
+                x0 = ox + i * (cw4 + g)
+                cvs.create_rectangle(x0, oy, x0 + cw4, oy + oh, fill=fills[i], outline=outlines[i])
+                cvs.create_text(x0 + cw4 / 2, oy + oh / 2, text=labels[i],
+                                fill=outlines[i], font=("", 11, "bold"))
+        else:
+            gh, gw = oh / 2, ow / 2
+            gl = self.grid_layout.get()
+            order = [("A", 0, 0), ("C", 1, 0), ("B", 0, 1), ("D", 1, 1)] if gl == "ac_bd" \
+                else [("A", 0, 0), ("B", 1, 0), ("C", 0, 1), ("D", 1, 1)]
+            for lab, gx, gy in order:
+                ci = "ABCD".index(lab)
+                x0, y0 = ox + gx * gw, oy + gy * gh
+                cvs.create_rectangle(x0, y0, x0 + gw - 2, y0 + gh - 2,
+                                     fill=fills[ci], outline=outlines[ci])
+                cvs.create_text(x0 + 8, y0 + 6, anchor=tk.NW, text=lab,
+                                fill=outlines[ci], font=("", 10, "bold"))
+
+    # ════════════════════════════════════════════
+    #  Template toggle → enable/disable config
+    # ════════════════════════════════════════════
+
+    def _toggle_template(self):
+        on = self.use_template.get()
+        st = NORMAL if on else DISABLED
+        self.template_entry.configure(state=st)
+        self.template_btn.configure(state=st)
+
+        if on:
+            self._tpl_hint.pack(anchor=W, pady=(8, 0))
+            self._config_notebook.pack_forget()
+            self._tpl_overlay_label.pack(fill=X, padx=8, pady=10)
+        else:
+            self._tpl_hint.pack_forget()
+            self._tpl_overlay_label.pack_forget()
+            self._config_notebook.pack(fill=X, padx=8, pady=(4, 8))
+
+    # ════════════════════════════════════════════
+    #  Defaults reset
+    # ════════════════════════════════════════════
+
+    def _reset_defaults(self):
+        pairs = [
+            (self.margin_left, 0.8), (self.margin_right, 0.8), (self.margin_top, 0.5),
+            (self.stem_h_img, 1.5), (self.stem_h_no, 2.5),
+            (self.gap_stem, 0.2), (self.gap_img, 0.15), (self.gap_opts, 0.2),
+            (self.stem_align, "left"), (self.image_align, "center"),
+            (self.image_max_w, 5.0), (self.image_max_h, 2.5),
+            (self.option_layout, "grid"), (self.grid_layout, "ab_cd"),
+            (self.grid_row_h, 0.9), (self.grid_col_gap, 0.15), (self.list_row_h, 0.7),
+            (self.one_row_h, 0.55), (self.one_row_gap, 0.06),
+            (self.option_align, "left"), (self.font_name, "微软雅黑"),
+            (self.font_size_stem, 20), (self.font_size_option, 18),
+            (self.stem_bold, True), (self.option_letter_bold, True), (self.option_text_bold, False),
+            (self.color_stem, "#1A1A2E"), (self.color_option, "#2D2D2D"), (self.color_letter, "#006BBD"),
+        ]
+        for var, val in pairs:
+            var.set(val)
+        self._schedule_preview_refresh()
+
+    # ════════════════════════════════════════════
+    #  File dialogs
+    # ════════════════════════════════════════════
+
+    def _browse_word(self):
+        path = filedialog.askopenfilename(title="选择 Word 文件",
+                                          filetypes=[("Word", "*.docx"), ("All", "*.*")])
+        if path:
+            self.word_path.set(path)
+            if not self.output_path.get():
+                self.output_path.set(os.path.splitext(path)[0] + ".pptx")
+
+    def _browse_output(self):
+        path = filedialog.asksaveasfilename(title="保存 PPT",
+                                            defaultextension=".pptx",
+                                            filetypes=[("PowerPoint", "*.pptx")])
+        if path:
+            self.output_path.set(path)
+
+    def _browse_template(self):
+        path = filedialog.askopenfilename(title="选择 PPT 模板",
+                                          filetypes=[("PowerPoint", "*.pptx"), ("All", "*.*")])
+        if path:
+            self.template_path.set(path)
+
+    # ════════════════════════════════════════════
+    #  Core operations
+    # ════════════════════════════════════════════
+
+    def _make_ppt_config(self) -> PPTConfig:
+        from pptx.util import Pt, Inches
+        c = PPTConfig()
+        c.margin_left_in = self.margin_left.get()
+        c.margin_right_in = self.margin_right.get()
+        c.margin_top_in = self.margin_top.get()
+        c.stem_height_with_image_in = self.stem_h_img.get()
+        c.stem_height_no_image_in = self.stem_h_no.get()
+        c.gap_after_stem_in = self.gap_stem.get()
+        c.gap_after_image_in = self.gap_img.get()
+        c.gap_before_options_in = self.gap_opts.get()
+        c.stem_align = self.stem_align.get()
+        c.image_h_align = self.image_align.get()
+        c.image_max_width = Inches(self.image_max_w.get())
+        c.image_max_height = Inches(self.image_max_h.get())
+        c.option_layout = self.option_layout.get()
+        c.grid_layout = self.grid_layout.get()
+        c.grid_row_height_in = self.grid_row_h.get()
+        c.grid_col_gap_in = self.grid_col_gap.get()
+        c.list_row_height_in = self.list_row_h.get()
+        c.one_row_height_in = self.one_row_h.get()
+        c.one_row_gap_in = self.one_row_gap.get()
+        c.option_align = self.option_align.get()
+        c.font_name = self.font_name.get().strip() or "微软雅黑"
+        c.stem_font_size = Pt(self.font_size_stem.get())
+        c.option_font_size = Pt(self.font_size_option.get())
+        c.font_bold_stem = self.stem_bold.get()
+        c.option_letter_bold = self.option_letter_bold.get()
+        c.option_font_bold = self.option_text_bold.get()
+        for attr, var in [("stem_color", self.color_stem),
+                          ("option_color", self.color_option),
+                          ("option_letter_color", self.color_letter)]:
+            rgb = parse_hex_color(var.get())
+            if rgb:
+                setattr(c, attr, rgb)
+        c.number_color = c.option_letter_color
+        return c
+
+    def _refresh_question_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for q in self.questions:
+            stem_short = q.stem[:50] + ("…" if len(q.stem) > 50 else "")
+            n_img = len(q.image_paths)
+            self.tree.insert("", END, values=(
+                q.number, stem_short, len(q.options),
+                f"{n_img} 张" if n_img else "—",
+            ))
+
+    def _parse_word_file(self) -> bool:
+        word_file = self.word_path.get().strip()
+        if not word_file:
+            messagebox.showwarning("提示", "请先选择 Word 文件")
+            return False
+        if not os.path.exists(word_file):
+            messagebox.showerror("错误", f"文件不存在：{word_file}")
+            return False
+        self._set_status("正在解析…")
+        try:
+            if self.parser:
+                self.parser.cleanup()
+            self.parser = WordParser()
+            self.questions = self.parser.parse(word_file)
+            self._refresh_question_tree()
+            self._set_status(f"解析完成 — {len(self.questions)} 道题")
+            return True
+        except Exception as e:
+            self._set_status("解析失败")
+            messagebox.showerror("解析错误", str(e))
+            return False
+
+    def _parse_preview(self):
+        if not self._parse_word_file():
+            return
+        if not self.questions:
+            messagebox.showinfo("提示", "未解析到任何题目，请检查 Word 格式")
+
+    def _convert_all(self):
+        word_file = self.word_path.get().strip()
+        if not word_file:
+            messagebox.showwarning("提示", "请先选择 Word 文件")
+            return
+        if not self.output_path.get().strip():
+            self.output_path.set(os.path.splitext(word_file)[0] + ".pptx")
+        if not self._parse_word_file():
+            return
+        if not self.questions:
+            messagebox.showinfo("提示", "未解析到任何题目")
+            return
+        self._generate_ppt()
+
+    def _generate_ppt(self):
+        if not self.questions:
+            messagebox.showwarning("提示", "请先解析 Word 文件")
+            return
+        output = self.output_path.get().strip()
+        if not output:
+            messagebox.showwarning("提示", "请设置输出路径")
+            return
+
+        template = None
+        if self.use_template.get():
+            template = self.template_path.get().strip()
+            if not template or not os.path.exists(template):
+                messagebox.showerror("错误", "请选择有效的模板文件")
+                return
+
+        self._set_status("正在生成 PPT…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = len(self.questions)
+
+        def work():
+            try:
+                config = self._make_ppt_config()
+                gen = PPTGenerator(config=config)
+                gen.generate(self.questions, output,
+                             template_path=template,
+                             progress_callback=self._on_progress)
+                self.root.after(0, lambda: self._on_done(output))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_progress(self, cur, total):
+        self.root.after(0, lambda: self._set_progress(cur, total))
+
+    def _set_progress(self, cur, total):
+        self.progress["value"] = cur
+        self._set_status(f"生成中 {cur}/{total}…")
+
+    def _on_done(self, path):
+        self.progress["value"] = self.progress["maximum"]
+        self._set_status(f"完成：{path}")
+        if messagebox.askyesno("完成", f"PPT 已生成！\n{path}\n\n打开所在目录？"):
+            os.startfile(os.path.dirname(os.path.abspath(path)))
+
+    def _on_error(self, msg):
+        self._set_status("生成失败")
+        messagebox.showerror("生成错误", msg)
+
+    def _clear_all(self):
+        self.word_path.set("")
+        self.output_path.set("")
+        self.template_path.set("")
+        self.use_template.set(False)
+        self._toggle_template()
+        self.questions.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.progress["value"] = 0
+        self._set_status("已清空")
+        if self.parser:
+            self.parser.cleanup()
+            self.parser = None
+
+    def _set_status(self, text: str):
+        self.status_label.configure(text=text)
+
+    # ── run ──
+
+    def run(self):
+        self.root.mainloop()
