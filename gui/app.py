@@ -20,7 +20,7 @@ _PAD = 14
 
 
 class PPTConvertApp:
-    """Word 杞?PPT 鍥惧舰鐣岄潰"""
+    """Word 转 PPT 图形界面。"""
 
     def __init__(self):
         self.root = ttk.Window(
@@ -32,7 +32,7 @@ class PPTConvertApp:
         )
         self.root.place_window_center()
 
-        # 鈹€鈹€ tk vars 鈹€鈹€
+        # Tk variables
         self.word_path = tk.StringVar()
         self.template_path = tk.StringVar()
         self.output_path = tk.StringVar()
@@ -58,7 +58,7 @@ class PPTConvertApp:
         self.grid_col_gap = tk.DoubleVar(value=0.15)
         self.list_row_h = tk.DoubleVar(value=0.7)
         self.option_align = tk.StringVar(value="left")
-        self.font_name = tk.StringVar(value="寰蒋闆呴粦")
+        self.font_name = tk.StringVar(value="微软雅黑")
         self.stem_bold = tk.BooleanVar(value=True)
         self.option_letter_bold = tk.BooleanVar(value=True)
         self.option_text_bold = tk.BooleanVar(value=False)
@@ -79,9 +79,7 @@ class PPTConvertApp:
         self._schedule_preview_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  UI 鏋勫缓
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # UI
 
     def _build_ui(self):
         outer = ttk.Frame(self.root)
@@ -104,7 +102,7 @@ class PPTConvertApp:
         self._build_config_section(main)
         self._build_question_table(main)
 
-    # 鈹€鈹€ header 鈹€鈹€
+    # Header
 
     def _build_header(self, parent):
         hdr = ttk.Frame(parent, padding=(20, 16, 20, 12))
@@ -125,10 +123,10 @@ class PPTConvertApp:
 
         ttk.Separator(hdr, orient=HORIZONTAL).pack(fill=X, pady=(10, 0))
 
-    # 鈹€鈹€ 1. files 鈹€鈹€
+    # 1. Files
 
     def _build_file_section(self, parent):
-        frame = ttk.Labelframe(parent, text=" 鈶?閫夋嫨鏂囦欢 ", bootstyle="primary", padding=_PAD)
+        frame = ttk.Labelframe(parent, text=" ① 选择文件 ", bootstyle="primary", padding=_PAD)
         frame.pack(fill=X, pady=(0, 10))
 
         self._file_row(frame, "Word 文件", self.word_path,
@@ -144,16 +142,16 @@ class PPTConvertApp:
         ttk.Button(row, text=btn_text, command=cmd,
                    bootstyle="outline", width=9).pack(side=RIGHT)
 
-    # 鈹€鈹€ 2. template 鈹€鈹€
+    # 2. Template
 
     def _build_template_section(self, parent):
-        frame = ttk.Labelframe(parent, text=" 鈶?妯℃澘锛堝彲閫夛級 ", bootstyle="info", padding=_PAD)
+        frame = ttk.Labelframe(parent, text=" ② 模板（可选） ", bootstyle="info", padding=_PAD)
         frame.pack(fill=X, pady=(0, 10))
 
         row = ttk.Frame(frame)
         row.pack(fill=X)
         ttk.Checkbutton(
-            row, text="浣跨敤 .pptx 妯℃澘", variable=self.use_template,
+            row, text="使用 .pptx 模板", variable=self.use_template,
             command=self._toggle_template, bootstyle="round-toggle",
         ).pack(side=LEFT)
         self.template_entry = ttk.Entry(row, textvariable=self.template_path, state=DISABLED)
@@ -176,7 +174,7 @@ class PPTConvertApp:
         self._tpl_hint.pack(anchor=W, pady=(8, 0))
         self._tpl_hint.pack_forget()
 
-    # 鈹€鈹€ 3. config 鈹€鈹€
+    # 3. Config
 
     def _build_config_section(self, parent):
         self._config_frame = ttk.Labelframe(
@@ -208,12 +206,12 @@ class PPTConvertApp:
         self._build_tab_font(tab_font)
         self._build_tab_preview(tab_preview)
 
-    # 鈹€鈹€ 4. question table 鈹€鈹€
+    # 4. Question table
 
     def _build_question_table(self, parent):
         frame = ttk.Labelframe(
             parent,
-            text=" 鈶?瑙ｆ瀽缁撴灉 ",
+            text=" ④ 解析结果 ",
             bootstyle="primary", padding=(2, 8),
         )
         frame.pack(fill=BOTH, expand=YES, pady=(0, 6))
@@ -224,9 +222,9 @@ class PPTConvertApp:
         self.tree = ttk.Treeview(inner, columns=cols, show="headings", height=7,
                                  bootstyle="info")
         self.tree.heading("num", text="#")
-        self.tree.heading("stem", text="棰樺共鎽樿")
-        self.tree.heading("options", text="閫夐」")
-        self.tree.heading("image", text="閰嶅浘")
+        self.tree.heading("stem", text="题干摘要")
+        self.tree.heading("options", text="选项")
+        self.tree.heading("image", text="配图")
         self.tree.column("num", width=40, anchor=CENTER)
         self.tree.column("stem", width=460)
         self.tree.column("options", width=50, anchor=CENTER)
@@ -241,7 +239,7 @@ class PPTConvertApp:
             frame, text=U.TIP_SECONDARY, font=("", 9), bootstyle="secondary",
         ).pack(anchor=W, padx=10, pady=(2, 4))
 
-    # 鈹€鈹€ action bar 鈹€鈹€
+    # Action bar
 
     def _build_action_bar(self, parent):
         bar = ttk.Frame(parent, padding=(16, 12))
@@ -265,9 +263,7 @@ class PPTConvertApp:
         ttk.Button(row, text="一键生成", command=self._convert_all,
                    bootstyle="success", width=10).pack(side=RIGHT, padx=3)
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  Tabs
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # Tabs
 
     def _spin_row(self, parent, label, var, lo, hi, step, width=6):
         f = ttk.Frame(parent)
@@ -341,7 +337,7 @@ class PPTConvertApp:
         # font family
         r0 = ttk.Frame(p)
         r0.pack(fill=X, pady=4)
-        ttk.Label(r0, text="瀛椾綋", width=14).pack(side=LEFT)
+        ttk.Label(r0, text="字体", width=14).pack(side=LEFT)
         self._font_combo = ttk.Combobox(r0, textvariable=self.font_name,
                                         values=self._font_list, width=24, state="readonly")
         self._font_combo.pack(side=LEFT, padx=4)
@@ -350,9 +346,9 @@ class PPTConvertApp:
         # sizes
         r1 = ttk.Frame(p)
         r1.pack(fill=X, pady=4)
-        ttk.Label(r1, text="棰樺共瀛楀彿", width=14).pack(side=LEFT)
+        ttk.Label(r1, text="题干字号", width=14).pack(side=LEFT)
         ttk.Spinbox(r1, from_=10, to=48, textvariable=self.font_size_stem, width=5).pack(side=LEFT, padx=4)
-        ttk.Label(r1, text="閫夐」瀛楀彿").pack(side=LEFT, padx=(16, 0))
+        ttk.Label(r1, text="选项字号").pack(side=LEFT, padx=(16, 0))
         ttk.Spinbox(r1, from_=8, to=40, textvariable=self.font_size_option, width=5).pack(side=LEFT, padx=4)
 
         # bold
@@ -397,7 +393,7 @@ class PPTConvertApp:
                 var.set(c[1].upper())
 
         sw.bind("<Button-1>", lambda e: pick())
-        ttk.Button(row, text="閫夎壊", command=pick, bootstyle="info-outline", width=6).pack(side=LEFT, padx=4)
+        ttk.Button(row, text="选色", command=pick, bootstyle="info-outline", width=6).pack(side=LEFT, padx=4)
 
         def sync(*_):
             hx = var.get().strip()
@@ -424,9 +420,7 @@ class PPTConvertApp:
         self._layout_canvas.pack(pady=4)
         self._layout_canvas.bind("<Configure>", lambda e: self._schedule_preview_refresh())
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  Preview refresh
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # Preview refresh
 
     def _bind_preview_updates(self):
         watched = [
@@ -461,7 +455,7 @@ class PPTConvertApp:
     def _refresh_font_preview(self):
         if not getattr(self, "_pv_stem", None):
             return
-        fn = self.font_name.get().strip() or "寰蒋闆呴粦"
+        fn = self.font_name.get().strip() or "微软雅黑"
         sz_s = max(10, self.font_size_stem.get() - 4)
         sz_o = max(9, self.font_size_option.get() - 2)
 
@@ -540,7 +534,7 @@ class PPTConvertApp:
                 cvs.create_rectangle(ox, oy + i * rh, ox + ow, oy + (i + 1) * rh - 2,
                                      fill=fills[i], outline=outlines[i])
                 cvs.create_text(ox + 8, oy + i * rh + 6, anchor=tk.NW,
-                                text=f"閫夐」 {labels[i]}", fill=outlines[i])
+                                text=f"选项 {labels[i]}", fill=outlines[i])
         elif layout == "one_row":
             g = self.one_row_gap.get() * sx
             cw4 = (ow - g * 3) / 4
@@ -562,9 +556,7 @@ class PPTConvertApp:
                 cvs.create_text(x0 + 8, y0 + 6, anchor=tk.NW, text=lab,
                                 fill=outlines[ci], font=("", 10, "bold"))
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  Template toggle 鈫?enable/disable config
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # Template toggle
 
     def _toggle_template(self):
         on = self.use_template.get()
@@ -581,9 +573,7 @@ class PPTConvertApp:
             self._tpl_overlay_label.pack_forget()
             self._config_notebook.pack(fill=X, padx=8, pady=(4, 8))
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  Defaults reset
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # Defaults reset
 
     def _reset_defaults(self):
         pairs = [
@@ -595,7 +585,7 @@ class PPTConvertApp:
             (self.option_layout, "grid"), (self.grid_layout, "ab_cd"),
             (self.grid_row_h, 0.9), (self.grid_col_gap, 0.15), (self.list_row_h, 0.7),
             (self.one_row_h, 0.55), (self.one_row_gap, 0.06),
-            (self.option_align, "left"), (self.font_name, "寰蒋闆呴粦"),
+            (self.option_align, "left"), (self.font_name, "微软雅黑"),
             (self.font_size_stem, 20), (self.font_size_option, 18),
             (self.stem_bold, True), (self.option_letter_bold, True), (self.option_text_bold, False),
             (self.color_stem, "#1A1A2E"), (self.color_option, "#2D2D2D"), (self.color_letter, "#006BBD"),
@@ -604,12 +594,10 @@ class PPTConvertApp:
             var.set(val)
         self._schedule_preview_refresh()
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
-    #  File dialogs
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
+    # File dialogs
 
     def _browse_word(self):
-        path = filedialog.askopenfilename(title="閫夋嫨 Word 鏂囦欢",
+        path = filedialog.askopenfilename(title="选择 Word 文件",
                                           filetypes=[("Word", "*.docx"), ("All", "*.*")])
         if path:
             self.word_path.set(path)
@@ -617,19 +605,18 @@ class PPTConvertApp:
                 self.output_path.set(os.path.splitext(path)[0] + ".pptx")
 
     def _browse_output(self):
-        path = filedialog.asksaveasfilename(title="淇濆瓨 PPT",
+        path = filedialog.asksaveasfilename(title="保存 PPT",
                                             defaultextension=".pptx",
                                             filetypes=[("PowerPoint", "*.pptx")])
         if path:
             self.output_path.set(path)
 
     def _browse_template(self):
-        path = filedialog.askopenfilename(title="閫夋嫨 PPT 妯℃澘",
+        path = filedialog.askopenfilename(title="选择 PPT 模板",
                                           filetypes=[("PowerPoint", "*.pptx"), ("All", "*.*")])
         if path:
             self.template_path.set(path)
 
-    # 鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲鈺愨晲
     # -----------------------------------------------------------------------------
     # Core operations
     # -----------------------------------------------------------------------------
