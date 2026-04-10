@@ -1,51 +1,99 @@
-# 将项目推送到 GitHub（新建仓库）
+# GitHub 协作与发布
 
-在 **GitHub 网页** 上新建空仓库后，在本地项目根目录执行以下命令（将 `YOUR_USER` / `YOUR_REPO` 换成你的用户名与仓库名）。
+本文档面向当前这个已经存在远程仓库的项目，不再讨论“如何第一次创建 GitHub 仓库”。
 
-## 1. 在 GitHub 创建仓库
+## 当前仓库
 
-1. 登录 [GitHub](https://github.com)，右上角 **+** → **New repository**。
-2. **Repository name**：例如 `PPTconvert`。
-3. 选择 **Public**（或 Private）。
-4. **不要**勾选「Add a README」等初始化选项（保持空仓库，避免与本地首次推送冲突）。
-5. 点击 **Create repository**，页面会显示推送命令，可对照下面步骤。
+- 远程：`origin = https://github.com/BlueSky0329/PPTconvert.git`
+- 默认分支：`main`
 
-## 2. 本地首次推送（若尚未执行过 `git init`）
+## 提交前检查
 
-在项目根目录 `PPTconvert` 下打开终端（PowerShell 或 CMD）：
+提交前至少做两件事：
 
 ```powershell
-cd 你的路径\PPTconvert
+python -m unittest discover -s tests -v
+python -m py_compile .\main.py .\gui\app.py
+```
 
-git init -b main
+如果本次修改集中在 PDF 解析，也建议补跑：
+
+```powershell
+python -m unittest tests.test_pdf_exam_extract tests.test_pdf_exam_parse tests.test_exam_project -v
+```
+
+## 仓库边界
+
+以下内容默认不提交：
+
+- 根目录下的真实 PDF
+- 根目录下导出的 DOCX / PPTX
+- `*_assets/`
+- `*_工程.json`
+- `outputs/`
+- 本地缓存目录
+
+如果要共享样例，请放到 `examples/`，并确认不含隐私与版权风险。
+
+## 日常提交流程
+
+```powershell
+git status
 git add .
-git commit -m "Initial commit: Word 转 PPT 工具"
-git remote add origin https://github.com/YOUR_USER/YOUR_REPO.git
-git push -u origin main
+git commit -m "feat: describe your change"
+git push origin main
 ```
 
-若仓库已存在且已做过首次提交，只需：
+更稳妥的多人协作流程：
 
 ```powershell
-git remote add origin https://github.com/YOUR_USER/YOUR_REPO.git
-git branch -M main
-git push -u origin main
+git checkout -b feat/your-topic
+git add .
+git commit -m "feat: describe your change"
+git push -u origin feat/your-topic
 ```
 
-## 3. 使用 SSH（可选）
+## 提交信息建议
 
-若已配置 SSH 密钥，可将 `remote` 改为：
+- `feat:` 新功能
+- `fix:` 缺陷修复
+- `refactor:` 重构
+- `docs:` 文档整理
+- `test:` 测试补充
+- `chore:` 纯维护性改动
 
-```text
-git@github.com:YOUR_USER/YOUR_REPO.git
+示例：
+
+- `feat: add pdf project workflow and gui wizard`
+- `fix: recover data material intro spilled into previous option`
+- `docs: rewrite architecture and progress docs`
+
+## 推送前自查
+
+推送前确认：
+
+1. `git status` 中没有误加入的本地试卷或导出文件
+2. 测试已通过
+3. README 与行为一致
+4. 大改动有对应测试
+
+## 发布建议
+
+适合打标签的节点：
+
+- GUI 工作流稳定可演示
+- 六大模块识别可用
+- 一轮真实试卷回归通过
+
+示例：
+
+```powershell
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-## 4. 常见问题
+## 不建议直接做的事
 
-| 情况 | 处理 |
-|------|------|
-| 提示需要登录 | GitHub 已不支持账号密码推送 HTTPS，请使用 **Personal Access Token** 作为密码，或改用 **SSH**。 |
-| `remote origin already exists` | `git remote remove origin` 后重新 `git remote add origin ...` |
-| 推送被拒绝 | 若远程已有 README，可先 `git pull origin main --rebase` 再 `git push`。 |
-
-完成后，在仓库 **Settings → General** 中可补充描述、勾选 **Topics**（如 `python`、`docx`、`pptx`、`education`）。
+- 不要把真实试卷 PDF 直接提交到根目录
+- 不要把导出的 Word/PPT 当源码版本管理
+- 不要在未跑测试的情况下直接推送解析规则改动

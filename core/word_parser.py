@@ -21,6 +21,7 @@ ANSWER_LINE = re.compile(
     r"(?:\u7b54\u6848|\u6b63\u786e\u7b54\u6848)\s*[\uff1a:]\s*([A-Za-z](?:\s*[,/\u3001\uff0c\s]\s*[A-Za-z])*)",
     re.IGNORECASE,
 )
+MATERIAL_HEADER = re.compile(r"^\s*材料[一二三四五六七八九十百千万\d〇零两]+\s*$")
 
 QUESTION_START_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -82,6 +83,19 @@ def _match_question_start(text: str) -> Optional[tuple[Optional[str], str]]:
     return None
 
 
+def _extract_question_number(text: str) -> Optional[str]:
+    stripped = text.strip()
+    for pattern_name, pattern in QUESTION_START_PATTERNS:
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        if pattern_name == "year_area":
+            return None
+        number = match.groupdict().get("number")
+        return number.strip() if number else None
+    return None
+
+
 def _normalize_answer(raw: str) -> Optional[str]:
     letters: list[str] = []
     for letter in re.findall(r"[A-Za-z]", raw.upper()):
@@ -105,13 +119,69 @@ def _parse_options_from_line(text: str) -> list[Option]:
     return options
 
 
+def _section_kind_from_text(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if not stripped or _match_question_start(stripped) is not None:
+        return None
+    if len(stripped) > 40 and not SECTION_HEADER.match(stripped):
+        return None
+    if "资料分析" in stripped:
+        return "data"
+    if "数量关系" in stripped:
+        return "quant"
+    return None
+
+
+def _material_header_from_text(text: str) -> Optional[str]:
+    stripped = text.strip()
+    if MATERIAL_HEADER.match(stripped):
+        return stripped
+    return None
+
+
 class WordParser:
     def __init__(self, temp_dir: Optional[str] = None):
         self.image_extractor = ImageExtractor(temp_dir)
 
+    @staticmethod
+    def _build_material_prefixed_stem(
+        stem: str,
+        material_header: Optional[str],
+        material_paragraphs: list[str],
+    ) -> str:
+        parts: list[str] = []
+        if material_header:
+            parts.append(material_header)
+        parts.extend(p for p in material_paragraphs if p)
+        if stem:
+            parts.append(stem)
+        return "\n".join(parts)
+
     def _append_images(self, question: Question, paragraph, question_number: int) -> None:
         question.image_paths.extend(
             self.image_extractor.extract_from_paragraph(paragraph, question_number)
+        )
+
+    def _new_question(
+        self,
+        q_counter: int,
+        stem: str,
+        source_label: Optional[str],
+        source_question_number: Optional[str],
+        material_header: Optional[str],
+        material_paragraphs: list[str],
+        material_images: list[str],
+        question_images: Optional[list[str]] = None,
+    ) -> Question:
+        material_text = "\n".join(p for p in material_paragraphs if p).strip() or None
+        return Question(
+            number=q_counter,
+            stem=stem,
+            source_label=source_label,
+            source_question_number=source_question_number,
+            material_header=material_header,
+            material_text=material_text,
+            image_paths=list(material_images) + list(question_images or []),
         )
 
     def _finalize_question(
@@ -139,12 +209,39 @@ class WordParser:
         questions: list[Question] = []
         current_question: Optional[Question] = None
         q_counter = 0
+        current_section_kind: Optional[str] = None
+        current_material_header: Optional[str] = None
+        current_material_paragraphs: list[str] = []
+        current_material_images: list[str] = []
+        pending_data_texts: list[str] = []
+        pending_data_images: list[str] = []
 
         for paragraph in iter_all_paragraphs(doc):
             text = _get_paragraph_text(paragraph).strip()
             has_img = _paragraph_has_image(paragraph)
 
             if not text and not has_img:
+                continue
+
+            section_kind = _section_kind_from_text(text) if text else None
+            if section_kind:
+                current_question = self._finalize_question(questions, current_question)
+                current_section_kind = section_kind
+                current_material_header = None
+                current_material_paragraphs = []
+                current_material_images = []
+                pending_data_texts = []
+                pending_data_images = []
+                continue
+
+            material_header = _material_header_from_text(text) if text else None
+            if current_section_kind == "data" and material_header:
+                current_question = self._finalize_question(questions, current_question)
+                current_material_header = material_header
+                current_material_paragraphs = []
+                current_material_images = []
+                pending_data_texts = []
+                pending_data_images = []
                 continue
 
             matched_question = _match_question_start(text) if text else None
@@ -161,13 +258,31 @@ class WordParser:
 
             if matched_question is not None:
                 source_label, stem = matched_question
+                source_question_number = _extract_question_number(text) if text else None
                 current_question = self._finalize_question(questions, current_question)
                 q_counter += 1
-                current_question = Question(
-                    number=q_counter,
-                    stem=stem,
-                    source_label=source_label,
-                )
+                if current_section_kind == "data":
+                    if pending_data_texts or pending_data_images:
+                        current_material_paragraphs = list(pending_data_texts)
+                        current_material_images = list(pending_data_images)
+                        pending_data_texts = []
+                        pending_data_images = []
+                    current_question = self._new_question(
+                        q_counter,
+                        stem,
+                        source_label,
+                        source_question_number,
+                        current_material_header,
+                        current_material_paragraphs,
+                        current_material_images,
+                    )
+                else:
+                    current_question = Question(
+                        number=q_counter,
+                        stem=stem,
+                        source_label=source_label,
+                        source_question_number=source_question_number,
+                    )
                 if has_img:
                     self._append_images(current_question, paragraph, q_counter)
                 continue
@@ -186,8 +301,66 @@ class WordParser:
                     self._append_images(current_question, paragraph, q_counter)
                 continue
 
+            if text and current_question is None and current_section_kind == "data" and OPTION_LINE.match(text):
+                options = _parse_options_from_line(text)
+                if options:
+                    q_counter += 1
+                    material_context_established = bool(current_material_paragraphs or current_material_images)
+                    if material_context_established:
+                        stem = "\n".join(pending_data_texts).strip()
+                        question_images = list(pending_data_images)
+                    else:
+                        if not pending_data_texts:
+                            LOGGER.warning("Skipping option-only block in data section: %r", text)
+                            continue
+                        stem = pending_data_texts[-1].strip()
+                        current_material_paragraphs = list(pending_data_texts[:-1])
+                        current_material_images = list(pending_data_images)
+                        question_images = []
+                    pending_data_texts = []
+                    pending_data_images = []
+                    current_question = self._new_question(
+                        q_counter,
+                        stem,
+                        None,
+                        None,
+                        current_material_header,
+                        current_material_paragraphs,
+                        current_material_images,
+                        question_images=question_images,
+                    )
+                    current_question.options.extend(options)
+                    if has_img:
+                        self._append_images(current_question, paragraph, q_counter)
+                    continue
+
             if has_img and current_question:
                 self._append_images(current_question, paragraph, q_counter)
+                continue
+
+            if current_section_kind == "data" and current_question is None:
+                if text:
+                    pending_data_texts.append(text)
+                if has_img:
+                    pending_data_images.extend(
+                        self.image_extractor.extract_from_paragraph(paragraph, q_counter + 1)
+                    )
+                continue
+
+            if (
+                current_section_kind == "data"
+                and current_question
+                and current_question.is_complete
+                and text
+                and not OPTION_LINE.match(text)
+            ):
+                current_question = self._finalize_question(questions, current_question)
+                pending_data_texts = [text]
+                pending_data_images = []
+                if has_img:
+                    pending_data_images.extend(
+                        self.image_extractor.extract_from_paragraph(paragraph, q_counter + 1)
+                    )
                 continue
 
             if current_question and text:

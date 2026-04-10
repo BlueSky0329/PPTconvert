@@ -1,163 +1,144 @@
-# PPTconvert · Word 选择题转 PPT
+# PPTconvert
 
-将 **Word（.docx）** 中的选择题解析并批量生成 **PowerPoint（.pptx）**，支持题干配图、Word 公式（OMML）近似转换、可选 **PPT 模板** 驱动版式。提供 **图形界面** 与 **命令行** 两种使用方式，并支持打包为 **Windows 独立 exe**。
+一个本地化的公考试卷整理工具，当前主链路是：
 
----
+`PDF -> 结构化工程 -> Word / PPT / JSON`
 
-## 功能概览
+项目已经不再把 GUI 设计成“Word 转 PPT 工具箱”。现在的 GUI 聚焦 PDF 试卷整理，适合把整套真题按科目抽取、预览、修补后再导出。
 
-| 能力 | 说明 |
-|------|------|
-| 解析 Word | 段落与 **表格**（含嵌套）中的题目；题干与选项 **A–D** |
-| 公式 | Word 自带公式编辑器内容 → **Unicode 近似文本** 写入 PPT |
-| 图片 | 提取题目配图并按版式插入幻灯片 |
-| 模板 | 可选 `.pptx` 模板，按占位符或顺序套用 **母版与样式** |
-| 界面 | **ttkbootstrap** 主题、布局预览、一键生成 |
-| 分发 | **PyInstaller** 打包为单文件 `PPTconvert.exe`（对方无需 Python） |
+## 当前状态
 
----
+- GUI：单一 PDF 向导，步骤为导入 PDF、识别设置、结果预览、导出结果
+- 科目识别：支持政治理论、常识判断、言语理解与表达、数量关系、判断推理、资料分析
+- 导出结果：支持题本 Word、授课 PPT、工程清单 JSON
+- 编辑能力：支持在 GUI 中查看结构树、调整资料分析材料与题目
+- 兼容能力：CLI 仍保留旧的 `Word -> PPT` 入口，便于兼容历史用法
 
-## 环境要求
+## 推荐工作流
 
-- **Python 3.10+**（开发 / 源码运行）
-- **Windows** 下打包 exe；源码运行亦可在其它系统尝试（未全面测试）
-- 生成文件为 `.pptx`，需 **Microsoft PowerPoint** 或兼容软件打开
-
----
-
-## 快速开始
+### GUI
 
 ```bash
-git clone https://github.com/BlueSky0329/PPTconvert.git
-cd PPTconvert
-pip install -r requirements.txt
 python main.py
 ```
 
-无参数启动 **图形界面**。
+GUI 默认进入 PDF 工作流：
 
-### 命令行示例
+1. 选择 PDF
+2. 勾选需要识别的科目
+3. 预览结果并修补结构
+4. 导出 Word / PPT / JSON
+
+### CLI
 
 ```bash
-# 默认输出与 Word 同名的 .pptx
-python main.py -i exam.docx
+# PDF -> Word
+python main.py --pdf-input exam.pdf --docx-output exam_题本.docx
 
-# 指定输出与模板
-python main.py -i exam.docx -o out.pptx -t template.pptx
+# PDF -> PPT
+python main.py --pdf-input exam.pdf --ppt-output exam.pptx
 
-# 选项排列（未使用模板时有效）
-python main.py -i exam.docx --layout grid --font-size 20
+# PDF -> Word + PPT，并筛选题号
+python main.py --pdf-input exam.pdf --docx-output exam_题本.docx --ppt-output exam.pptx --question-range 66-85,111-120
+
+# PDF -> 仅部分科目
+python main.py --pdf-input exam.pdf --ppt-output verbal_only.pptx --subject verbal
+python main.py --pdf-input exam.pdf --ppt-output mixed.pptx --subject politics,common_sense,verbal
+
+# 兼容旧流程：Word -> PPT
+python main.py -i exam.docx -o exam.pptx
 ```
 
-使用 `-t` 指定模板时，**样式以模板为准**，多数版式参数不再参与生成（见下文「自定义模板」）。
+## 能力边界
 
----
+当前这套规则对以下场景做了较多修补：
 
-## 文档索引
+- 六大模块识别
+- PDF 内嵌图片与页面图片补提取
+- 资料分析材料截图复用
+- 文本表格材料按 PDF 区域裁图导出
+- `D` 选项续行、行内下一题、题号独立成行等切题边界
+- 双栏页面的读序修正
 
-| 文档 | 内容 |
-|------|------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 目录结构与模块职责 |
-| [docs/GITHUB.md](docs/GITHUB.md) | **新建 GitHub 仓库并推送** 的步骤 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 本地开发与环境说明 |
+仍然需要警惕的场景：
 
----
+- 扫描版 PDF 或 OCR 错字严重的 PDF
+- 跨页材料
+- 多列表格读序异常
+- 极端版式下的题号、选项、材料混排
 
-## Word 公式与特殊符号
+这类问题目前仍建议用真实试卷做回归，再按错例补规则。
 
-- 使用 **Word 自带公式编辑器**（插入 → 公式）输入的内容，会以 Office Math（OMML）保存在文档中。
-- 程序会解析 OMML，将 **根号、分式、上下标、积分求和等** 转为可读的 **Unicode 近似文本**（如 `√(x)`、`a/b`、`x^2`），并写入 PPT 文本框。
-- **圆周率 π** 等在公式里通常已是 Unicode 字符，会原样保留。
-- 若题目写在 **表格** 中，解析会遍历表格内段落（含嵌套表格），避免漏题。
+## 安装
 
----
+### 环境要求
 
-## 自定义 PPT 模板（第一页）
+- Python 3.10+
+- Windows 为主
 
-生成时若指定模板，会 **删除模板中全部旧幻灯片**，只保留本次生成的题目页；**母版与主题**仍来自该模板。
+### 安装依赖
 
-**重要**：勾选/指定模板后，**字体、字号、颜色、对齐方式、选项排版等均以模板第一页解析结果为准**，界面或命令行里其它版式/样式参数 **不会** 再参与生成（未在模板中体现的项使用程序内置默认值）。
+```bash
+pip install -r requirements.txt
+```
 
-**推荐占位（第一页）：**
+依赖包含：
 
-| 方式 | 说明 |
-|------|------|
-| **标签占位** | 在文本框内输入：`[题干]`、`[图片]`、`[选项A]` … `[选项D]`，程序按框的位置与大小排版。 |
-| **图片区** | 插入「图片」占位符，或任意图片 + 形状名含 `图片`/`pic`；也可用仅含 `[图片]` 的文本框标出插图矩形区。 |
-| **纯顺序** | 无标签时：自上而下、先左后右，**第 1 个文本框 = 题干**，其后填满 **A～D 共四个框** 才启用「按模板矩形」排版（否则仅用模板字体颜色，版式走界面设置）。 |
-| **一行四选项** | 若 **一个** 文本框里写了 `A. … B. … C. … D. …`，程序会把该框的矩形 **四等分为 2×2**，分别填入四个选项（字号颜色仍从该框读取）。 |
+- `pymupdf`
+- `python-docx`
+- `python-pptx`
+- `Pillow`
+- `ttkbootstrap`
 
----
+## 项目结构
 
-## 界面说明
+```text
+PPTconvert/
+├── main.py
+├── core/         # PDF 抽取/解析、旧版 Word->PPT 核心
+├── ingest/       # PDF -> 工程模型构建
+├── domain/       # 统一工程模型、筛选与编辑操作
+├── exporters/    # Word / PPT / JSON 导出
+├── workflows/    # 端到端流程编排
+├── gui/          # PDF 向导界面
+├── tests/        # 回归测试
+├── docs/         # 架构、进度、GitHub 协作说明
+├── templates/    # PPT 模板
+├── examples/     # 可分享的样例
+└── outputs/      # 本地导出目录（默认忽略）
+```
 
-- **主题**：默认 ttkbootstrap `litera`（可在 `gui/ui_constants.py` 中修改 `THEME_NAME`）。
-- **流程**：顶部标题 → 三步流程条 → ① 导入/导出 → ② 模板（可选）→ ③ 版式与样式 → 题目列表。
-- **底部固定栏**：进度条 + 状态 + **一键生成** / 解析 / 生成 / 清空；主内容区可滚动。
-- **一键生成**：解析 Word 并直接导出 PPT（若未填输出路径，默认与 Word 同名的 `.pptx`）。
+更详细的模块说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
----
+## 测试
 
-## PPT 生成选项说明
+全量回归：
 
-界面中 **「PPT 生成选项」** 分三个标签页：
+```bash
+python -m unittest discover -s tests -v
+```
 
-### 布局与边距
+常用定向测试：
 
-- **页面边距**：左 / 右 / 上边距（英寸）
-- **题干区高度**：有图 / 无图时题干文本框高度
-- **间距**：题干与下方、图片之间、图片与选项区
-- **题干对齐**：左 / 中 / 右
-- **图片水平位置**：左 / 中 / 右（在内容区内）
-- **图片最大宽、高**（英寸）
+```bash
+python -m unittest tests.test_pdf_exam_parse -v
+python -m unittest tests.test_pdf_exam_extract -v
+python -m unittest tests.test_exam_project -v
+```
 
-### 选项排列
+## 仓库约定
 
-- **整体排列**：2×2 网格、竖排列表、**一行四个**（横向 ABCD）
-- **网格版式**：`A B / C D` 或 `A C / B D`
-- **一行四列**：行高、选项间距
-- **网格行高、列间距**；**列表行高**
-- **选项文字对齐**：左 / 中 / 右
+- 根目录下的 PDF、DOCX、PPT、资产目录和工程 JSON 视为本地输入/输出，默认不提交
+- 可分享样例请放到 `examples/`
+- 本地导出建议放到 `outputs/`
 
-### 布局预览
+## 文档
 
-- 独立标签页 **「布局预览」**：根据当前边距、题干区、是否含图、选项排列方式绘制示意图。
-- **字体与颜色**：字体为下拉列表（含系统字体）；颜色以色块展示，点击色块或「选色」修改。
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/STATUS.md](docs/STATUS.md)
+- [docs/GITHUB.md](docs/GITHUB.md)
+- [CONTRIBUTING.md](CONTRIBUTING.md)
 
-### 字体与颜色
+## License
 
-- **字体名称**（如 微软雅黑、宋体）
-- **题干 / 选项字号**（pt）
-- **加粗**：题干、选项字母、选项正文
-- **颜色**：题干、选项正文、选项字母（`#RRGGBB`，可点「选色」）
-- **恢复默认样式**：一键还原初始参数
-
----
-
-## 打包为 Windows exe（发给他人免装 Python）
-
-1. 本机已安装 **Python 3.10+**（安装时勾选「Add Python to PATH」）。
-2. 双击或在项目根目录运行 **`build_exe.bat`**（会自动创建 `.venv`、安装依赖并调用 PyInstaller）。
-3. 完成后得到 **`dist\PPTconvert.exe`**：可单独复制到任意 Win10/11 电脑双击运行，**无需安装 Python**。
-4. 首次启动单文件 exe 可能略慢（解压临时文件），属正常现象。
-
-**说明**：部分杀毒软件可能误报 PyInstaller 打包的程序；若遇拦截，可加入信任或改用「文件夹模式」自行调整 `PPTconvert.spec`。
-
----
-
-## 仓库说明
-
-- 根目录下的 **`*.docx` / `*.pptx`** 默认被 [`.gitignore`](.gitignore) 忽略（避免误提交个人试卷或大体积导出）。`templates/` 中的模板可随仓库分享。
-- 若需公开 **样例 Word**，可放在例如 `examples/sample.docx` 并单独 `git add`。
-
----
-
-## 开源协议
-
-本项目以 [MIT License](LICENSE) 发布。
-
----
-
-## 致谢
-
-依赖包括但不限于：[python-docx](https://github.com/python-openxml/python-docx)、[python-pptx](https://github.com/scanny/python-pptx)、[Pillow](https://python-pillow.org/)、[ttkbootstrap](https://github.com/israel-dryer/ttkbootstrap)。
+MIT

@@ -5,6 +5,10 @@ dist/
 __pycache__/
 *.py[cod]
 *.spec.bak
+.pytest_cache/
+.mypy_cache/
+.coverage
+*.log
 
 # IDE / 系统
 .idea/
@@ -14,5 +18,11 @@ __pycache__/
 Thumbs.db
 
 # 根目录下的本地试卷/导出（体积大或含隐私，不纳入仓库；需要分享样例可放到 examples/）
+/*.pdf
 /*.docx
 /*.pptx
+/*_assets/
+/*_工程.json
+/*_manifest.json
+/_tmp_*
+/outputs/

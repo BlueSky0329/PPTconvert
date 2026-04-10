@@ -17,6 +17,9 @@ class Question:
     image_paths: list[str] = field(default_factory=list)
     answer: Optional[str] = None
     source_label: Optional[str] = None
+    source_question_number: Optional[str] = None
+    material_header: Optional[str] = None
+    material_text: Optional[str] = None
 
     @property
     def display_stem(self) -> str:

@@ -1,26 +1,46 @@
-﻿import os
+import os
+import shutil
+import tempfile
 import threading
 from typing import Optional
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, colorchooser
+from tkinter import colorchooser, filedialog, messagebox, simpledialog
 
 import ttkbootstrap as ttk
+from PIL import Image, ImageTk
 from ttkbootstrap.constants import *
 from ttkbootstrap.scrolled import ScrolledFrame
 
 from core.word_parser import WordParser
+from domain.models import ALL_SUBJECT_KINDS, SUBJECT_DISPLAY_NAMES
+from domain.project_editor import (
+    insert_material_after,
+    merge_adjacent_materials,
+    move_data_question,
+    remove_question,
+    rename_material,
+    renumber_question,
+)
 from core.ppt_generator import PPTGenerator, PPTConfig
 from core.ppt_style import parse_hex_color
 from core.models import Question
+from exporters.material_crops import crop_material_regions
 from gui.font_data import build_font_values
 from gui import ui_constants as U
 
 _PAD = 14
+_PDF_WIZARD_STEPS = (
+    ("导入 PDF", "选择试卷文件，向导会按文件名预填默认输出路径。"),
+    ("识别设置", "决定要进入工程的题目范围；下一步会生成或刷新结构化预览。"),
+    ("结果预览", "校对题号、材料和题目归属；这一步的人工修正会直接用于导出。"),
+    ("导出结果", "从同一份题目工程导出题本 Word、授课 PPT 和工程 JSON。"),
+)
+_PDF_SUBJECT_ORDER = tuple(ALL_SUBJECT_KINDS)
 
 
 class PPTConvertApp:
-    """Word 转 PPT 图形界面。"""
+    """PDF 试卷整理图形界面。"""
 
     def __init__(self):
         self.root = ttk.Window(
@@ -73,8 +93,33 @@ class PPTConvertApp:
         self._preview_after: Optional[str] = None
         self.questions: list[Question] = []
         self.parser: WordParser | None = None
+        self.pdf_project = None
+        self._pdf_project_context: dict[str, str] = {}
+        self._pdf_preview_payloads: dict[str, dict] = {}
+        self._pdf_material_preview_dir: Optional[str] = None
+        self._pdf_material_preview_cache: dict[str, tuple[str, list[str]]] = {}
+        self._pdf_material_preview_paths: list[str] = []
+        self._pdf_material_preview_source = ""
+        self._pdf_material_preview_title = ""
+        self._pdf_material_preview_index = 0
+        self._pdf_material_preview_photo = None
+
+        self.pdf_path = tk.StringVar()
+        self.pdf_word_out = tk.StringVar()
+        self.pdf_ppt_out = tk.StringVar()
+        self.pdf_manifest_out = tk.StringVar()
+        self.pdf_question_range = tk.StringVar()
+        self._pdf_subject_vars = {
+            kind: tk.BooleanVar(value=True)
+            for kind in _PDF_SUBJECT_ORDER
+        }
+        self._pdf_wizard_step = 0
+        self._pdf_wizard_pending_step: Optional[int] = None
+        self._pdf_step_frames: list[ttk.Frame] = []
+        self._pdf_step_buttons: list[ttk.Button] = []
 
         self._build_ui()
+        self._bind_pdf_wizard_updates()
         self._bind_preview_updates()
         self._schedule_preview_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -84,8 +129,6 @@ class PPTConvertApp:
     def _build_ui(self):
         outer = ttk.Frame(self.root)
         outer.pack(fill=BOTH, expand=YES)
-
-        self._build_action_bar(outer)
 
         self._scroll = ScrolledFrame(outer, padding=_PAD, autohide=True)
         self._scroll.pack(fill=BOTH, expand=YES)
@@ -97,10 +140,8 @@ class PPTConvertApp:
         main = self._scroll
 
         self._build_header(main)
-        self._build_file_section(main)
-        self._build_template_section(main)
-        self._build_config_section(main)
-        self._build_question_table(main)
+        self._build_pdf_tab(main)
+        self._build_progress_footer(outer)
 
     # Header
 
@@ -145,7 +186,7 @@ class PPTConvertApp:
     # 2. Template
 
     def _build_template_section(self, parent):
-        frame = ttk.Labelframe(parent, text=" ② 模板（可选） ", bootstyle="info", padding=_PAD)
+        frame = ttk.Labelframe(parent, text=" PPT 模板（可选） ", bootstyle="info", padding=_PAD)
         frame.pack(fill=X, pady=(0, 10))
 
         row = ttk.Frame(frame)
@@ -178,7 +219,7 @@ class PPTConvertApp:
 
     def _build_config_section(self, parent):
         self._config_frame = ttk.Labelframe(
-            parent, text=" ③ 版式与样式（非模板模式） ", bootstyle="primary", padding=(2, 8),
+            parent, text=" PPT 版式与样式（非模板模式） ", bootstyle="primary", padding=(2, 8),
         )
         self._config_frame.pack(fill=X, pady=(0, 10))
 
@@ -239,20 +280,14 @@ class PPTConvertApp:
             frame, text=U.TIP_SECONDARY, font=("", 9), bootstyle="secondary",
         ).pack(anchor=W, padx=10, pady=(2, 4))
 
-    # Action bar
+    # PPT tab buttons + shared footer
 
-    def _build_action_bar(self, parent):
-        bar = ttk.Frame(parent, padding=(16, 12))
+    def _build_ppt_tab_buttons(self, parent):
+        bar = ttk.Frame(parent, padding=(16, 8))
         bar.pack(side=BOTTOM, fill=X)
-
-        self.progress = ttk.Progressbar(bar, mode="determinate", bootstyle="success-striped")
-        self.progress.pack(fill=X, pady=(0, 10))
 
         row = ttk.Frame(bar)
         row.pack(fill=X)
-
-        self.status_label = ttk.Label(row, text="就绪", anchor=W, bootstyle="secondary")
-        self.status_label.pack(side=LEFT, fill=X, expand=YES, padx=(0, 12))
 
         ttk.Button(row, text="清空", command=self._clear_all,
                    bootstyle="secondary-outline", width=7).pack(side=RIGHT, padx=3)
@@ -262,6 +297,644 @@ class PPTConvertApp:
                    bootstyle="info-outline", width=10).pack(side=RIGHT, padx=3)
         ttk.Button(row, text="一键生成", command=self._convert_all,
                    bootstyle="success", width=10).pack(side=RIGHT, padx=3)
+
+    def _build_pdf_tab(self, parent):
+        frame = ttk.Frame(parent, padding=_PAD)
+        frame.pack(fill=BOTH, expand=YES)
+
+        hdr = ttk.Frame(frame, padding=(12, 12, 12, 6))
+        hdr.pack(fill=X)
+        ttk.Label(hdr, text="PDF 试卷工作流", font=("", 15, "bold")).pack(anchor=W)
+        ttk.Label(
+            hdr, text=U.PDF_TAB_HINT, wraplength=860, font=("", 9), bootstyle="secondary",
+        ).pack(anchor=W, pady=(6, 0))
+
+        self._build_pdf_wizard(frame)
+
+    def _build_pdf_wizard(self, parent):
+        step_bar = ttk.Frame(parent, padding=(12, 6, 12, 6))
+        step_bar.pack(fill=X, pady=(2, 6))
+        self._pdf_step_buttons = []
+        for index, (title, _hint) in enumerate(_PDF_WIZARD_STEPS):
+            button = ttk.Button(
+                step_bar,
+                text=f"{index + 1}. {title}",
+                command=lambda i=index: self._request_pdf_wizard_step(i),
+                width=16,
+                bootstyle="secondary-outline",
+            )
+            button.pack(side=LEFT, padx=(0, 8))
+            self._pdf_step_buttons.append(button)
+
+        intro = ttk.Frame(parent, padding=(12, 0, 12, 6))
+        intro.pack(fill=X)
+        self._pdf_step_title_label = ttk.Label(intro, font=("", 12, "bold"))
+        self._pdf_step_title_label.pack(anchor=W)
+        self._pdf_step_hint_label = ttk.Label(
+            intro,
+            wraplength=860,
+            font=("", 9),
+            bootstyle="secondary",
+            justify=LEFT,
+        )
+        self._pdf_step_hint_label.pack(anchor=W, pady=(4, 0))
+
+        self._pdf_step_host = ttk.Frame(parent)
+        self._pdf_step_host.pack(fill=BOTH, expand=YES)
+
+        self._pdf_step_frames = []
+        for builder in (
+            self._build_pdf_step_import,
+            self._build_pdf_step_settings,
+            self._build_pdf_step_preview,
+            self._build_pdf_step_export,
+        ):
+            step_frame = ttk.Frame(self._pdf_step_host)
+            builder(step_frame)
+            self._pdf_step_frames.append(step_frame)
+
+        nav = ttk.Frame(parent, padding=(12, 8, 12, 0))
+        nav.pack(fill=X)
+        self._pdf_nav_status_label = ttk.Label(nav, bootstyle="secondary")
+        self._pdf_nav_status_label.pack(side=LEFT, fill=X, expand=YES)
+        self._pdf_prev_btn = ttk.Button(
+            nav,
+            text="上一步",
+            command=self._go_prev_pdf_step,
+            bootstyle="secondary-outline",
+            width=10,
+        )
+        self._pdf_prev_btn.pack(side=RIGHT, padx=(6, 0))
+        self._pdf_next_btn = ttk.Button(
+            nav,
+            text="下一步",
+            command=self._go_next_pdf_step,
+            bootstyle="primary",
+            width=16,
+        )
+        self._pdf_next_btn.pack(side=RIGHT)
+
+        self._show_pdf_wizard_step(0)
+
+    def _build_pdf_step_import(self, parent):
+        box = ttk.Labelframe(parent, text=" 第一步：导入试卷 ", bootstyle="info", padding=_PAD)
+        box.pack(fill=X, pady=(0, 8))
+
+        self._file_row(box, "PDF 文件", self.pdf_path, self._browse_pdf, "浏览...", pady=(0, 0))
+        ttk.Label(
+            box,
+            text="导出文件路径会在最后一步统一确认；当前只需要先锁定试卷 PDF。",
+            font=("", 9),
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(8, 0))
+
+        self._pdf_import_summary = ttk.Label(
+            box,
+            wraplength=840,
+            justify=LEFT,
+            bootstyle="secondary",
+        )
+        self._pdf_import_summary.pack(anchor=W, pady=(10, 0))
+
+        tips = ttk.Labelframe(parent, text=" 工作流说明 ", bootstyle="secondary", padding=_PAD)
+        tips.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            tips,
+            text=(
+                "向导会按“导入 PDF -> 识别设置 -> 结果预览 -> 导出结果”推进。\n"
+                "资料分析 PPT 会优先复用从 PDF 页面裁切出来的材料图，不再走 Word 二次解析。"
+            ),
+            wraplength=840,
+            justify=LEFT,
+        ).pack(anchor=W)
+
+    def _build_pdf_step_settings(self, parent):
+        box = ttk.Labelframe(parent, text=" 第二步：识别设置 ", bootstyle="info", padding=_PAD)
+        box.pack(fill=X, pady=(0, 8))
+
+        subject_box = ttk.Frame(box)
+        subject_box.pack(fill=X, pady=(0, 0))
+        ttk.Label(subject_box, text="处理科目", width=10).pack(side=LEFT, anchor=N)
+        subject_panel = ttk.Frame(subject_box)
+        subject_panel.pack(side=LEFT, fill=X, expand=YES)
+
+        row1 = ttk.Frame(subject_panel)
+        row1.pack(anchor=W)
+        row2 = ttk.Frame(subject_panel)
+        row2.pack(anchor=W, pady=(6, 0))
+        action_row = ttk.Frame(subject_panel)
+        action_row.pack(anchor=W, pady=(8, 0))
+
+        for index, kind in enumerate(_PDF_SUBJECT_ORDER):
+            host = row1 if index < 3 else row2
+            ttk.Checkbutton(
+                host,
+                text=SUBJECT_DISPLAY_NAMES.get(kind, kind),
+                variable=self._pdf_subject_vars[kind],
+                bootstyle="round-toggle",
+            ).pack(side=LEFT, padx=(0, 10))
+
+        ttk.Button(
+            action_row,
+            text="全选",
+            command=lambda: self._set_all_pdf_subjects(True),
+            bootstyle="secondary-outline",
+            width=8,
+        ).pack(side=LEFT, padx=(0, 6))
+        ttk.Button(
+            action_row,
+            text="清空",
+            command=lambda: self._set_all_pdf_subjects(False),
+            bootstyle="secondary-outline",
+            width=8,
+        ).pack(side=LEFT)
+
+        range_row = ttk.Frame(box)
+        range_row.pack(fill=X, pady=(8, 0))
+        ttk.Label(range_row, text="题号范围", width=10).pack(side=LEFT)
+        ttk.Entry(range_row, textvariable=self.pdf_question_range).pack(
+            side=LEFT, fill=X, expand=YES, padx=(0, 8)
+        )
+        ttk.Label(
+            range_row,
+            text="例如 66-85,111-115；留空表示导出当前科目全部题目",
+            font=("", 9),
+            bootstyle="secondary",
+        ).pack(side=LEFT)
+
+        self._pdf_settings_summary = ttk.Label(
+            box,
+            wraplength=840,
+            justify=LEFT,
+            bootstyle="secondary",
+        )
+        self._pdf_settings_summary.pack(anchor=W, pady=(10, 0))
+
+        action_row = ttk.Frame(box)
+        action_row.pack(fill=X, pady=(12, 0))
+        ttk.Button(
+            action_row,
+            text="生成预览并进入下一步",
+            command=self._start_pdf_preview_step,
+            bootstyle="primary",
+            width=18,
+        ).pack(side=RIGHT)
+
+    def _build_pdf_step_preview(self, parent):
+        ttk.Label(
+            parent,
+            text="第三步会把当前筛选结果整理成题目工程。你可以直接修改题号、材料标题、题目归属，导出时会复用当前工程。",
+            wraplength=860,
+            justify=LEFT,
+            font=("", 9),
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 8), padx=12)
+        self._pdf_preview_summary = ttk.Label(
+            parent,
+            wraplength=860,
+            justify=LEFT,
+            bootstyle="secondary",
+        )
+        self._pdf_preview_summary.pack(anchor=W, pady=(0, 8), padx=12)
+        self._build_pdf_preview(parent)
+
+    def _build_pdf_step_export(self, parent):
+        summary = ttk.Labelframe(parent, text=" 第四步：导出结果 ", bootstyle="info", padding=_PAD)
+        summary.pack(fill=X, pady=(0, 8))
+        self._pdf_export_summary = ttk.Label(
+            summary,
+            wraplength=840,
+            justify=LEFT,
+            bootstyle="secondary",
+        )
+        self._pdf_export_summary.pack(anchor=W)
+
+        box = ttk.Labelframe(parent, text=" 导出文件 ", bootstyle="primary", padding=_PAD)
+        box.pack(fill=X, pady=(0, 8))
+
+        self._file_row(box, "题本 Word", self.pdf_word_out, self._browse_pdf_word, "另存为...", pady=(0, 0))
+        self._file_row(box, "授课 PPT", self.pdf_ppt_out, self._browse_pdf_ppt, "另存为...", pady=(6, 0))
+        self._file_row(box, "工程 JSON", self.pdf_manifest_out, self._browse_pdf_manifest, "另存为...", pady=(6, 0))
+
+        template_row = ttk.Frame(box)
+        template_row.pack(fill=X, pady=(8, 0))
+        ttk.Label(template_row, text="PPT 模板", width=10).pack(side=LEFT)
+        ttk.Entry(template_row, textvariable=self.template_path).pack(
+            side=LEFT, fill=X, expand=YES, padx=(0, 8)
+        )
+        ttk.Button(
+            template_row,
+            text="选择...",
+            command=self._browse_template,
+            bootstyle="info-outline",
+            width=8,
+        ).pack(side=RIGHT)
+
+        action_row = ttk.Frame(parent, padding=(0, 4))
+        action_row.pack(fill=X)
+        ttk.Button(
+            action_row,
+            text="重新预览",
+            command=self._preview_pdf_project,
+            bootstyle="secondary-outline",
+            width=12,
+        ).pack(side=LEFT)
+        ttk.Button(
+            action_row,
+            text="仅导出 Word",
+            command=self._export_pdf_word,
+            bootstyle="info-outline",
+            width=12,
+        ).pack(side=RIGHT, padx=(4, 0))
+        ttk.Button(
+            action_row,
+            text="仅导出 PPT",
+            command=self._export_pdf_ppt,
+            bootstyle="success-outline",
+            width=12,
+        ).pack(side=RIGHT, padx=4)
+        ttk.Button(
+            action_row,
+            text="导出 Word + PPT",
+            command=self._export_pdf_bundle,
+            bootstyle="success",
+            width=16,
+        ).pack(side=RIGHT, padx=4)
+
+        self._build_template_section(parent)
+        self._build_config_section(parent)
+
+    def _build_progress_footer(self, parent):
+        bar = ttk.Frame(parent, padding=(16, 10))
+        bar.pack(side=BOTTOM, fill=X)
+
+        self.progress = ttk.Progressbar(bar, mode="determinate", bootstyle="success-striped")
+        self.progress.pack(fill=X, pady=(0, 8))
+
+        row = ttk.Frame(bar)
+        row.pack(fill=X)
+        self.status_label = ttk.Label(row, text="就绪", anchor=W, bootstyle="secondary")
+        self.status_label.pack(side=LEFT, fill=X, expand=YES)
+
+    def _selected_pdf_subjects(self) -> list[str]:
+        return [
+            kind
+            for kind in _PDF_SUBJECT_ORDER
+            if self._pdf_subject_vars[kind].get()
+        ]
+
+    def _current_pdf_subject_spec(self) -> str:
+        selected = self._selected_pdf_subjects()
+        if not selected:
+            return ""
+        if tuple(selected) == _PDF_SUBJECT_ORDER:
+            return "all"
+        return ",".join(selected)
+
+    def _selected_pdf_subject_labels(self) -> str:
+        selected = self._selected_pdf_subjects()
+        if not selected:
+            return "未选择科目"
+        return " / ".join(SUBJECT_DISPLAY_NAMES.get(kind, kind) for kind in selected)
+
+    def _set_all_pdf_subjects(self, selected: bool):
+        for var in self._pdf_subject_vars.values():
+            var.set(selected)
+
+    def _bind_pdf_wizard_updates(self):
+        watched = [
+            self.pdf_path,
+            self.pdf_question_range,
+            self.pdf_word_out,
+            self.pdf_ppt_out,
+            self.pdf_manifest_out,
+            self.template_path,
+        ]
+        for var in watched:
+            try:
+                var.trace_add("write", lambda *_: self._refresh_pdf_wizard_ui())
+            except Exception:
+                pass
+        for var in self._pdf_subject_vars.values():
+            try:
+                var.trace_add("write", lambda *_: self._refresh_pdf_wizard_ui())
+            except Exception:
+                pass
+
+    def _pdf_project_matches_current_selection(self) -> bool:
+        return (
+            self.pdf_project is not None
+            and self._pdf_project_context.get("pdf_path") == self.pdf_path.get().strip()
+            and self._pdf_project_context.get("subject_spec", "all") == self._current_pdf_subject_spec()
+            and self._pdf_project_context.get("range_spec", "") == self.pdf_question_range.get().strip()
+        )
+
+    def _pdf_can_enter_step(self, index: int, *, show_message: bool) -> bool:
+        if index <= 0:
+            return True
+
+        pdf_file = self.pdf_path.get().strip()
+        if not pdf_file:
+            if show_message:
+                messagebox.showwarning("提示", "请先在第一步选择 PDF 文件")
+            return False
+        if not os.path.exists(pdf_file):
+            if show_message:
+                messagebox.showerror("错误", f"文件不存在：{pdf_file}")
+            return False
+        if not self._selected_pdf_subjects():
+            if show_message:
+                messagebox.showwarning("提示", "请至少选择一个科目")
+            return False
+
+        if index >= 2 and not self._pdf_project_matches_current_selection():
+            if show_message:
+                messagebox.showinfo("提示", "请先在第二步生成当前设置对应的预览")
+            return False
+        return True
+
+    def _request_pdf_wizard_step(self, index: int):
+        if index == self._pdf_wizard_step:
+            return
+        if index < self._pdf_wizard_step:
+            self._show_pdf_wizard_step(index)
+            return
+        if index == 1:
+            if self._pdf_can_enter_step(index, show_message=True):
+                self._show_pdf_wizard_step(index)
+            return
+        if index == 2:
+            self._start_pdf_preview_step()
+            return
+        if self._pdf_can_enter_step(index, show_message=True):
+            self._show_pdf_wizard_step(index)
+
+    def _show_pdf_wizard_step(self, index: int):
+        if not self._pdf_step_frames:
+            return
+        self._pdf_wizard_step = max(0, min(index, len(self._pdf_step_frames) - 1))
+        for step_index, frame in enumerate(self._pdf_step_frames):
+            frame.pack_forget()
+            if step_index == self._pdf_wizard_step:
+                frame.pack(fill=BOTH, expand=YES)
+        self._refresh_pdf_wizard_ui()
+
+    def _go_prev_pdf_step(self):
+        if self._pdf_wizard_step > 0:
+            self._show_pdf_wizard_step(self._pdf_wizard_step - 1)
+
+    def _go_next_pdf_step(self):
+        if self._pdf_wizard_step == 0:
+            if self._pdf_can_enter_step(1, show_message=True):
+                self._show_pdf_wizard_step(1)
+        elif self._pdf_wizard_step == 1:
+            self._start_pdf_preview_step()
+        elif self._pdf_wizard_step == 2:
+            if self._pdf_can_enter_step(3, show_message=True):
+                self._show_pdf_wizard_step(3)
+
+    def _start_pdf_preview_step(self):
+        if not self._pdf_can_enter_step(1, show_message=True):
+            return
+        self._pdf_wizard_pending_step = 2
+        self._preview_pdf_project()
+
+    def _refresh_pdf_wizard_ui(self):
+        if not getattr(self, "_pdf_step_title_label", None):
+            return
+
+        title, hint = _PDF_WIZARD_STEPS[self._pdf_wizard_step]
+        self._pdf_step_title_label.configure(text=f"第 {self._pdf_wizard_step + 1} 步 · {title}")
+        self._pdf_step_hint_label.configure(text=hint)
+
+        for index, button in enumerate(getattr(self, "_pdf_step_buttons", [])):
+            if index == self._pdf_wizard_step:
+                style = "primary"
+            elif index == 0 and self.pdf_path.get().strip():
+                style = "success-outline"
+            elif index in (1, 2) and self._pdf_project_matches_current_selection():
+                style = "success-outline"
+            else:
+                style = "secondary-outline"
+            button.configure(bootstyle=style)
+
+        self._pdf_prev_btn.configure(state=NORMAL if self._pdf_wizard_step > 0 else DISABLED)
+
+        if self._pdf_wizard_step == 0:
+            self._pdf_next_btn.configure(text="下一步：识别设置", state=NORMAL, bootstyle="primary")
+        elif self._pdf_wizard_step == 1:
+            self._pdf_next_btn.configure(text="生成预览", state=NORMAL, bootstyle="primary")
+        elif self._pdf_wizard_step == 2:
+            state = NORMAL if self._pdf_project_matches_current_selection() else DISABLED
+            self._pdf_next_btn.configure(text="下一步：导出结果", state=state, bootstyle="success")
+        else:
+            self._pdf_next_btn.configure(text="已到最后一步", state=DISABLED, bootstyle="secondary")
+
+        range_text = self.pdf_question_range.get().strip() or "当前科目全部题目"
+        pdf_file = self.pdf_path.get().strip()
+        base_name = os.path.basename(pdf_file) if pdf_file else "未选择 PDF"
+        subject_text = self._selected_pdf_subject_labels()
+        preview_ready = self._pdf_project_matches_current_selection()
+        if preview_ready:
+            preview_state = f"当前预览已就绪，共 {self.pdf_project.question_count} 道题。"
+        elif self.pdf_project is not None:
+            preview_state = "已有旧预览，但与当前设置不一致，请重新生成。"
+        else:
+            preview_state = "尚未生成预览。"
+
+        import_summary = "未选择 PDF 文件。"
+        if pdf_file:
+            import_summary = (
+                f"当前试卷：{base_name}\n"
+                f"默认题本：{self.pdf_word_out.get().strip() or os.path.splitext(pdf_file)[0] + '_真题.docx'}\n"
+                f"默认课件：{self.pdf_ppt_out.get().strip() or os.path.splitext(pdf_file)[0] + '_授课.pptx'}\n"
+                f"默认工程：{self.pdf_manifest_out.get().strip() or os.path.splitext(pdf_file)[0] + '_工程.json'}"
+            )
+        if getattr(self, "_pdf_import_summary", None):
+            self._pdf_import_summary.configure(text=import_summary)
+
+        settings_summary = (
+            f"当前试卷：{base_name}\n"
+            f"处理科目：{subject_text}\n"
+            f"题号范围：{range_text}\n"
+            f"{preview_state}"
+        )
+        if getattr(self, "_pdf_settings_summary", None):
+            self._pdf_settings_summary.configure(text=settings_summary)
+
+        preview_summary = (
+            f"当前试卷：{base_name}\n"
+            f"筛选：{subject_text}；题号范围 {range_text}\n"
+            f"{preview_state}"
+        )
+        if getattr(self, "_pdf_preview_summary", None):
+            self._pdf_preview_summary.configure(text=preview_summary)
+
+        if preview_ready:
+            asset_dir = self._pdf_project_context.get("asset_dir", "-")
+            export_summary = (
+                f"当前工程共 {self.pdf_project.question_count} 道题，素材目录：{asset_dir}\n"
+                "导出会直接复用当前预览中的人工修改。"
+            )
+        else:
+            export_summary = "请先在上一步生成当前设置对应的预览工程。"
+        if getattr(self, "_pdf_export_summary", None):
+            self._pdf_export_summary.configure(text=export_summary)
+
+        if getattr(self, "_pdf_nav_status_label", None):
+            self._pdf_nav_status_label.configure(text=preview_state)
+
+    def _build_pdf_preview(self, parent):
+        frame = ttk.Labelframe(parent, text=" 结果预览 ", bootstyle="primary", padding=(10, 8))
+        frame.pack(fill=BOTH, expand=YES, pady=(6, 0))
+
+        split = ttk.Panedwindow(frame, orient=HORIZONTAL)
+        split.pack(fill=BOTH, expand=YES)
+
+        left = ttk.Frame(split)
+        right = ttk.Frame(split)
+        split.add(left, weight=3)
+        split.add(right, weight=4)
+
+        cols = ("kind", "source", "count")
+        self.pdf_tree = ttk.Treeview(
+            left,
+            columns=cols,
+            show="tree headings",
+            height=12,
+            bootstyle="info",
+        )
+        self.pdf_tree.heading("#0", text="节点")
+        self.pdf_tree.heading("kind", text="类型")
+        self.pdf_tree.heading("source", text="题号")
+        self.pdf_tree.heading("count", text="数量")
+        self.pdf_tree.column("#0", width=320)
+        self.pdf_tree.column("kind", width=70, anchor=CENTER)
+        self.pdf_tree.column("source", width=70, anchor=CENTER)
+        self.pdf_tree.column("count", width=60, anchor=CENTER)
+        self.pdf_tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        sb = ttk.Scrollbar(left, orient=VERTICAL, command=self.pdf_tree.yview)
+        self.pdf_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT, fill=Y)
+        self.pdf_tree.bind("<<TreeviewSelect>>", self._on_pdf_preview_select)
+
+        action_box = ttk.Frame(right)
+        action_box.pack(fill=X, pady=(0, 6))
+        action_row = ttk.Frame(action_box)
+        action_row.pack(fill=X)
+        ttk.Button(
+            action_row,
+            text="重新生成预览",
+            command=self._preview_pdf_project,
+            bootstyle="secondary-outline",
+            width=12,
+        ).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(
+            action_row,
+            text="改题号",
+            command=self._edit_selected_question_number,
+            bootstyle="info-outline",
+            width=8,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row,
+            text="删题",
+            command=self._remove_selected_question,
+            bootstyle="danger-outline",
+            width=7,
+        ).pack(side=LEFT, padx=4)
+        action_row2 = ttk.Frame(action_box)
+        action_row2.pack(fill=X, pady=(6, 0))
+        ttk.Button(
+            action_row2,
+            text="材料改名",
+            command=self._rename_selected_material,
+            bootstyle="warning-outline",
+            width=10,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row2,
+            text="下方新建材料",
+            command=self._insert_material_after_selection,
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row2,
+            text="并入上一材料",
+            command=lambda: self._merge_selected_material(-1),
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row2,
+            text="并入下一材料",
+            command=lambda: self._merge_selected_material(1),
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row2,
+            text="移到上一材料",
+            command=lambda: self._move_selected_question_between_materials(-1),
+            bootstyle="secondary-outline",
+            width=12,
+        ).pack(side=LEFT, padx=4)
+        ttk.Button(
+            action_row2,
+            text="移到下一材料",
+            command=lambda: self._move_selected_question_between_materials(1),
+            bootstyle="secondary-outline",
+            width=12,
+        ).pack(side=LEFT, padx=4)
+
+        preview_box = ttk.Labelframe(right, text=" 材料原貌 ", bootstyle="secondary", padding=(8, 6))
+        preview_box.pack(fill=X, pady=(0, 8))
+        preview_nav = ttk.Frame(preview_box)
+        preview_nav.pack(fill=X, pady=(0, 6))
+        self._pdf_material_preview_status = ttk.Label(
+            preview_nav,
+            text="选择资料分析材料或题目后，可查看 PDF 区域原貌。",
+        )
+        self._pdf_material_preview_status.pack(side=LEFT, fill=X, expand=YES)
+        self._pdf_material_preview_prev = ttk.Button(
+            preview_nav,
+            text="上一张",
+            command=lambda: self._step_pdf_material_preview(-1),
+            width=8,
+            bootstyle="secondary-outline",
+            state=DISABLED,
+        )
+        self._pdf_material_preview_prev.pack(side=LEFT, padx=(4, 4))
+        self._pdf_material_preview_next = ttk.Button(
+            preview_nav,
+            text="下一张",
+            command=lambda: self._step_pdf_material_preview(1),
+            width=8,
+            bootstyle="secondary-outline",
+            state=DISABLED,
+        )
+        self._pdf_material_preview_next.pack(side=LEFT)
+        self._pdf_material_preview_box = ttk.Label(
+            preview_box,
+            text="暂无材料原貌",
+            anchor=CENTER,
+            justify=CENTER,
+        )
+        self._pdf_material_preview_box.pack(fill=X, expand=YES, ipady=70)
+        self._pdf_material_preview_box.bind(
+            "<Configure>",
+            lambda _event: self._render_pdf_material_preview(),
+        )
+
+        ttk.Label(
+            right,
+            text="详情",
+            font=("", 10, "bold"),
+        ).pack(anchor=W, pady=(0, 6))
+        self.pdf_detail = tk.Text(right, wrap="word", height=16)
+        self.pdf_detail.pack(fill=BOTH, expand=YES)
+        self.pdf_detail.configure(state="disabled")
 
     # Tabs
 
@@ -617,6 +1290,171 @@ class PPTConvertApp:
         if path:
             self.template_path.set(path)
 
+    def _browse_pdf(self):
+        path = filedialog.askopenfilename(
+            title="选择 PDF 试卷",
+            filetypes=[("PDF", "*.pdf"), ("All", "*.*")],
+        )
+        if path:
+            self.pdf_path.set(path)
+            if not self.pdf_word_out.get().strip():
+                self.pdf_word_out.set(os.path.splitext(path)[0] + "_真题.docx")
+            if not self.pdf_ppt_out.get().strip():
+                self.pdf_ppt_out.set(os.path.splitext(path)[0] + "_授课.pptx")
+            if not self.pdf_manifest_out.get().strip():
+                self.pdf_manifest_out.set(os.path.splitext(path)[0] + "_工程.json")
+
+    def _browse_pdf_word(self):
+        path = filedialog.asksaveasfilename(
+            title="保存真题 Word",
+            defaultextension=".docx",
+            filetypes=[("Word", "*.docx"), ("All", "*.*")],
+        )
+        if path:
+            self.pdf_word_out.set(path)
+
+    def _browse_pdf_ppt(self):
+        path = filedialog.asksaveasfilename(
+            title="保存授课 PPT",
+            defaultextension=".pptx",
+            filetypes=[("PowerPoint", "*.pptx"), ("All", "*.*")],
+        )
+        if path:
+            self.pdf_ppt_out.set(path)
+
+    def _browse_pdf_manifest(self):
+        path = filedialog.asksaveasfilename(
+            title="保存工程清单 JSON",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if path:
+            self.pdf_manifest_out.set(path)
+
+    def _preview_pdf_project(self):
+        self._run_pdf_project(export_word=False, export_ppt=False)
+
+    def _export_pdf_word(self):
+        self._run_pdf_project(export_word=True, export_ppt=False)
+
+    def _export_pdf_ppt(self):
+        self._run_pdf_project(export_word=False, export_ppt=True)
+
+    def _export_pdf_bundle(self):
+        self._run_pdf_project(export_word=True, export_ppt=True)
+
+    def _run_pdf_project(self, *, export_word: bool, export_ppt: bool):
+        from workflows.project_flow import build_pdf_project, export_project_outputs
+
+        pdf_file = self.pdf_path.get().strip()
+        if not pdf_file:
+            messagebox.showwarning("提示", "请先选择 PDF 文件")
+            return
+        if not os.path.exists(pdf_file):
+            messagebox.showerror("错误", f"文件不存在：{pdf_file}")
+            return
+
+        subject_spec = self._current_pdf_subject_spec()
+        if not subject_spec:
+            messagebox.showwarning("提示", "请至少选择一个科目")
+            return
+        range_spec = self.pdf_question_range.get().strip()
+
+        docx_output = self.pdf_word_out.get().strip() if export_word else None
+        ppt_output = self.pdf_ppt_out.get().strip() if export_ppt else None
+        manifest_output = self.pdf_manifest_out.get().strip() or None
+        if export_word and not docx_output:
+            docx_output = os.path.splitext(pdf_file)[0] + "_真题.docx"
+            self.pdf_word_out.set(docx_output)
+        if export_ppt and not ppt_output:
+            ppt_output = os.path.splitext(pdf_file)[0] + "_授课.pptx"
+            self.pdf_ppt_out.set(ppt_output)
+        if not (export_word or export_ppt):
+            manifest_output = None
+        elif not manifest_output:
+            manifest_output = os.path.splitext(pdf_file)[0] + "_工程.json"
+            self.pdf_manifest_out.set(manifest_output)
+
+        template = self.template_path.get().strip() or None
+        if template and not os.path.exists(template):
+            messagebox.showerror("错误", "PPT 模板文件不存在")
+            return
+
+        self._set_status("正在从 PDF 整理题目工程…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = 100
+
+        use_cached_project = (
+            self.pdf_project is not None
+            and self._pdf_project_context.get("pdf_path") == pdf_file
+            and self._pdf_project_context.get("subject_spec", "all") == subject_spec
+            and self._pdf_project_context.get("range_spec", "") == range_spec
+        )
+
+        def work():
+            try:
+                if use_cached_project:
+                    project = self.pdf_project
+                    asset_dir = self._pdf_project_context.get("asset_dir", "")
+                else:
+                    project, asset_dir = build_pdf_project(
+                        pdf_file,
+                        mode=subject_spec,
+                        question_range_spec=range_spec,
+                    )
+                ppt_config = self._make_ppt_config() if export_ppt else None
+                outputs = export_project_outputs(
+                    project,
+                    asset_dir=asset_dir,
+                    docx_output=docx_output,
+                    ppt_output=ppt_output,
+                    manifest_output=manifest_output,
+                    template_path=template,
+                    ppt_config=ppt_config,
+                )
+                self.root.after(0, lambda: self._on_pdf_project_done(project, outputs))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_pdf_project_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pdf_project_done(self, project, outputs):
+        self.pdf_project = project
+        self._pdf_project_context = {
+            "pdf_path": self.pdf_path.get().strip(),
+            "subject_spec": self._current_pdf_subject_spec(),
+            "range_spec": self.pdf_question_range.get().strip(),
+            "asset_dir": outputs.asset_dir,
+        }
+        self._reset_pdf_material_preview_session()
+        self._populate_pdf_preview(project)
+        preview_only = not (outputs.docx_path or outputs.pptx_path or outputs.manifest_path)
+        if preview_only:
+            self._show_pdf_wizard_step(self._pdf_wizard_pending_step or 2)
+        else:
+            self._show_pdf_wizard_step(3)
+        self._pdf_wizard_pending_step = None
+        self.progress["value"] = self.progress["maximum"]
+        self._set_status(f"PDF 工作流已完成，共 {project.question_count} 道题")
+        result_lines = [f"共整理题目：{project.question_count}", f"素材目录：{outputs.asset_dir}"]
+        if outputs.docx_path:
+            result_lines.append(f"题本 Word：{outputs.docx_path}")
+        if outputs.pptx_path:
+            result_lines.append(f"授课 PPT：{outputs.pptx_path}")
+        if outputs.manifest_path:
+            result_lines.append(f"工程 JSON：{outputs.manifest_path}")
+        if outputs.docx_path or outputs.pptx_path or outputs.manifest_path:
+            messagebox.showinfo(
+                "完成",
+                "\n".join(result_lines),
+            )
+
+    def _on_pdf_project_error(self, msg: str):
+        self._pdf_wizard_pending_step = None
+        self.progress["value"] = 0
+        self._set_status("PDF 工作流失败")
+        messagebox.showerror("处理失败", msg)
+
     # -----------------------------------------------------------------------------
     # Core operations
     # -----------------------------------------------------------------------------
@@ -637,6 +1475,423 @@ class PPTConvertApp:
                     f"{image_count} 张" if image_count else "-",
                 ),
             )
+
+    def _clear_pdf_preview(self):
+        self.pdf_project = None
+        self._pdf_wizard_pending_step = None
+        self._pdf_project_context = {}
+        self._pdf_preview_payloads.clear()
+        self._reset_pdf_material_preview_session()
+        if getattr(self, "pdf_tree", None):
+            for item in self.pdf_tree.get_children():
+                self.pdf_tree.delete(item)
+        self._set_pdf_detail("")
+        self._refresh_pdf_wizard_ui()
+
+    def _set_pdf_detail(self, text: str):
+        if not getattr(self, "pdf_detail", None):
+            return
+        self.pdf_detail.configure(state="normal")
+        self.pdf_detail.delete("1.0", tk.END)
+        self.pdf_detail.insert("1.0", text or "暂无内容")
+        self.pdf_detail.configure(state="disabled")
+
+    def _selected_pdf_payload(self) -> dict:
+        if not getattr(self, "pdf_tree", None):
+            return {}
+        selected = self.pdf_tree.selection()
+        if not selected:
+            return {}
+        return self._pdf_preview_payloads.get(selected[0], {})
+
+    def _reset_pdf_material_preview_session(self):
+        if self._pdf_material_preview_dir and os.path.isdir(self._pdf_material_preview_dir):
+            shutil.rmtree(self._pdf_material_preview_dir, ignore_errors=True)
+        self._pdf_material_preview_dir = None
+        self._pdf_material_preview_cache.clear()
+        self._pdf_material_preview_paths = []
+        self._pdf_material_preview_source = ""
+        self._pdf_material_preview_title = ""
+        self._pdf_material_preview_index = 0
+        self._pdf_material_preview_photo = None
+        self._set_pdf_material_preview_message(
+            "选择资料分析材料或题目后，可查看 PDF 区域原貌。",
+            "暂无材料原貌",
+        )
+
+    def _ensure_pdf_material_preview_dir(self) -> str:
+        if self._pdf_material_preview_dir and os.path.isdir(self._pdf_material_preview_dir):
+            return self._pdf_material_preview_dir
+        self._pdf_material_preview_dir = tempfile.mkdtemp(prefix="pptconvert_gui_material_preview_")
+        return self._pdf_material_preview_dir
+
+    def _set_pdf_material_preview_message(self, message: str, status: str):
+        self._pdf_material_preview_photo = None
+        if getattr(self, "_pdf_material_preview_status", None):
+            self._pdf_material_preview_status.configure(text=status)
+        if getattr(self, "_pdf_material_preview_prev", None):
+            self._pdf_material_preview_prev.configure(state=DISABLED)
+        if getattr(self, "_pdf_material_preview_next", None):
+            self._pdf_material_preview_next.configure(state=DISABLED)
+        if getattr(self, "_pdf_material_preview_box", None):
+            self._pdf_material_preview_box.configure(image="", text=message)
+
+    def _current_material_preview_target(self, payload: dict):
+        if payload.get("kind") == "material":
+            return payload.get("material")
+        if payload.get("kind") == "question" and payload.get("section_kind") == "data":
+            return payload.get("material")
+        return None
+
+    def _material_preview_entries(self, material) -> tuple[str, list[str]]:
+        cache_key = str(material.material_id or id(material))
+        cached = self._pdf_material_preview_cache.get(cache_key)
+        if cached:
+            return cached
+
+        source = ""
+        paths: list[str] = []
+        pdf_path = self._pdf_project_context.get("pdf_path") or ""
+        if pdf_path and material.body_regions:
+            paths = crop_material_regions(
+                pdf_path,
+                material,
+                self._ensure_pdf_material_preview_dir(),
+                dpi=144,
+            )
+            if paths:
+                source = "PDF 区域预览"
+        if not paths and material.body_assets:
+            paths = [
+                asset.path
+                for asset in material.body_assets
+                if asset.path and os.path.exists(asset.path)
+            ]
+            if paths:
+                source = "材料图片"
+
+        result = (source, paths)
+        self._pdf_material_preview_cache[cache_key] = result
+        return result
+
+    def _show_pdf_material_preview_for_payload(self, payload: dict):
+        material = self._current_material_preview_target(payload)
+        if material is None:
+            self._pdf_material_preview_paths = []
+            self._pdf_material_preview_source = ""
+            self._pdf_material_preview_title = ""
+            self._pdf_material_preview_index = 0
+            self._pdf_material_preview_photo = None
+            self._set_pdf_material_preview_message(
+                "选择资料分析材料或题目后，可查看 PDF 区域原貌。",
+                "暂无材料原貌",
+            )
+            return
+
+        source, paths = self._material_preview_entries(material)
+        if not paths:
+            self._pdf_material_preview_paths = []
+            self._pdf_material_preview_source = ""
+            self._pdf_material_preview_title = ""
+            self._pdf_material_preview_index = 0
+            self._pdf_material_preview_photo = None
+            self._set_pdf_material_preview_message(
+                "当前材料没有可用的区域截图或图片素材，请先参考下方结构化文本。",
+                f"{material.header or material.material_id}：暂无可视预览",
+            )
+            return
+
+        self._pdf_material_preview_paths = paths
+        self._pdf_material_preview_source = source
+        self._pdf_material_preview_title = material.header or material.material_id
+        self._pdf_material_preview_index = 0
+        self._render_pdf_material_preview()
+
+    def _step_pdf_material_preview(self, delta: int):
+        if not self._pdf_material_preview_paths:
+            return
+        self._pdf_material_preview_index = (
+            self._pdf_material_preview_index + delta
+        ) % len(self._pdf_material_preview_paths)
+        self._render_pdf_material_preview()
+
+    def _render_pdf_material_preview(self, title: str = ""):
+        if not getattr(self, "_pdf_material_preview_box", None):
+            return
+        if not self._pdf_material_preview_paths:
+            return
+        index = min(self._pdf_material_preview_index, len(self._pdf_material_preview_paths) - 1)
+        image_path = self._pdf_material_preview_paths[index]
+        if not os.path.exists(image_path):
+            self._set_pdf_material_preview_message(
+                "预览图片不存在，请重新生成预览。",
+                "材料原貌不可用",
+            )
+            return
+
+        target_width = self._pdf_material_preview_box.winfo_width()
+        max_width = max(260, target_width - 20) if target_width > 40 else 420
+        with Image.open(image_path) as source_image:
+            image = source_image.copy()
+        image.thumbnail((max_width, 240), Image.Resampling.LANCZOS)
+        self._pdf_material_preview_photo = ImageTk.PhotoImage(image)
+        self._pdf_material_preview_box.configure(image=self._pdf_material_preview_photo, text="")
+
+        preview_title = title or self._pdf_material_preview_title or "材料原貌"
+        self._pdf_material_preview_status.configure(
+            text=(
+                f"{preview_title} · {self._pdf_material_preview_source} "
+                f"{index + 1}/{len(self._pdf_material_preview_paths)}"
+            )
+        )
+        state = NORMAL if len(self._pdf_material_preview_paths) > 1 else DISABLED
+        self._pdf_material_preview_prev.configure(state=state)
+        self._pdf_material_preview_next.configure(state=state)
+
+    def _refresh_pdf_preview_after_edit(self, detail_text: str | None = None):
+        if self.pdf_project is None:
+            return
+        self._reset_pdf_material_preview_session()
+        self._populate_pdf_preview(self.pdf_project)
+        if detail_text:
+            self._set_pdf_detail(detail_text)
+
+    def _edit_selected_question_number(self):
+        payload = self._selected_pdf_payload()
+        if payload.get("kind") != "question":
+            messagebox.showinfo("提示", "请先在左侧选择一道题目")
+            return
+        question = payload.get("question")
+        if question is None:
+            return
+        new_number = simpledialog.askstring(
+            "修改题号",
+            "输入新的原题号：",
+            initialvalue=question.source_number or "",
+            parent=self.root,
+        )
+        if new_number is None:
+            return
+        renumber_question(question, new_number)
+        self._refresh_pdf_preview_after_edit("已更新题号。")
+
+    def _rename_selected_material(self):
+        payload = self._selected_pdf_payload()
+        if payload.get("kind") != "material":
+            messagebox.showinfo("提示", "请先选择一个材料节点")
+            return
+        material = payload.get("material")
+        if material is None:
+            return
+        new_header = simpledialog.askstring(
+            "修改材料标题",
+            "输入新的材料标题：",
+            initialvalue=material.header or "",
+            parent=self.root,
+        )
+        if new_header is None:
+            return
+        rename_material(material, new_header)
+        self._refresh_pdf_preview_after_edit("已更新材料标题。")
+
+    def _insert_material_after_selection(self):
+        payload = self._selected_pdf_payload()
+        material = payload.get("material")
+        if material is None:
+            messagebox.showinfo("提示", "请先选择一个材料节点，或选择资料分析中的一道题目")
+            return
+        if payload.get("section_kind") != "data":
+            messagebox.showinfo("提示", "只有资料分析部分支持新增材料组")
+            return
+        new_header = simpledialog.askstring(
+            "新建材料",
+            "输入新材料标题：",
+            initialvalue="新材料",
+            parent=self.root,
+        )
+        if new_header is None:
+            return
+        if insert_material_after(self.pdf_project, material, new_header):
+            self._refresh_pdf_preview_after_edit("已在当前材料后方新建材料组。")
+
+    def _merge_selected_material(self, direction: int):
+        payload = self._selected_pdf_payload()
+        material = payload.get("material")
+        if material is None:
+            messagebox.showinfo("提示", "请先选择一个材料节点，或选择资料分析中的一道题目")
+            return
+        if payload.get("section_kind") != "data":
+            messagebox.showinfo("提示", "只有资料分析部分支持合并材料组")
+            return
+        direction_text = "下一材料" if direction > 0 else "上一材料"
+        if not messagebox.askyesno("确认合并", f"确定与{direction_text}合并吗？"):
+            return
+        merged = merge_adjacent_materials(self.pdf_project, material, direction)
+        if not merged:
+            messagebox.showinfo("提示", "当前材料已经在边界位置，无法继续合并")
+            return
+        self._refresh_pdf_preview_after_edit("已完成材料组合并。")
+
+    def _remove_selected_question(self):
+        payload = self._selected_pdf_payload()
+        if payload.get("kind") != "question":
+            messagebox.showinfo("提示", "请先选择一道题目")
+            return
+        question = payload.get("question")
+        if question is None or self.pdf_project is None:
+            return
+        if not messagebox.askyesno("确认删除", "确定从当前工程中移除这道题吗？"):
+            return
+        if remove_question(self.pdf_project, question):
+            self._refresh_pdf_preview_after_edit("已移除所选题目。")
+
+    def _move_selected_question_between_materials(self, direction: int):
+        payload = self._selected_pdf_payload()
+        if payload.get("kind") != "question":
+            messagebox.showinfo("提示", "请先选择资料分析中的一道题目")
+            return
+        if payload.get("section_kind") != "data":
+            messagebox.showinfo("提示", "只有资料分析题支持跨材料移动")
+            return
+        question = payload.get("question")
+        if question is None or self.pdf_project is None:
+            return
+        moved = move_data_question(self.pdf_project, question, direction)
+        if not moved:
+            messagebox.showinfo("提示", "当前题目已经在边界材料中，无法继续移动")
+            return
+        self._refresh_pdf_preview_after_edit("已调整题目所属材料。")
+
+    def _material_preview_text(self, material) -> str:
+        lines = [
+            f"材料编号：{material.material_id}",
+            f"标题：{material.header or '-'}",
+            f"题目数：{len(material.questions)}",
+            f"材料区域数：{len(material.body_regions)}",
+            "",
+            "材料正文：",
+            material.body or "-",
+        ]
+        if material.body_regions:
+            lines.append("")
+            lines.append("页面区域：")
+            for region in material.body_regions:
+                lines.append(
+                    f"第 {region.page_number} 页  ({region.x0:.1f}, {region.y0:.1f}) - ({region.x1:.1f}, {region.y1:.1f})"
+                )
+        return "\n".join(lines)
+
+    def _question_preview_text(self, section, material, question) -> str:
+        lines = [
+            f"科目：{section.kind}",
+            f"原题号：{question.source_number or '-'}",
+            f"选项数：{len(question.options)}",
+            f"题干图片：{len(question.stem_assets)}",
+        ]
+        if material is not None:
+            lines.append(f"所属材料：{material.header or material.material_id}")
+        if question.page_numbers:
+            lines.append("来源页码：" + ", ".join(str(page_no) for page_no in question.page_numbers))
+        lines.extend(["", "题干：", question.stem or "-"])
+        if question.options:
+            lines.extend(["", "选项："])
+            for option in question.options:
+                suffix = " [图]" if option.image_path else ""
+                lines.append(f"{option.letter}. {option.text}{suffix}")
+        return "\n".join(lines)
+
+    def _populate_pdf_preview(self, project):
+        self._pdf_preview_payloads.clear()
+        for item in self.pdf_tree.get_children():
+            self.pdf_tree.delete(item)
+
+        section_index = 0
+        for section in project.sections:
+            section_index += 1
+            count = len(section.questions) if section.kind != "data" else sum(
+                len(material.questions) for material in section.material_sets
+            )
+            section_id = self.pdf_tree.insert(
+                "",
+                END,
+                text=section.title or f"Section {section_index}",
+                values=(section.kind, "", count),
+                open=True,
+            )
+            self._pdf_preview_payloads[section_id] = {
+                "kind": "section",
+                "section": section,
+                "section_kind": section.kind,
+                "text": f"篇题：{section.title}\n科目：{section.kind}\n题目数：{count}",
+            }
+
+            if section.kind == "data":
+                for material in section.material_sets:
+                    material_id = self.pdf_tree.insert(
+                        section_id,
+                        END,
+                        text=material.header or material.material_id,
+                        values=("material", "", len(material.questions)),
+                        open=True,
+                    )
+                    self._pdf_preview_payloads[material_id] = {
+                        "kind": "material",
+                        "section": section,
+                        "section_kind": section.kind,
+                        "material": material,
+                        "text": self._material_preview_text(material),
+                    }
+                    for question in material.questions:
+                        stem_short = (question.stem or "")[:38]
+                        if len(question.stem or "") > 38:
+                            stem_short += "..."
+                        qid = self.pdf_tree.insert(
+                            material_id,
+                            END,
+                            text=stem_short or "未命名题目",
+                            values=("question", question.source_number or "-", len(question.options)),
+                        )
+                        self._pdf_preview_payloads[qid] = {
+                            "kind": "question",
+                            "section": section,
+                            "section_kind": section.kind,
+                            "material": material,
+                            "question": question,
+                            "text": self._question_preview_text(section, material, question),
+                        }
+            else:
+                for question in section.questions:
+                    stem_short = (question.stem or "")[:38]
+                    if len(question.stem or "") > 38:
+                        stem_short += "..."
+                    qid = self.pdf_tree.insert(
+                        section_id,
+                        END,
+                        text=stem_short or "未命名题目",
+                        values=("question", question.source_number or "-", len(question.options)),
+                    )
+                    self._pdf_preview_payloads[qid] = {
+                        "kind": "question",
+                        "section": section,
+                        "section_kind": section.kind,
+                        "material": None,
+                        "question": question,
+                        "text": self._question_preview_text(section, None, question),
+                    }
+
+        self._set_pdf_detail(f"已加载 {project.question_count} 道题。\n请在左侧查看篇题、材料和题目结构。")
+        self._refresh_pdf_wizard_ui()
+
+    def _on_pdf_preview_select(self, _event=None):
+        if not getattr(self, "pdf_tree", None):
+            return
+        selected = self.pdf_tree.selection()
+        if not selected:
+            self._show_pdf_material_preview_for_payload({})
+            return
+        payload = self._pdf_preview_payloads.get(selected[0], {})
+        self._set_pdf_detail(payload.get("text", "暂无内容"))
+        self._show_pdf_material_preview_for_payload(payload)
 
     def _close_parser(self):
         if self.parser:
@@ -759,7 +2014,7 @@ class PPTConvertApp:
                 )
                 self.root.after(0, lambda: self._on_done(output))
             except Exception as exc:
-                self.root.after(0, lambda: self._on_error(str(exc)))
+                self.root.after(0, lambda e=exc: self._on_error(str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -784,11 +2039,19 @@ class PPTConvertApp:
         self.word_path.set("")
         self.output_path.set("")
         self.template_path.set("")
+        self.pdf_path.set("")
+        self.pdf_word_out.set("")
+        self.pdf_ppt_out.set("")
+        self.pdf_manifest_out.set("")
+        self.pdf_question_range.set("")
+        self._set_all_pdf_subjects(True)
         self.use_template.set(False)
         self._toggle_template()
         self.questions.clear()
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self._clear_pdf_preview()
+        self._show_pdf_wizard_step(0)
         self.progress["value"] = 0
         self._set_status("已清空")
         self._close_parser()
@@ -798,6 +2061,7 @@ class PPTConvertApp:
 
     def _on_close(self):
         self._close_parser()
+        self._reset_pdf_material_preview_session()
         self.root.destroy()
 
     def run(self):

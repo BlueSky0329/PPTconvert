@@ -168,6 +168,20 @@ class PPTGenerator:
             )
         return question.options[:4]
 
+    @staticmethod
+    def _stem_text_for_question(question: Question) -> str:
+        display_number = (question.source_question_number or "").strip() or str(question.number)
+        question_line = f"{display_number}. {question.stem}".strip() if question.stem else f"{display_number}."
+        if question.material_header or question.material_text:
+            parts = [
+                part
+                for part in (question.material_header, question.material_text, question_line)
+                if part
+            ]
+            return "\n".join(parts)
+        display_stem = question.display_stem
+        return f"{display_number}. {display_stem}".strip() if display_stem else f"{display_number}."
+
     def _add_question_slide(self, question: Question):
         slide = self._prs.slides.add_slide(self.tm.get_blank_layout())
         template_style = self._tpl_style
@@ -299,7 +313,7 @@ class PPTGenerator:
         text_frame = box.text_frame
         text_frame.word_wrap = True
         paragraph = text_frame.paragraphs[0]
-        paragraph.text = f"{question.number}. {question.display_stem}"
+        paragraph.text = self._stem_text_for_question(question)
 
         extracted = style_override
         paragraph.font.size = (

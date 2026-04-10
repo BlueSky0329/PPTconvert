@@ -45,3 +45,16 @@ class PPTGeneratorTest(unittest.TestCase):
         self.assertEqual([option.letter for option in options], ["A", "B", "C", "D"])
         self.assertIn("only the first 4 can be rendered", captured.output[0])
 
+    def test_stem_text_for_data_question_uses_material_then_source_number(self):
+        question = Question(
+            number=99,
+            stem="2024年全国地表水中未入渗补给地下水的资源量比入渗补给地下水的多：",
+            source_question_number="1",
+            material_header="材料一",
+            material_text="2024年，全国平均年降水量为717.7毫米。",
+        )
+        text = PPTGenerator._stem_text_for_question(question)
+        self.assertEqual(
+            text,
+            "材料一\n2024年，全国平均年降水量为717.7毫米。\n1. 2024年全国地表水中未入渗补给地下水的资源量比入渗补给地下水的多：",
+        )
