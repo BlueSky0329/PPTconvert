@@ -188,6 +188,29 @@ class ExamProjectTest(unittest.TestCase):
         self.assertIsNone(questions[0].material_text)
         self.assertEqual(questions[0].source_question_number, "111")
 
+    def test_project_to_ppt_questions_preserves_question_option_layout(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[_text_line("A. 1"), _text_line("B. 2")],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam, source_pdf_path="sample.pdf")
+        project.sections[0].questions[0].option_layout = "one_row"
+
+        questions = project_to_ppt_questions(project)
+
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(questions[0].option_layout, "one_row")
+
     def test_build_project_flattens_soft_wrapped_stem_lines(self):
         exam = ParsedExam(
             quant_sections=[

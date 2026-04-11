@@ -97,7 +97,7 @@ def select_project(
 
     filtered_sections: list[Section] = []
     for section in clone.sections:
-        if selected_subjects and section.kind not in selected_subjects:
+        if selected_subjects and section.kind not in selected_subjects and section.kind != "unknown":
             continue
         if section.kind == "data":
             material_sets: list[MaterialSet] = []

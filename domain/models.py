@@ -65,6 +65,8 @@ class OptionNode:
     letter: str
     text: str
     image_path: Optional[str] = None
+    source_page: Optional[int] = None
+    page_region: Optional[PageRegion] = None
 
 
 @dataclass
@@ -75,6 +77,7 @@ class QuestionNode:
     stem_assets: list[AssetRef] = field(default_factory=list)
     answer: Optional[str] = None
     page_numbers: list[int] = field(default_factory=list)
+    option_layout: Optional[str] = None
 
     @property
     def numeric_source_number(self) -> Optional[int]:

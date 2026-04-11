@@ -1,144 +1,134 @@
 # PPTconvert
 
-一个本地化的公考试卷整理工具，当前主链路是：
+`PPTconvert` 现在是一个面向公考试题整理与授课输出的桌面工具，不再只是早期的 `Word -> PPT` 小脚本。
 
-`PDF -> 结构化工程 -> Word / PPT / JSON`
+当前主链路已经收敛成两条共享工程流：
 
-项目已经不再把 GUI 设计成“Word 转 PPT 工具箱”。现在的 GUI 聚焦 PDF 试卷整理，适合把整套真题按科目抽取、预览、修补后再导出。
+- `PDF -> 抽取 / 解析 / 科目推断 -> ExamProject -> 共享预览 / 编辑 -> Word / PPT / JSON`
+- `Word -> 解析 / 科目推断 -> ExamProject -> 共享预览 / 编辑 -> PPT / JSON`
 
-## 当前状态
+## 当前能力
 
-- GUI：单一 PDF 向导，步骤为导入 PDF、识别设置、结果预览、导出结果
-- 科目识别：支持政治理论、常识判断、言语理解与表达、数量关系、判断推理、资料分析
-- 导出结果：支持题本 Word、授课 PPT、工程清单 JSON
-- 编辑能力：支持在 GUI 中查看结构树、调整资料分析材料与题目
-- 兼容能力：CLI 仍保留旧的 `Word -> PPT` 入口，便于兼容历史用法
+### PDF 试卷整理
 
-## 推荐工作流
+- 支持政治理论、常识判断、言语理解与表达、数量关系、判断推理、资料分析
+- 支持整份文档科目提示：`自动识别 / 政治理论 / 常识判断 / 言语理解与表达 / 数量关系 / 判断推理 / 资料分析`
+- 支持无大标题、单科整卷、标题中途缺失时的启发式科目推断
+- 支持资料分析材料的文本、图片、表格区域保留与裁图复用
+- 支持导出题本 Word、授课 PPT、工程 JSON
 
-### GUI
+### Word 生成 PPT
 
-```bash
+- 支持直接导入整理好的 `.docx`
+- 先解析为统一的 `ExamProject`，再进入共享预览页
+- 可在导出前继续修改题干、选项、选项布局、科目归类
+- 保留旧版 `Word -> PPT` 输出能力，但已经接到新的共享预览/编辑链路
+
+### 共享预览与人工修订
+
+- 结构树预览篇题、材料、题目
+- 题干实时编辑
+- 选项文字、顺序、增删、图片替换 / 清除 / PDF 重裁
+- 单题选项布局覆盖：`跟随全局 / 一行四项 / 两行两列 / 四行竖排`
+- 资料分析材料原貌预览
+- 题干图片预览
+- 未保存修改保护
+- 未知科目保留与整段改科目
+
+## GUI 工作流
+
+启动方式：
+
+```powershell
 python main.py
 ```
 
-GUI 默认进入 PDF 工作流：
+当前 GUI 有三个主标签页：
 
-1. 选择 PDF
-2. 勾选需要识别的科目
-3. 预览结果并修补结构
-4. 导出 Word / PPT / JSON
+- `PDF 试卷整理`
+- `Word 生成 PPT`
+- `PPT 导出设置`
 
-### CLI
+PDF 与 Word 都会汇入同一套预览/编辑区域，再共用导出设置。
 
-```bash
-# PDF -> Word
+## CLI 用法
+
+### 启动 GUI
+
+```powershell
+python main.py
+```
+
+### 处理 PDF
+
+```powershell
 python main.py --pdf-input exam.pdf --docx-output exam_题本.docx
-
-# PDF -> PPT
-python main.py --pdf-input exam.pdf --ppt-output exam.pptx
-
-# PDF -> Word + PPT，并筛选题号
-python main.py --pdf-input exam.pdf --docx-output exam_题本.docx --ppt-output exam.pptx --question-range 66-85,111-120
-
-# PDF -> 仅部分科目
-python main.py --pdf-input exam.pdf --ppt-output verbal_only.pptx --subject verbal
-python main.py --pdf-input exam.pdf --ppt-output mixed.pptx --subject politics,common_sense,verbal
-
-# 兼容旧流程：Word -> PPT
-python main.py -i exam.docx -o exam.pptx
+python main.py --pdf-input exam.pdf --ppt-output exam.pptx --subject data
+python main.py --pdf-input exam.pdf --ppt-output exam.pptx --subject politics,common_sense,verbal
 ```
 
-## 能力边界
+### 处理 Word
 
-当前这套规则对以下场景做了较多修补：
-
-- 六大模块识别
-- PDF 内嵌图片与页面图片补提取
-- 资料分析材料截图复用
-- 文本表格材料按 PDF 区域裁图导出
-- `D` 选项续行、行内下一题、题号独立成行等切题边界
-- 双栏页面的读序修正
-
-仍然需要警惕的场景：
-
-- 扫描版 PDF 或 OCR 错字严重的 PDF
-- 跨页材料
-- 多列表格读序异常
-- 极端版式下的题号、选项、材料混排
-
-这类问题目前仍建议用真实试卷做回归，再按错例补规则。
-
-## 安装
-
-### 环境要求
-
-- Python 3.10+
-- Windows 为主
-
-### 安装依赖
-
-```bash
-pip install -r requirements.txt
+```powershell
+python main.py -i input.docx -o output.pptx -t template.pptx
 ```
 
-依赖包含：
+常用参数包括：
 
-- `pymupdf`
-- `python-docx`
-- `python-pptx`
-- `Pillow`
-- `ttkbootstrap`
+- `--pdf-input`
+- `--docx-output`
+- `--ppt-output`
+- `--manifest-output`
+- `--subject`
+- `--question-range`
+- `--template`
 
-## 项目结构
+## 目录概览
 
-```text
-PPTconvert/
-├── main.py
-├── core/         # PDF 抽取/解析、旧版 Word->PPT 核心
-├── ingest/       # PDF -> 工程模型构建
-├── domain/       # 统一工程模型、筛选与编辑操作
-├── exporters/    # Word / PPT / JSON 导出
-├── workflows/    # 端到端流程编排
-├── gui/          # PDF 向导界面
-├── tests/        # 回归测试
-├── docs/         # 架构、进度、GitHub 协作说明
-├── templates/    # PPT 模板
-├── examples/     # 可分享的样例
-└── outputs/      # 本地导出目录（默认忽略）
-```
-
-更详细的模块说明见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-
-## 测试
-
-全量回归：
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-常用定向测试：
-
-```bash
-python -m unittest tests.test_pdf_exam_parse -v
-python -m unittest tests.test_pdf_exam_extract -v
-python -m unittest tests.test_exam_project -v
-```
-
-## 仓库约定
-
-- 根目录下的 PDF、DOCX、PPT、资产目录和工程 JSON 视为本地输入/输出，默认不提交
-- 可分享样例请放到 `examples/`
-- 本地导出建议放到 `outputs/`
+- [main.py](C:/Users/17679/Desktop/PPTconvert/main.py)
+  命令行入口；无参数时启动 GUI。
+- [gui/app.py](C:/Users/17679/Desktop/PPTconvert/gui/app.py)
+  主界面、共享预览编辑、两条导入流程。
+- [workflows/project_flow.py](C:/Users/17679/Desktop/PPTconvert/workflows/project_flow.py)
+  `PDF/Word -> ExamProject -> 导出` 编排入口。
+- [core/pdf_exam_extract.py](C:/Users/17679/Desktop/PPTconvert/core/pdf_exam_extract.py)
+  PDF 文本块、图片块、页面图片信息抽取。
+- [core/pdf_exam_parse.py](C:/Users/17679/Desktop/PPTconvert/core/pdf_exam_parse.py)
+  PDF 题目、材料、选项、科目切分。
+- [core/word_parser.py](C:/Users/17679/Desktop/PPTconvert/core/word_parser.py)
+  Word 题目解析与科目修正。
+- [core/subject_inference.py](C:/Users/17679/Desktop/PPTconvert/core/subject_inference.py)
+  无标题 / 单科 / 标题缺失时的启发式科目推断。
+- [ingest/pdf/project_builder.py](C:/Users/17679/Desktop/PPTconvert/ingest/pdf/project_builder.py)
+  PDF 解析结果转 `ExamProject`。
+- [ingest/docx/project_builder.py](C:/Users/17679/Desktop/PPTconvert/ingest/docx/project_builder.py)
+  Word 解析结果转 `ExamProject`。
+- [domain/](C:/Users/17679/Desktop/PPTconvert/domain)
+  统一工程模型、筛选器、编辑动作。
+- [exporters/](C:/Users/17679/Desktop/PPTconvert/exporters)
+  Word / PPT / JSON 导出与材料裁图。
+- [tests/](C:/Users/17679/Desktop/PPTconvert/tests)
+  解析、工程构建、编辑、导出回归。
 
 ## 文档
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- [docs/STATUS.md](docs/STATUS.md)
-- [docs/GITHUB.md](docs/GITHUB.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [架构说明](C:/Users/17679/Desktop/PPTconvert/docs/ARCHITECTURE.md)
+- [当前进度](C:/Users/17679/Desktop/PPTconvert/docs/STATUS.md)
+- [本次整理记录](C:/Users/17679/Desktop/PPTconvert/docs/WORKLOG.md)
+- [GitHub 协作说明](C:/Users/17679/Desktop/PPTconvert/docs/GITHUB.md)
 
-## License
+## 测试
 
-MIT
+常用回归命令：
+
+```powershell
+python -m unittest discover -s tests -v
+python -m py_compile .\main.py .\gui\app.py
+```
+
+## 当前边界
+
+- 扫描版 PDF、OCR 错字、多栏复杂版式仍会影响切题与分科
+- 没有大标题、且多科混排、且文本信号很弱的文档，目前仍以启发式推断为主
+- 资料分析跨页、极端复杂表格、超弱结构化 Word 仍需继续补规则
+- 共享预览已经能覆盖大部分人工修订，但还不是最终导出版面的完全替代

@@ -48,6 +48,10 @@ class WordParserHelpersTest(unittest.TestCase):
     def test_material_and_section_detection(self):
         self.assertEqual(_section_kind_from_text("2026年·天津·资料分析"), "data")
         self.assertEqual(_section_kind_from_text("四. 数量关系:"), "quant")
+        self.assertEqual(_section_kind_from_text("一. 政治理论：根据题目要求作答"), "politics")
+        self.assertEqual(_section_kind_from_text("二、常识判断"), "common_sense")
+        self.assertEqual(_section_kind_from_text("三. 言语理解与表达：本部分包括表达与理解"), "verbal")
+        self.assertEqual(_section_kind_from_text("五. 判断推理：在四个选项中选出答案"), "reasoning")
         self.assertEqual(_material_header_from_text("材料一"), "材料一")
         self.assertIsNone(_material_header_from_text("题干正文"))
         self.assertEqual(_extract_question_number("12. 题干"), "12")
@@ -144,6 +148,117 @@ class WordParserIntegrationTest(unittest.TestCase):
             self.assertEqual(questions[0].material_header, "材料一")
             self.assertEqual(questions[0].material_text, "这是材料正文。")
             self.assertEqual([opt.letter for opt in questions[0].options], ["A", "B"])
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_parse_docx_without_titles_can_infer_quant_subject(self):
+        document = Document()
+        document.add_paragraph("甲、乙两车同时从两地相向而行，全程240千米，速度比为3:2，几小时后相遇？")
+        document.add_paragraph("66. 第一题")
+        document.add_paragraph("A. 4")
+        document.add_paragraph("B. 5")
+        document.add_paragraph("C. 6")
+        document.add_paragraph("D. 8")
+
+        tmp_path = None
+        parser = WordParser()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 1)
+            self.assertEqual(questions[0].section_kind, "quant")
+            self.assertEqual(questions[0].section_title, "数量关系")
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_parse_docx_without_titles_can_force_data_subject(self):
+        document = Document()
+        document.add_paragraph("材料一")
+        document.add_paragraph("2024年某市工业增加值同比增长8.3%。")
+        document.add_paragraph("111. 第一题")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+
+        tmp_path = None
+        parser = WordParser(document_subject_hint="data")
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 1)
+            self.assertEqual(questions[0].section_kind, "data")
+            self.assertEqual(questions[0].material_header, "材料一")
+            self.assertIn("同比增长", questions[0].material_text or "")
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_parse_docx_can_reclassify_later_questions_when_title_missing(self):
+        document = Document()
+        document.add_paragraph("四. 数量关系")
+        document.add_paragraph("66. 甲、乙两队合修一段公路，若甲单独修需要12天，乙单独修需要18天，两队合修几天完成？")
+        document.add_paragraph("A. 6")
+        document.add_paragraph("B. 7")
+        document.add_paragraph("C. 8")
+        document.add_paragraph("D. 9")
+        document.add_paragraph("76. 如果所有甲都是乙，且有些乙是丙，那么下列哪项一定为真？")
+        document.add_paragraph("A. 有些甲是丙")
+        document.add_paragraph("B. 有些丙是甲")
+        document.add_paragraph("C. 有些乙不是丙")
+        document.add_paragraph("D. 所有甲都是乙")
+
+        tmp_path = None
+        parser = WordParser()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 2)
+            self.assertEqual(questions[0].section_kind, "quant")
+            self.assertEqual(questions[1].section_kind, "reasoning")
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_parse_docx_can_switch_to_data_when_material_header_appears(self):
+        document = Document()
+        document.add_paragraph("四. 数量关系")
+        document.add_paragraph("66. 甲、乙两地相距240千米，两车相向而行几小时后相遇？")
+        document.add_paragraph("A. 4")
+        document.add_paragraph("B. 5")
+        document.add_paragraph("C. 6")
+        document.add_paragraph("D. 8")
+        document.add_paragraph("材料一")
+        document.add_paragraph("2024年某市工业增加值同比增长8.3%。")
+        document.add_paragraph("111. 根据上述材料，下列说法正确的是：")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+
+        tmp_path = None
+        parser = WordParser()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 2)
+            self.assertEqual(questions[0].section_kind, "quant")
+            self.assertEqual(questions[1].section_kind, "data")
+            self.assertEqual(questions[1].material_header, "材料一")
         finally:
             parser.cleanup()
             if tmp_path and os.path.exists(tmp_path):

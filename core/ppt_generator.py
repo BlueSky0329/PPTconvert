@@ -290,7 +290,7 @@ class PPTGenerator:
                     top = self._insert_image(slide, path, margin_left, top, content_width)
 
         options_top = top + Inches(config.gap_before_options_in)
-        option_layout = (config.option_layout or "grid").lower()
+        option_layout = (question.option_layout or config.option_layout or "grid").lower()
         if option_layout == "list":
             self._options_list(slide, question, margin_left, options_top, content_width)
         elif option_layout == "one_row":

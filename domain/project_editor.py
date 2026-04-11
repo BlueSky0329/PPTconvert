@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from domain.models import ExamProject, MaterialSet, QuestionNode, Section
+from domain.models import ExamProject, MaterialSet, OptionNode, QuestionNode, Section, SUBJECT_DISPLAY_NAMES
+
+_QUESTION_OPTION_LAYOUTS = {"grid", "list", "one_row"}
+_OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def _material_body_lines(material: MaterialSet) -> list[str]:
@@ -47,6 +50,133 @@ def _next_material_id(section: Section, base_material_id: str) -> str:
 
 def renumber_question(question: QuestionNode, new_number: str) -> None:
     question.source_number = (new_number or "").strip()
+
+
+def update_question_stem(question: QuestionNode, new_stem: str) -> None:
+    question.stem = (new_stem or "").strip()
+
+
+def _find_option(question: QuestionNode, letter: str) -> Optional[OptionNode]:
+    normalized = (letter or "").strip().upper()
+    if not normalized:
+        return None
+    for option in question.options:
+        if (option.letter or "").strip().upper() == normalized:
+            return option
+    return None
+
+
+def update_option_text(question: QuestionNode, letter: str, new_text: str) -> bool:
+    option = _find_option(question, letter)
+    if option is None:
+        return False
+    option.text = (new_text or "").strip()
+    return True
+
+
+def replace_option_image(question: QuestionNode, letter: str, image_path: str | None) -> bool:
+    option = _find_option(question, letter)
+    if option is None:
+        return False
+    normalized = (image_path or "").strip()
+    option.image_path = normalized or None
+    return True
+
+
+def clear_option_image(question: QuestionNode, letter: str) -> bool:
+    return replace_option_image(question, letter, None)
+
+
+def _answer_letters(value: str | None) -> list[str]:
+    letters: list[str] = []
+    for char in (value or "").upper():
+        if "A" <= char <= "Z" and char not in letters:
+            letters.append(char)
+    return letters
+
+
+def _capture_answer_targets(question: QuestionNode) -> tuple[list[OptionNode], list[str]]:
+    matched: list[OptionNode] = []
+    unmatched: list[str] = []
+    for letter in _answer_letters(question.answer):
+        option = _find_option(question, letter)
+        if option is None:
+            unmatched.append(letter)
+        elif option not in matched:
+            matched.append(option)
+    return matched, unmatched
+
+
+def _restore_answer_targets(question: QuestionNode, matched: list[OptionNode], unmatched: list[str]) -> None:
+    letters: list[str] = []
+    for option in question.options:
+        if option in matched and option.letter not in letters:
+            letters.append(option.letter)
+    for letter in unmatched:
+        if letter not in letters:
+            letters.append(letter)
+    question.answer = "".join(letters) or None
+
+
+def _reletter_options(question: QuestionNode) -> None:
+    for index, option in enumerate(question.options):
+        if index < len(_OPTION_LETTERS):
+            option.letter = _OPTION_LETTERS[index]
+
+
+def move_option(question: QuestionNode, letter: str, direction: int) -> bool:
+    if direction not in (-1, 1):
+        return False
+    option = _find_option(question, letter)
+    if option is None:
+        return False
+    index = question.options.index(option)
+    target_index = index + direction
+    if target_index < 0 or target_index >= len(question.options):
+        return False
+    matched, unmatched = _capture_answer_targets(question)
+    question.options[index], question.options[target_index] = question.options[target_index], question.options[index]
+    _reletter_options(question)
+    _restore_answer_targets(question, matched, unmatched)
+    return True
+
+
+def insert_option_after(question: QuestionNode, letter: str | None = None) -> bool:
+    if len(question.options) >= len(_OPTION_LETTERS):
+        return False
+    if not question.options:
+        question.options.append(OptionNode(letter="A", text=""))
+        return True
+
+    matched, unmatched = _capture_answer_targets(question)
+    insert_at = len(question.options)
+    if letter:
+        option = _find_option(question, letter)
+        if option is None:
+            return False
+        insert_at = question.options.index(option) + 1
+
+    question.options.insert(insert_at, OptionNode(letter="", text=""))
+    _reletter_options(question)
+    _restore_answer_targets(question, matched, unmatched)
+    return True
+
+
+def remove_option(question: QuestionNode, letter: str) -> bool:
+    option = _find_option(question, letter)
+    if option is None:
+        return False
+    matched, unmatched = _capture_answer_targets(question)
+    matched = [item for item in matched if item is not option]
+    question.options.remove(option)
+    _reletter_options(question)
+    _restore_answer_targets(question, matched, unmatched)
+    return True
+
+
+def set_question_option_layout(question: QuestionNode, layout: str | None) -> None:
+    normalized = (layout or "").strip().lower()
+    question.option_layout = normalized if normalized in _QUESTION_OPTION_LAYOUTS else None
 
 
 def rename_material(material: MaterialSet, new_header: str) -> None:
@@ -154,6 +284,19 @@ def merge_adjacent_materials(project: ExamProject, target: MaterialSet, directio
             _cleanup_project(project)
             return True
     return False
+
+
+def reclassify_objective_section(section: Section, new_kind: str) -> bool:
+    normalized = (new_kind or "").strip().lower()
+    if not normalized or normalized == "data":
+        return False
+    if section.kind == "data":
+        return False
+    if section.kind == normalized:
+        return False
+    section.kind = normalized
+    section.title = SUBJECT_DISPLAY_NAMES.get(normalized, "未知科目")
+    return True
 
 
 def _cleanup_project(project: ExamProject) -> None:

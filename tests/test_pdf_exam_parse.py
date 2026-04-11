@@ -163,6 +163,66 @@ class TestPdfExamParse(unittest.TestCase):
         self.assertGreater(len(exam.quant_sections[0].questions), 0)
         self.assertGreater(len(exam.data_sections[0].materials[0].questions), 0)
 
+    def test_parse_without_titles_falls_back_to_quant_by_heuristic(self):
+        items = [
+            ("甲、乙两地相距240千米，客车和货车同时出发，相向而行，几小时后相遇？", None),
+            ("66.", None),
+            ("A．4\tB．5\tC．6\tD．8", None),
+            ("某商品按8折出售后利润率为20%，其成本是多少？", None),
+            ("67.", None),
+            ("A．80\tB．96\tC．100\tD．120", None),
+        ]
+        exam = parse_line_items(items, mode="all")
+        self.assertEqual(len(exam.quant_sections), 1)
+        self.assertEqual(len(exam.quant_sections[0].questions), 2)
+
+    def test_parse_without_titles_can_force_data_subject(self):
+        items = [
+            ("材料一", None),
+            ("2024年某市工业增加值同比增长8.3%，服务业增加值同比增长6.1%。", None),
+            ("111.", None),
+            ("根据上述材料，下列说法正确的是：", None),
+            ("A．1\tB．2\tC．3\tD．4", None),
+        ]
+        exam = parse_line_items(items, mode="all", document_subject_hint="data")
+        self.assertEqual(len(exam.data_sections), 1)
+        self.assertEqual(len(exam.data_sections[0].materials), 1)
+        self.assertEqual(exam.data_sections[0].materials[0].questions[0].source_number, "111")
+
+    def test_partial_missing_section_title_can_split_to_reasoning(self):
+        items = [
+            ("四. 数量关系：", None),
+            ("甲、乙两队合修一段公路，若甲单独修需要12天，乙单独修需要18天，两队合修几天完成？", None),
+            ("66.", None),
+            ("A．6\tB．7\tC．8\tD．9", None),
+            ("如果所有甲都是乙，且有些乙是丙，那么下列哪项一定为真？", None),
+            ("76.", None),
+            ("A．有些甲是丙\tB．有些丙是甲\tC．有些乙不是丙\tD．所有甲都是乙", None),
+        ]
+        exam = parse_line_items(items, mode="all")
+        self.assertEqual(len(exam.quant_sections), 1)
+        self.assertEqual(len(exam.quant_sections[0].questions), 1)
+        self.assertEqual(len(exam.reasoning_sections), 1)
+        self.assertEqual(len(exam.reasoning_sections[0].questions), 1)
+
+    def test_objective_section_can_split_out_embedded_data_material(self):
+        items = [
+            ("四. 数量关系：", None),
+            ("甲、乙两地相距240千米，两车相向而行几小时后相遇？", None),
+            ("66.", None),
+            ("A．4\tB．5\tC．6\tD．8", None),
+            ("材料一", None),
+            ("2024年某市工业增加值同比增长8.3%，服务业增加值同比增长6.1%。", None),
+            ("111.", None),
+            ("根据上述材料，下列说法正确的是：", None),
+            ("A．1\tB．2\tC．3\tD．4", None),
+        ]
+        exam = parse_line_items(items, mode="all")
+        self.assertEqual(len(exam.quant_sections), 1)
+        self.assertEqual(len(exam.quant_sections[0].questions), 1)
+        self.assertEqual(len(exam.data_sections), 1)
+        self.assertEqual(exam.data_sections[0].materials[0].questions[0].source_number, "111")
+
     def test_other_section_stops_quant_block(self):
         items = [
             ("四. 数量关系：", None),

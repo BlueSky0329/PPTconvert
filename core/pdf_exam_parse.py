@@ -17,9 +17,11 @@ from core.pdf_exam_models import (
     QuantSection,
     ReasoningSection,
     RichLine,
+    UnknownSection,
     VerbalSection,
 )
 from domain.models import ALL_SUBJECT_KINDS, SubjectKind
+from core.subject_inference import default_subject_title, infer_document_subject, infer_subject_from_content
 from core.word_parser import OPTION_MARKER, _parse_options_from_line
 
 LineItem = tuple[str, str | None]  # (text, image_path)
@@ -901,16 +903,224 @@ def _append_objective_section(exam: ParsedExam, kind: SubjectKind, title: str, q
         exam.quant_sections.append(QuantSection(title=title, questions=questions))
     elif kind == "reasoning":
         exam.reasoning_sections.append(ReasoningSection(title=title, questions=questions))
+    else:
+        exam.unknown_sections.append(UnknownSection(title=title, questions=questions))
+
+
+def _rich_lines_text(lines: list[RichLine]) -> str:
+    return "\n".join(_rich_line_text_value(line) for line in lines if _rich_line_text_value(line))
+
+
+def _question_option_texts(question: ExamQuestion) -> list[str]:
+    option_texts: list[str] = []
+    for line in question.option_lines:
+        text = _rich_line_text_value(line)
+        if text:
+            option_texts.append(text)
+    return option_texts
+
+
+def _infer_question_subject(question: ExamQuestion, *, allow_data: bool = False) -> tuple[SubjectKind, float]:
+    kind, confidence = infer_subject_from_content(
+        stem=_rich_lines_text(question.stem_lines),
+        options=_question_option_texts(question),
+        image_count=sum(1 for line in question.stem_lines + question.option_lines if _rich_line_has_image(line)),
+        allow_data=allow_data,
+    )
+    return kind, confidence
+
+
+def _smooth_subject_runs(
+    annotated: list[tuple[SubjectKind, float, ExamQuestion]],
+) -> list[tuple[SubjectKind, float, ExamQuestion]]:
+    if len(annotated) < 3:
+        return annotated
+    smoothed = list(annotated)
+    for index in range(1, len(smoothed) - 1):
+        prev_kind, _prev_conf, _prev_question = smoothed[index - 1]
+        kind, confidence, question = smoothed[index]
+        next_kind, _next_conf, _next_question = smoothed[index + 1]
+        if kind != prev_kind and prev_kind == next_kind and confidence < 1.4:
+            smoothed[index] = (prev_kind, confidence, question)
+    return smoothed
+
+
+def _group_questions_by_subject(
+    questions: list[ExamQuestion],
+    *,
+    default_kind: SubjectKind = "unknown",
+) -> list[tuple[SubjectKind, list[ExamQuestion]]]:
+    annotated: list[tuple[SubjectKind, float, ExamQuestion]] = []
+    for question in questions:
+        inferred_kind, confidence = _infer_question_subject(question)
+        effective_kind = default_kind
+        stem_text = _rich_lines_text(question.stem_lines)
+        option_text_blob = " ".join(_question_option_texts(question))
+        strong_text_signal = len(stem_text) >= 10 or len(option_text_blob) >= 18
+        if default_kind == "unknown":
+            effective_kind = inferred_kind
+        elif (
+            inferred_kind not in {"unknown", default_kind}
+            and confidence >= 0.85
+            and strong_text_signal
+        ):
+            effective_kind = inferred_kind
+        annotated.append((effective_kind, confidence, question))
+
+    annotated = _smooth_subject_runs(annotated)
+    groups: list[tuple[SubjectKind, list[ExamQuestion]]] = []
+    for kind, _confidence, question in annotated:
+        if groups and groups[-1][0] == kind:
+            groups[-1][1].append(question)
+        else:
+            groups.append((kind, [question]))
+    return groups
+
+
+def _append_grouped_objective_sections(
+    exam: ParsedExam,
+    *,
+    default_kind: SubjectKind,
+    default_title: str,
+    questions: list[ExamQuestion],
+    selected_subjects: set[SubjectKind],
+) -> None:
+    grouped = _group_questions_by_subject(questions, default_kind=default_kind)
+    for index, (kind, grouped_questions) in enumerate(grouped):
+        if kind != "unknown" and kind not in selected_subjects:
+            continue
+        title = default_title if index == 0 and kind == default_kind else default_subject_title(kind)
+        _append_objective_section(exam, kind, title, grouped_questions)
+
+
+def _parse_whole_document_as_subject(
+    items: list[LineItem],
+    exam: ParsedExam,
+    kind: SubjectKind,
+    *,
+    title: str | None = None,
+) -> None:
+    body_start = _skip_section_boilerplate(items, 0, len(items), kind="data" if kind == "data" else kind)
+    section_title = title or default_subject_title(kind)
+    if kind == "data":
+        sec = DataAnalysisSection(title=section_title, materials=[])
+        mat_positions = [
+            i
+            for i in range(body_start, len(items))
+            if not items[i][1] and material_header_line((items[i][0] or "").strip())
+        ]
+        if not mat_positions:
+            unit = parse_material_body(items, body_start, len(items), "材料一")
+            if unit:
+                for split_unit in _split_into_material_units(unit):
+                    sec.materials.append(split_unit)
+        else:
+            for mi, m_start in enumerate(mat_positions):
+                m_next = mat_positions[mi + 1] if mi + 1 < len(mat_positions) else len(items)
+                unit = parse_material_block(items, m_start, m_next)
+                if unit:
+                    sec.materials.append(unit)
+        if sec.materials:
+            exam.data_sections.append(sec)
+        return
+
+    questions = parse_quant_block(items, body_start, len(items))
+    _append_objective_section(exam, kind, section_title, questions)
+
+
+def _parse_without_titles(items: list[LineItem], exam: ParsedExam, selected_subjects: set[SubjectKind]) -> None:
+    texts = [text for text, image_path in items if not image_path and (text or "").strip()]
+    image_count = sum(1 for _text, image_path in items if image_path)
+    material_header_count = sum(
+        1 for text, image_path in items if not image_path and material_header_line((text or "").strip())
+    )
+    inferred_kind, confidence = infer_document_subject(
+        texts,
+        image_count=image_count,
+        material_header_count=material_header_count,
+    )
+    if material_header_count or inferred_kind == "data":
+        if "data" not in selected_subjects:
+            start = _skip_section_boilerplate(items, 0, len(items), kind="quant")
+            questions = parse_quant_block(items, start, len(items))
+            _append_grouped_objective_sections(
+                exam,
+                default_kind="unknown",
+                default_title=default_subject_title("unknown"),
+                questions=questions,
+                selected_subjects=selected_subjects,
+            )
+            return
+        _parse_whole_document_as_subject(
+            items,
+            exam,
+            "data",
+            title=default_subject_title("data") if confidence >= 0.4 else default_subject_title("unknown"),
+        )
+        return
+    if (
+        inferred_kind in {"politics", "common_sense", "verbal", "quant", "reasoning"}
+        and confidence >= 0.55
+        and inferred_kind in selected_subjects
+    ):
+        _parse_whole_document_as_subject(items, exam, inferred_kind, title=default_subject_title(inferred_kind))
+        return
+
+    start = _skip_section_boilerplate(items, 0, len(items), kind="quant")
+    questions = parse_quant_block(items, start, len(items))
+    if not questions:
+        return
+    _append_grouped_objective_sections(
+        exam,
+        default_kind="unknown",
+        default_title=default_subject_title("unknown"),
+        questions=questions,
+        selected_subjects=selected_subjects,
+    )
+
+
+def _append_data_section_from_body(
+    exam: ParsedExam,
+    items: list[LineItem],
+    *,
+    title: str,
+    body_start: int,
+    body_end: int,
+) -> None:
+    sec = DataAnalysisSection(title=title, materials=[])
+    mat_positions = [
+        i
+        for i in range(body_start, body_end)
+        if not items[i][1] and material_header_line((items[i][0] or "").strip())
+    ]
+    if not mat_positions:
+        unit = parse_material_body(items, body_start, body_end, "材料一")
+        if unit:
+            for split_unit in _split_into_material_units(unit):
+                sec.materials.append(split_unit)
+    else:
+        for mi, m_start in enumerate(mat_positions):
+            m_next = mat_positions[mi + 1] if mi + 1 < len(mat_positions) else body_end
+            unit = parse_material_block(items, m_start, m_next)
+            if unit:
+                sec.materials.append(unit)
+    if sec.materials:
+        exam.data_sections.append(sec)
 
 
 def parse_line_items(
     items: list[LineItem],
     mode: Literal["data", "quant", "both", "all"] | str = "all",
+    document_subject_hint: SubjectKind | None = None,
 ) -> ParsedExam:
     items = _preprocess_line_items(items)
     exam = ParsedExam()
     n = len(items)
     selected_subjects = _normalize_subject_selection(mode)
+
+    if document_subject_hint and document_subject_hint != "unknown":
+        _parse_whole_document_as_subject(items, exam, document_subject_hint)
+        return exam
     # (篇类, 合并后的篇题, 篇题起始行下标, 正文起始行下标, 是否需要解析)
     title_entries: list[tuple[str, str, int, int, bool]] = []
 
@@ -949,6 +1159,10 @@ def parse_line_items(
 
         i += 1
 
+    if not title_entries:
+        _parse_without_titles(items, exam, selected_subjects)
+        return exam
+
     for j, (kind, title, _start_idx, body_start, should_parse) in enumerate(title_entries):
         if not should_parse:
             continue
@@ -957,30 +1171,44 @@ def parse_line_items(
         body_start = _skip_section_boilerplate(items, body_start, body_end, kind=kind)  # type: ignore[arg-type]
 
         if kind == "data":
-            sec = DataAnalysisSection(title=title, materials=[])
-            mat_positions = [
+            _append_data_section_from_body(
+                exam,
+                items,
+                title=title,
+                body_start=body_start,
+                body_end=body_end,
+            )
+        else:
+            material_positions = [
                 i
                 for i in range(body_start, body_end)
                 if not items[i][1] and material_header_line((items[i][0] or "").strip())
             ]
-            if not mat_positions:
-                unit = parse_material_body(items, body_start, body_end, "材料一")
-                if unit:
-                    for u in _split_into_material_units(unit):
-                        sec.materials.append(u)
+            if material_positions:
+                first_material = material_positions[0]
+                objective_questions = parse_quant_block(items, body_start, first_material)
+                _append_grouped_objective_sections(
+                    exam,
+                    default_kind=kind,  # type: ignore[arg-type]
+                    default_title=title,
+                    questions=objective_questions,
+                    selected_subjects=selected_subjects,
+                )
+                if "data" in selected_subjects:
+                    _append_data_section_from_body(
+                        exam,
+                        items,
+                        title=default_subject_title("data"),
+                        body_start=first_material,
+                        body_end=body_end,
+                    )
             else:
-                for mi, m_start in enumerate(mat_positions):
-                    m_next = mat_positions[mi + 1] if mi + 1 < len(mat_positions) else body_end
-                    unit = parse_material_block(items, m_start, m_next)
-                    if unit:
-                        sec.materials.append(unit)
-            exam.data_sections.append(sec)
-        else:
-            _append_objective_section(
-                exam,
-                kind,  # type: ignore[arg-type]
-                title,
-                parse_quant_block(items, body_start, body_end),
-            )
+                _append_grouped_objective_sections(
+                    exam,
+                    default_kind=kind,  # type: ignore[arg-type]
+                    default_title=title,
+                    questions=parse_quant_block(items, body_start, body_end),
+                    selected_subjects=selected_subjects,
+                )
 
     return exam

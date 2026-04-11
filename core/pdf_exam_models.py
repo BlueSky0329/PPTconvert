@@ -63,6 +63,11 @@ class ReasoningSection(ObjectiveSection):
 
 
 @dataclass
+class UnknownSection(ObjectiveSection):
+    kind: SubjectKind = "unknown"
+
+
+@dataclass
 class QuantSection(ObjectiveSection):
     kind: SubjectKind = "quant"
 
@@ -82,6 +87,7 @@ class ParsedExam:
     data_sections: list[DataAnalysisSection] = field(default_factory=list)
     quant_sections: list[QuantSection] = field(default_factory=list)
     reasoning_sections: list[ReasoningSection] = field(default_factory=list)
+    unknown_sections: list[UnknownSection] = field(default_factory=list)
 
     def iter_objective_sections(self) -> list[ObjectiveSection]:
         return [
@@ -90,4 +96,5 @@ class ParsedExam:
             *self.verbal_sections,
             *self.quant_sections,
             *self.reasoning_sections,
+            *self.unknown_sections,
         ]

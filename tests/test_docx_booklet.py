@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from docx import Document
 
-from domain.models import ExamProject, MaterialSet, PageRegion, PaperSource, QuestionNode, Section
+from domain.models import ExamProject, MaterialSet, OptionNode, PageRegion, PaperSource, QuestionNode, Section
 from exporters.docx_booklet import export_project_to_docx
 
 _PNG_BYTES = base64.b64decode(
@@ -100,6 +100,41 @@ class DocxBookletTest(unittest.TestCase):
             paragraph_texts = [paragraph.text for paragraph in document.paragraphs]
             self.assertIn("2025年表格材料", paragraph_texts)
             self.assertEqual(len(document.inline_shapes), 0)
+
+    def test_option_image_stays_with_option_block(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "option.png")
+            out_path = os.path.join(temp_dir, "output.docx")
+            self._write_png(image_path)
+
+            project = ExamProject(
+                title="test",
+                source=PaperSource(),
+                sections=[
+                    Section(
+                        kind="quant",
+                        title="",
+                        questions=[
+                            QuestionNode(
+                                source_number="66",
+                                stem="题干",
+                                options=[
+                                    OptionNode(letter="A", text="", image_path=image_path),
+                                    OptionNode(letter="B", text="2"),
+                                ],
+                            )
+                        ],
+                    )
+                ],
+            )
+
+            export_project_to_docx(project, out_path)
+
+            document = Document(out_path)
+            paragraph_texts = [paragraph.text for paragraph in document.paragraphs]
+            self.assertEqual([text.strip() for text in paragraph_texts[:3]], ["66. 题干", "A.", "B. 2"])
+            self.assertEqual(len(document.paragraphs), 4)
+            self.assertEqual(len(document.inline_shapes), 1)
 
 
 if __name__ == "__main__":

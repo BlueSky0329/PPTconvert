@@ -41,6 +41,7 @@ def project_to_ppt_questions(
                             source_question_number=question.source_number or None,
                             material_header=None if material_images else material.header or None,
                             material_text=None if material_images else (material.body or None),
+                            option_layout=question.option_layout,
                         )
                     )
                     display_number += 1
@@ -60,6 +61,7 @@ def project_to_ppt_questions(
                         ],
                         image_paths=[asset.path for asset in question.stem_assets if asset.path],
                         source_question_number=question.source_number or None,
+                        option_layout=question.option_layout,
                     )
                 )
                 display_number += 1

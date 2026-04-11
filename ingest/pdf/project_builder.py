@@ -10,7 +10,7 @@ from typing import Iterable, Mapping, Optional
 from core.pdf_exam_extract import ExtractedImageRegion, extract_pdf_line_items_with_metadata
 from core.pdf_exam_models import ObjectiveSection, ParsedExam, RichLine
 from core.pdf_exam_parse import parse_line_items
-from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, PageRegion, PaperSource, QuestionNode, Section
+from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, PageRegion, PaperSource, QuestionNode, Section, SubjectKind
 from ingest.pdf.layout import PageTextLine, extract_pdf_text_lines
 
 _OPTION_PREFIX = re.compile(r"^\s*([A-Z])\s*[.．、:：\)）]\s*", re.IGNORECASE)
@@ -206,6 +206,9 @@ def _question_from_rich(
                 current.text = _join_wrapped_lines([current.text, text])
         if current is not None and images and not current.image_path:
             current.image_path = images[0]
+            region = _region_from_extracted_image((image_regions or {}).get(images[0]))
+            current.source_page = region.page_number if region else None
+            current.page_region = region
     if current is not None:
         options.append(current)
 
@@ -312,10 +315,15 @@ def build_exam_project_from_pdf(
     *,
     mode: str = "all",
     asset_dir: Optional[str] = None,
+    document_subject_hint: SubjectKind | None = None,
 ) -> ExamProject:
     items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
     try:
-        exam = parse_line_items(items, mode=mode)  # type: ignore[arg-type]
+        exam = parse_line_items(
+            items,
+            mode=mode,
+            document_subject_hint=document_subject_hint,
+        )  # type: ignore[arg-type]
         layout_lines = extract_pdf_text_lines(pdf_path)
         project = build_project_from_parsed_exam(
             exam,

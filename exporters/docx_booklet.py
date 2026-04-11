@@ -34,6 +34,31 @@ def _add_asset_paragraph(doc: Document, asset: AssetRef, width: float = 5.8):
     run.add_picture(asset.path, width=Inches(width))
 
 
+def _add_option_block(
+    doc: Document,
+    option,
+    font_name: str,
+    option_size: Pt,
+    image_width: float = 3.4,
+):
+    paragraph = doc.add_paragraph()
+    label_text = f"{option.letter}." if option.image_path and not option.text else f"{option.letter}. "
+
+    label_run = paragraph.add_run(label_text)
+    _set_run_font(label_run, font_name, option_size, bold=False)
+
+    if option.text:
+        body_run = paragraph.add_run(option.text)
+        _set_run_font(body_run, font_name, option_size, bold=False)
+
+    if option.image_path and os.path.isfile(option.image_path):
+        image_run = paragraph.add_run()
+        image_run.add_break()
+        image_run.add_picture(option.image_path, width=Inches(image_width))
+
+    return paragraph
+
+
 def _render_material_body(
     doc: Document,
     project: ExamProject,
@@ -61,12 +86,7 @@ def _add_question_block(doc: Document, question: QuestionNode, font_name: str, s
     for asset in question.stem_assets:
         _add_asset_paragraph(doc, asset)
     for option in question.options:
-        label = f"{option.letter}. {option.text}".strip()
-        _add_text_paragraph(doc, label, font_name, option_size)
-        if option.image_path and os.path.isfile(option.image_path):
-            paragraph = doc.add_paragraph()
-            run = paragraph.add_run()
-            run.add_picture(option.image_path, width=Inches(3.4))
+        _add_option_block(doc, option, font_name, option_size)
     doc.add_paragraph("")
 
 

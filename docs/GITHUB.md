@@ -9,7 +9,7 @@
 
 ## 提交前检查
 
-提交前至少做两件事：
+提交前至少执行：
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -73,9 +73,27 @@ git push -u origin feat/your-topic
 推送前确认：
 
 1. `git status` 中没有误加入的本地试卷或导出文件
-2. 测试已通过
-3. README 与行为一致
-4. 大改动有对应测试
+2. `__pycache__/`、`.pytest_cache/`、`.mypy_cache/` 等本地缓存已清理
+3. README、[docs/STATUS.md](C:/Users/17679/Desktop/PPTconvert/docs/STATUS.md)、[docs/ARCHITECTURE.md](C:/Users/17679/Desktop/PPTconvert/docs/ARCHITECTURE.md) 与当前行为一致
+4. 测试已通过
+5. 大改动有对应测试
+
+## 建议的整理动作
+
+如果本轮改动跨度较大，推送前建议顺手完成：
+
+```powershell
+Get-ChildItem -Recurse -Directory -Force |
+  Where-Object { $_.Name -in @('__pycache__', '.pytest_cache', '.mypy_cache') } |
+  Remove-Item -Recurse -Force
+```
+
+然后再执行：
+
+```powershell
+git status
+python -m unittest discover -s tests -v
+```
 
 ## 发布建议
 

@@ -58,3 +58,37 @@ class PPTGeneratorTest(unittest.TestCase):
             text,
             "材料一\n2024年，全国平均年降水量为717.7毫米。\n1. 2024年全国地表水中未入渗补给地下水的资源量比入渗补给地下水的多：",
         )
+
+    def test_layout_default_prefers_question_option_layout_over_global_config(self):
+        question = Question(
+            number=1,
+            stem="stem",
+            options=[
+                Option("A", "1"),
+                Option("B", "2"),
+                Option("C", "3"),
+                Option("D", "4"),
+            ],
+            option_layout="one_row",
+        )
+        generator = PPTGenerator(config=PPTConfig(option_layout="list"))
+        generator._prs = generator.tm.create_default()
+        slide = generator._prs.slides.add_slide(generator.tm.get_blank_layout())
+        called: list[str] = []
+
+        def mark_one_row(*args, **kwargs):
+            called.append("one_row")
+
+        def mark_list(*args, **kwargs):
+            called.append("list")
+
+        def mark_grid(*args, **kwargs):
+            called.append("grid")
+
+        generator._options_one_row = mark_one_row  # type: ignore[method-assign]
+        generator._options_list = mark_list  # type: ignore[method-assign]
+        generator._options_grid = mark_grid  # type: ignore[method-assign]
+
+        generator._layout_default(slide, question)
+
+        self.assertEqual(called, ["one_row"])

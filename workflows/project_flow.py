@@ -7,6 +7,7 @@ from domain.selectors import parse_question_ranges, parse_subject_spec, select_p
 from exporters.docx_booklet import export_project_to_docx
 from exporters.manifest_json import export_project_manifest
 from exporters.pptx_slides import export_project_to_pptx
+from ingest.docx.project_builder import build_exam_project_from_docx
 from ingest.pdf.project_builder import build_exam_project_from_pdf
 
 
@@ -24,12 +25,19 @@ def _default_asset_dir(pdf_path: str) -> str:
     return os.path.join(base_dir, f"{pdf_name}_assets")
 
 
+def _default_docx_asset_dir(docx_path: str) -> str:
+    base_dir = os.path.dirname(os.path.abspath(docx_path))
+    docx_name = os.path.splitext(os.path.basename(docx_path))[0]
+    return os.path.join(base_dir, f"{docx_name}_word_assets")
+
+
 def build_pdf_project(
     pdf_path: str,
     *,
     mode: str = "all",
     question_range_spec: str = "",
     asset_dir: str | None = None,
+    document_subject_hint=None,
 ):
     chosen_asset_dir = asset_dir or _default_asset_dir(pdf_path)
     selected_subjects = parse_subject_spec(mode)
@@ -37,6 +45,7 @@ def build_pdf_project(
         pdf_path,
         mode="all",
         asset_dir=chosen_asset_dir,
+        document_subject_hint=document_subject_hint,
     )
 
     question_ranges = parse_question_ranges(question_range_spec)
@@ -46,6 +55,21 @@ def build_pdf_project(
         question_ranges=question_ranges,
     )
     return project, chosen_asset_dir
+
+
+def build_word_project(
+    docx_path: str,
+    *,
+    asset_dir: str | None = None,
+    document_subject_hint=None,
+):
+    chosen_asset_dir = asset_dir or _default_docx_asset_dir(docx_path)
+    project, questions, _asset_dir = build_exam_project_from_docx(
+        docx_path,
+        asset_dir=chosen_asset_dir,
+        document_subject_hint=document_subject_hint,
+    )
+    return project, questions, chosen_asset_dir
 
 
 def export_project_outputs(

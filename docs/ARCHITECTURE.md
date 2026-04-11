@@ -2,222 +2,174 @@
 
 ## 总览
 
-项目已经从早期的 `Word -> PPT` 单链路，演进为以 `ExamProject` 为中心的统一工程流：
+项目当前围绕统一工程模型 `ExamProject` 组织，已经不是两套完全割裂的 `PDF` 与 `Word` 逻辑。
 
-`PDF -> 抽取 -> 解析 -> 工程模型 -> 预览/编辑 -> Word / PPT / JSON`
+当前整体结构是：
 
-其中：
+`PDF / Word -> 解析与启发式分类 -> ExamProject -> 共享预览 / 编辑 -> Word / PPT / JSON`
 
-- GUI 主要服务 PDF 工作流
-- CLI 既支持 PDF 工作流，也保留旧版 `Word -> PPT` 兼容入口
-- `ExamProject` 是 PDF 工作流的统一中间层
+设计上的核心目标是：
 
-## 目录职责
+- 让 `PDF` 与 `Word` 最终汇入同一套预览和编辑能力
+- 把“题目切分、科目归类、材料保留、人工修订”放在导出之前解决
+- 将 `Word / PPT / JSON` 视为 `ExamProject` 的不同输出层，而不是彼此独立的流程
 
-### 根目录
+## 当前主流程
 
-- `main.py`
-  - 命令行入口
-  - 无参数启动 GUI
-  - `--pdf-input` 走 PDF 工程流
-  - `-i/--input` 走旧版 Word -> PPT 兼容流
+### 1. PDF 流
 
-### `gui/`
+`PDF -> pdf_exam_extract -> pdf_exam_parse -> ingest.pdf.project_builder -> ExamProject`
 
-- `app.py`
-  - PDF 向导界面
-  - 负责导入、筛选、预览、导出和局部编辑
-- `ui_constants.py`
-  - 主题、文案和常量配置
+职责拆分如下：
 
-### `workflows/`
+1. [core/pdf_exam_extract.py](C:/Users/17679/Desktop/PPTconvert/core/pdf_exam_extract.py)
+   - 基于 PyMuPDF 抽取文本块、图片块、页面图片信息
+   - 处理双栏页读序与页面图片补提取
+2. [core/pdf_exam_parse.py](C:/Users/17679/Desktop/PPTconvert/core/pdf_exam_parse.py)
+   - 识别篇题、材料、题号、选项
+   - 处理题干/选项续行、材料拆组、标题缺失 fallback
+3. [core/subject_inference.py](C:/Users/17679/Desktop/PPTconvert/core/subject_inference.py)
+   - 在无标题、单科整卷、篇题缺失时做启发式科目推断
+4. [ingest/pdf/project_builder.py](C:/Users/17679/Desktop/PPTconvert/ingest/pdf/project_builder.py)
+   - 将解析结果映射为 `ExamProject`
+   - 保存题干资源、材料图片、PDF 页面区域
 
-- `project_flow.py`
-  - 端到端编排入口
-  - 负责：
-    - 构建 PDF 工程
-    - 按科目/题号筛选
-    - 导出 Word / PPT / JSON
+### 2. Word 流
 
-### `domain/`
+`Word -> word_parser -> ingest.docx.project_builder -> ExamProject`
 
-- `models.py`
-  - 统一工程模型定义
-- `selectors.py`
-  - 题号范围、科目筛选
-- `project_editor.py`
-  - GUI 里对工程的局部编辑操作
+职责拆分如下：
 
-核心对象：
+1. [core/word_parser.py](C:/Users/17679/Desktop/PPTconvert/core/word_parser.py)
+   - 解析整理后的题本 Word
+   - 提取题号、题干、选项、材料、题干图片
+   - 在标题缺失时调用启发式科目推断
+2. [core/subject_inference.py](C:/Users/17679/Desktop/PPTconvert/core/subject_inference.py)
+   - 作为 Word 无标题和漂移修正的共用分类器
+3. [ingest/docx/project_builder.py](C:/Users/17679/Desktop/PPTconvert/ingest/docx/project_builder.py)
+   - 将 Word 解析结果转成 `ExamProject`
+   - 让 Word 与 PDF 共享同一套后续预览与导出逻辑
+
+### 3. 共享工程流
+
+`ExamProject -> selectors / project_editor -> GUI preview -> exporters`
+
+这部分是当前架构的中心：
+
+- [domain/models.py](C:/Users/17679/Desktop/PPTconvert/domain/models.py)
+  定义统一工程模型
+- [domain/selectors.py](C:/Users/17679/Desktop/PPTconvert/domain/selectors.py)
+  负责科目、题号范围筛选，并保留 `unknown` 兜底段
+- [domain/project_editor.py](C:/Users/17679/Desktop/PPTconvert/domain/project_editor.py)
+  负责 GUI 的人工修题操作
+- [gui/app.py](C:/Users/17679/Desktop/PPTconvert/gui/app.py)
+  负责两条导入流、共享预览、共享导出设置
+
+## 核心模型
+
+统一工程模型位于 [domain/models.py](C:/Users/17679/Desktop/PPTconvert/domain/models.py)。
+
+关键对象包括：
 
 - `ExamProject`
+  整份工程，承载来源信息、选中科目、章节列表
 - `Section`
+  一个科目段落，可能是普通客观题，也可能是资料分析
 - `MaterialSet`
+  资料分析材料，包含正文、材料图片、页面区域和挂载题目
 - `QuestionNode`
+  统一题目对象，包含题干、题干资源、选项、答案、选项布局
 - `OptionNode`
+  统一选项对象，支持文本、图片、原 PDF 区域信息
 - `AssetRef`
+  图片等资源引用
 - `PageRegion`
+  从 PDF 记录下来的页码与裁切区域
 
-### `core/`
+统一模型的价值在于：
 
-这里同时承载两类能力。
+- PDF 和 Word 可以共享预览编辑界面
+- Word / PPT / JSON 导出不用重复理解上游文档结构
+- GUI 的人工修正不需要分别改两条链路
 
-#### 1. PDF 抽取与解析
+## GUI 结构
 
-- `pdf_exam_extract.py`
-  - 用 PyMuPDF 抽取文本块、图片块和页面图片信息
-  - 负责页面读序、双栏识别、图片补提取
-- `pdf_exam_parse.py`
-  - 将抽取结果解析为六大模块的结构化中间模型
-  - 处理题号、材料、选项、续行、切题边界
-- `pdf_exam_models.py`
-  - PDF 解析阶段的中间数据结构
-- `exam_docx_writer.py`
-  - 旧版 PDF -> Word 输出模块，当前仍保留
-- `pdf_exam_pipeline.py`
-  - 旧版 PDF 工作流入口，当前以兼容为主
+当前 GUI 位于 [gui/app.py](C:/Users/17679/Desktop/PPTconvert/gui/app.py)，主要包含三块：
 
-#### 2. 旧版 Word -> PPT 链路
+- `PDF 试卷整理`
+  负责导入 PDF、科目选择、预览生成、结果导出
+- `Word 生成 PPT`
+  负责导入 Word 并转入共享预览
+- `PPT 导出设置`
+  负责模板、字号、版式等导出参数
 
-- `word_parser.py`
-  - 解析整理好的 Word 题本
-- `models.py`
-  - 旧版 PPT 生成使用的数据结构
-- `ppt_generator.py`
-  - 生成 PPT
-- `template_manager.py`
-  - 加载和创建模板
-- `template_style.py`
-  - 提取模板占位样式
+无论来源是 PDF 还是 Word，都会进入同一套预览编辑区：
 
-说明：
+- 左侧结构树：篇题 / 材料 / 题目
+- 右侧题目编辑：题干、选项、选项布局、图片修订
+- 右侧材料原貌：资料分析材料截图 / 原图
+- 右侧结构详情：便于排查模型状态
 
-- 新的 PDF 主链路导出 PPT 时，最终仍会复用 `core.ppt_generator`
-- 也就是说，旧版 PPT 生成器目前已经成为新旧两条流共享的输出层
+## 导出层
 
-### `ingest/`
+统一导出位于 [exporters/](C:/Users/17679/Desktop/PPTconvert/exporters)：
 
-- `pdf/layout.py`
-  - 抽取 PDF 文本行和块级几何信息
-- `pdf/project_builder.py`
-  - 将 PDF 解析结果映射为 `ExamProject`
-  - 负责：
-    - 题干与选项落盘
-    - 材料正文、材料图片、页面区域保存
-    - 资源文件复制到工程资产目录
+- [docx_booklet.py](C:/Users/17679/Desktop/PPTconvert/exporters/docx_booklet.py)
+  `ExamProject -> Word`
+- [pptx_slides.py](C:/Users/17679/Desktop/PPTconvert/exporters/pptx_slides.py)
+  `ExamProject -> PPT`
+- [manifest_json.py](C:/Users/17679/Desktop/PPTconvert/exporters/manifest_json.py)
+  `ExamProject <-> JSON`
+- [material_crops.py](C:/Users/17679/Desktop/PPTconvert/exporters/material_crops.py)
+  从原 PDF 按页面区域裁图，供 Word / PPT / GUI 共用
 
-### `exporters/`
+其中 PPT 输出层最终仍会复用 [core/ppt_generator.py](C:/Users/17679/Desktop/PPTconvert/core/ppt_generator.py)，也就是说旧版 Word 生成器与新工程流在输出层已经汇合。
 
-- `docx_booklet.py`
-  - `ExamProject -> Word`
-- `pptx_slides.py`
-  - `ExamProject -> PPT`
-- `manifest_json.py`
-  - `ExamProject -> JSON`
-- `material_crops.py`
-  - 资料分析材料按 PDF 页面区域裁图
-  - 被 Word / PPT / GUI 复用
+## 编排层
 
-### `tests/`
+[workflows/project_flow.py](C:/Users/17679/Desktop/PPTconvert/workflows/project_flow.py) 负责端到端编排：
 
-测试按风险点分层：
+- 构建 PDF 工程
+- 构建 Word 工程
+- 按科目与题号筛选
+- 导出 Word / PPT / JSON
+
+[main.py](C:/Users/17679/Desktop/PPTconvert/main.py) 则提供：
+
+- 无参数启动 GUI
+- `--pdf-input` 走 PDF 工程流
+- `-i / --input` 走 Word 输入流
+
+## 测试结构
+
+[tests/](C:/Users/17679/Desktop/PPTconvert/tests) 按风险点分层：
 
 - `test_pdf_exam_extract.py`
-  - 页面读序、图片补提取
+  页面读序、图片补提取
 - `test_pdf_exam_parse.py`
-  - 题目切分、材料切分、选项边界
+  题目切分、材料切分、科目 fallback
 - `test_exam_project.py`
-  - `ParsedExam -> ExamProject`
-- `test_docx_booklet.py`
-  - Word 导出
-- `test_project_editor.py`
-  - GUI 编辑动作
+  `ParsedExam -> ExamProject`
 - `test_word_parser.py`
-  - 旧版 Word -> PPT 兼容流
+  Word 解析与无标题推断
+- `test_word_project_builder.py`
+  `WordQuestion -> ExamProject`
+- `test_project_editor.py`
+  GUI 编辑动作、答案同步
+- `test_docx_booklet.py`
+  Word 导出
 - `test_ppt_generator.py`
-  - PPT 输出层
+  PPT 输出层
+- `test_manifest_json.py`
+  JSON round-trip
+- `test_selectors.py`
+  科目筛选与 `unknown` 保留
 
-## 主流程
+## 当前边界
 
-### PDF -> ExamProject
+当前架构已经能稳住大部分“单科 / 缺标题 / 可人工修题”的使用场景，但仍有边界：
 
-1. `core/pdf_exam_extract.py`
-   - 提取文本与图片
-   - 补充页面缺失图片
-   - 对明显双栏页重排块顺序
-2. `core/pdf_exam_parse.py`
-   - 识别篇题
-   - 切材料
-   - 切题
-   - 切选项
-3. `ingest/pdf/project_builder.py`
-   - 生成 `ExamProject`
-   - 复制资产到工程目录
-4. `domain/selectors.py`
-   - 按科目、题号筛选
-
-### ExamProject -> 导出
-
-1. `exporters/docx_booklet.py`
-   - 输出题本 Word
-   - 资料分析材料优先插入 PDF 区域裁图
-2. `exporters/pptx_slides.py`
-   - 将 `ExamProject` 转成旧版 `Question`
-   - 调用 `core.ppt_generator` 生成 PPT
-3. `exporters/manifest_json.py`
-   - 导出工程清单 JSON
-
-### ExamProject -> GUI
-
-1. GUI 读取 `ExamProject`
-2. 左侧树展示科目、材料、题目
-3. 右侧预览文本、选项和资料分析材料原貌
-4. 用户可做局部修补后导出
-
-## 关键设计
-
-### 统一工程模型
-
-PDF 解析结果不直接写 Word 或 PPT，而是先落到 `ExamProject`。这样：
-
-- GUI 和 CLI 共享同一套数据
-- 筛选逻辑只写一份
-- 导出器可以独立演进
-
-### 材料双表示
-
-资料分析材料目前同时保存三份信息：
-
-- `body_lines`
-  - 文本版正文
-- `body_assets`
-  - 抽取到的原始图片
-- `body_regions`
-  - 对应 PDF 页面区域
-
-好处是：
-
-- Word 可以在文本回退和截图之间切换
-- PPT 可以优先保留原始表格/图表外观
-- GUI 可以展示“材料原貌”
-
-### 输出层复用
-
-新链路没有重写一套 PPT 生成器，而是先将 `ExamProject` 映射为旧版 `Question`，继续复用已经稳定的 `core.ppt_generator`。这降低了重构成本，但也意味着：
-
-- `core/` 目录暂时同时承载新旧两代能力
-- 后续若继续整理代码，可以考虑把旧版兼容层再明确拆分
-
-## 当前已知边界
-
-- OCR 质量差的扫描 PDF 仍不稳定
-- 跨页材料仍主要靠启发式处理
-- 极端多栏或复杂表格排版仍可能读序异常
-- 工程 JSON 当前主要用于导出与检查，不是完整的可回载编辑格式
-
-## 推荐后续整理方向
-
-1. 为真实 PDF 建立回归样本集
-2. 将 GUI 编辑能力和工程 JSON 回载打通
-3. 进一步把旧版 Word -> PPT 兼容层与新 PDF 主链隔离
-4. 给解析器增加调试视图或诊断日志导出
+- 多科混排且没有任何大标题时，只能依赖启发式推断
+- 扫描版 PDF 与 OCR 错字仍会影响切题与分类
+- 复杂跨页资料分析材料需要继续增强
+- GUI 预览主要服务人工校对，还不是最终导出版面的完全等价渲染

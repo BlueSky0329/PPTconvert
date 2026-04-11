@@ -3,14 +3,23 @@ import unittest
 from core.pdf_exam_models import DataAnalysisSection, ExamQuestion, MaterialUnit, ParsedExam, QuantSection, RichLine
 from domain.models import AssetRef, PageRegion
 from domain.project_editor import (
+    clear_option_image,
+    insert_option_after,
     insert_material_after,
     merge_adjacent_materials,
+    move_option,
     move_data_question,
     remove_question,
+    remove_option,
+    replace_option_image,
     rename_material,
     renumber_question,
+    set_question_option_layout,
+    update_option_text,
+    update_question_stem,
 )
 from ingest.pdf.project_builder import build_project_from_parsed_exam
+from core.pdf_exam_extract import ExtractedImageRegion
 
 
 def _text_line(text: str) -> RichLine:
@@ -114,6 +123,163 @@ class ProjectEditorTest(unittest.TestCase):
 
         self.assertEqual(material.header, "材料甲")
         self.assertEqual(question.source_number, "211")
+
+    def test_update_question_stem_and_option_layout(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[_text_line("A. 1"), _text_line("B. 2")],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        question = project.sections[0].questions[0]
+
+        update_question_stem(question, "新的题干")
+        set_question_option_layout(question, "one_row")
+
+        self.assertEqual(question.stem, "新的题干")
+        self.assertEqual(question.option_layout, "one_row")
+
+        set_question_option_layout(question, "unknown")
+        self.assertIsNone(question.option_layout)
+
+    def test_update_option_text_and_image(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[_text_line("A. 1"), _text_line("B. 2")],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        question = project.sections[0].questions[0]
+
+        self.assertTrue(update_option_text(question, "A", "10"))
+        self.assertTrue(replace_option_image(question, "B", "sample.png"))
+        self.assertEqual(question.options[0].text, "10")
+        self.assertEqual(question.options[1].image_path, "sample.png")
+
+        self.assertTrue(clear_option_image(question, "B"))
+        self.assertIsNone(question.options[1].image_path)
+        self.assertFalse(update_option_text(question, "Z", "x"))
+
+    def test_move_insert_and_remove_option(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[
+                                _text_line("A. 1"),
+                                _text_line("B. 2"),
+                                _text_line("C. 3"),
+                            ],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        question = project.sections[0].questions[0]
+        question.answer = "AC"
+
+        self.assertTrue(move_option(question, "C", -1))
+        self.assertEqual([(o.letter, o.text) for o in question.options], [("A", "1"), ("B", "3"), ("C", "2")])
+        self.assertEqual(question.answer, "AB")
+
+        self.assertTrue(insert_option_after(question, "B"))
+        self.assertEqual([o.letter for o in question.options], ["A", "B", "C", "D"])
+        self.assertEqual(question.options[2].text, "")
+        self.assertEqual(question.answer, "AB")
+
+        self.assertTrue(remove_option(question, "B"))
+        self.assertEqual([o.letter for o in question.options], ["A", "B", "C"])
+        self.assertEqual([o.text for o in question.options], ["1", "", "2"])
+        self.assertEqual(question.answer, "A")
+
+    def test_remove_answered_option_drops_that_answer_letter(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[
+                                _text_line("A. 1"),
+                                _text_line("B. 2"),
+                                _text_line("C. 3"),
+                            ],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        question = project.sections[0].questions[0]
+        question.answer = "BC"
+
+        self.assertTrue(remove_option(question, "B"))
+        self.assertEqual([o.letter for o in question.options], ["A", "B"])
+        self.assertEqual([o.text for o in question.options], ["1", "3"])
+        self.assertEqual(question.answer, "B")
+
+    def test_build_project_preserves_option_image_region(self):
+        image_path = "option_a.png"
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[
+                                RichLine(parts=[("A. ", None), ("", image_path)]),
+                                _text_line("B. 2"),
+                            ],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(
+            exam,
+            image_regions={
+                image_path: ExtractedImageRegion(
+                    path=image_path,
+                    page_number=3,
+                    x0=10.0,
+                    y0=20.0,
+                    x1=40.0,
+                    y1=60.0,
+                )
+            },
+        )
+
+        option = project.sections[0].questions[0].options[0]
+        self.assertEqual(option.image_path, image_path)
+        self.assertEqual(option.source_page, 3)
+        self.assertIsNotNone(option.page_region)
 
     def test_insert_material_after(self):
         exam = ParsedExam(
