@@ -35,6 +35,18 @@
 - 未保存修改保护
 - 未知科目保留与整段改科目
 
+### 本地学习与训练
+
+- 支持从金标准 PDF 语料构建本地科目分类训练集
+- 支持训练轻量本地分类模型，并在达标时与规则引擎融合
+- 当前训练入口：
+  - [data/gold_pdf_catalog.json](C:/Users/17679/Desktop/PPTconvert/data/gold_pdf_catalog.json)
+  - [scripts/build_gold_subject_dataset.py](C:/Users/17679/Desktop/PPTconvert/scripts/build_gold_subject_dataset.py)
+  - [scripts/train_local_subject_model.py](C:/Users/17679/Desktop/PPTconvert/scripts/train_local_subject_model.py)
+- 当前运行时保护策略：
+  - 训练出的模型只有在评估达标时才会自动接入 `subject_inference`
+  - 未达标模型只保留为候选模型，不会直接污染线上解析结果
+
 ## GUI 工作流
 
 启动方式：
@@ -71,6 +83,19 @@ python main.py --pdf-input exam.pdf --ppt-output exam.pptx --subject politics,co
 
 ```powershell
 python main.py -i input.docx -o output.pptx -t template.pptx
+```
+
+### 构建本地训练集
+
+```powershell
+python .\scripts\build_gold_subject_dataset.py
+```
+
+### 训练本地分类模型
+
+```powershell
+pip install -r .\requirements-ml.txt
+python .\scripts\train_local_subject_model.py
 ```
 
 常用参数包括：
@@ -113,6 +138,10 @@ python main.py -i input.docx -o output.pptx -t template.pptx
 ## 文档
 
 - [架构说明](C:/Users/17679/Desktop/PPTconvert/docs/ARCHITECTURE.md)
+- [本地 AI 知识库](C:/Users/17679/Desktop/PPTconvert/docs/LOCAL_AI_KB.md)
+- [公考题型知识总表](C:/Users/17679/Desktop/PPTconvert/docs/GONGKAO_TAXONOMY.md)
+- [公考题库学习画像](C:/Users/17679/Desktop/PPTconvert/docs/GONGKAO_CORPUS.md)
+- [本地训练方案](C:/Users/17679/Desktop/PPTconvert/docs/ML_TRAINING.md)
 - [当前进度](C:/Users/17679/Desktop/PPTconvert/docs/STATUS.md)
 - [本次整理记录](C:/Users/17679/Desktop/PPTconvert/docs/WORKLOG.md)
 - [GitHub 协作说明](C:/Users/17679/Desktop/PPTconvert/docs/GITHUB.md)

@@ -233,6 +233,36 @@ class WordParserIntegrationTest(unittest.TestCase):
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+    def test_parse_docx_keeps_single_definition_like_question_inside_explicit_common_sense_section(self):
+        document = Document()
+        document.add_paragraph("二. 常识判断")
+        document.add_paragraph("1. 下列关于行政处罚的说法正确的是：")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+        document.add_paragraph("C. 丙")
+        document.add_paragraph("D. 丁")
+        document.add_paragraph("2. 某种行为是指行为人违反管理秩序并造成一定后果的行为。根据上述定义，下列属于该行为的是：")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+        document.add_paragraph("C. 丙")
+        document.add_paragraph("D. 丁")
+
+        tmp_path = None
+        parser = WordParser()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 2)
+            self.assertEqual(questions[0].section_kind, "common_sense")
+            self.assertEqual(questions[1].section_kind, "common_sense")
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
     def test_parse_docx_can_switch_to_data_when_material_header_appears(self):
         document = Document()
         document.add_paragraph("四. 数量关系")

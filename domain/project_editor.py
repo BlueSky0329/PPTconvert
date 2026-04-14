@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 from typing import Optional
 
-from domain.models import ExamProject, MaterialSet, OptionNode, QuestionNode, Section, SUBJECT_DISPLAY_NAMES
+from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, QuestionNode, Section, SUBJECT_DISPLAY_NAMES
 
 _QUESTION_OPTION_LAYOUTS = {"grid", "list", "one_row"}
 _OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -85,6 +86,31 @@ def replace_option_image(question: QuestionNode, letter: str, image_path: str | 
 
 def clear_option_image(question: QuestionNode, letter: str) -> bool:
     return replace_option_image(question, letter, None)
+
+
+def reassign_stem_assets_to_options(question: QuestionNode, *, count: int | None = None) -> int:
+    if not question.stem_assets or not question.options:
+        return 0
+    target_count = min(len(question.options), len(question.stem_assets))
+    if count is not None:
+        target_count = min(target_count, max(0, int(count)))
+    if target_count <= 0:
+        return 0
+
+    changes = 0
+    remaining_assets = list(question.stem_assets)
+    for index in range(target_count):
+        option = question.options[index]
+        asset: AssetRef = remaining_assets[index]
+        if option.image_path == asset.path:
+            continue
+        option.image_path = asset.path
+        option.source_page = asset.source_page
+        option.page_region = asset.page_region
+        changes += 1
+    if changes > 0:
+        question.stem_assets = remaining_assets[target_count:]
+    return changes
 
 
 def _answer_letters(value: str | None) -> list[str]:
@@ -183,6 +209,92 @@ def rename_material(material: MaterialSet, new_header: str) -> None:
     material.header = (new_header or "").strip()
 
 
+def prepend_material_body_text(material: MaterialSet, text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    existing = _material_body_lines(material)
+    material.body_lines = [normalized, *existing]
+    _refresh_material_body(material)
+    return True
+
+
+def move_stem_assets_to_material(material: MaterialSet, question: QuestionNode, *, count: int | None = None) -> int:
+    if material is None or not question.stem_assets:
+        return 0
+    move_count = len(question.stem_assets)
+    if count is not None:
+        move_count = min(move_count, max(0, int(count)))
+    if move_count <= 0:
+        return 0
+
+    moving_assets = list(question.stem_assets[:move_count])
+    remaining_assets = list(question.stem_assets[move_count:])
+    existing_asset_keys = {
+        (
+            asset.kind,
+            asset.path,
+            asset.source_page,
+            getattr(asset.page_region, "page_number", None),
+            getattr(asset.page_region, "x0", None),
+            getattr(asset.page_region, "y0", None),
+            getattr(asset.page_region, "x1", None),
+            getattr(asset.page_region, "y1", None),
+        )
+        for asset in material.body_assets
+    }
+    existing_region_keys = {
+        (
+            region.page_number,
+            region.x0,
+            region.y0,
+            region.x1,
+            region.y1,
+        )
+        for region in material.body_regions
+    }
+
+    changes = 0
+    for asset in moving_assets:
+        asset_key = (
+            asset.kind,
+            asset.path,
+            asset.source_page,
+            getattr(asset.page_region, "page_number", None),
+            getattr(asset.page_region, "x0", None),
+            getattr(asset.page_region, "y0", None),
+            getattr(asset.page_region, "x1", None),
+            getattr(asset.page_region, "y1", None),
+        )
+        if asset_key not in existing_asset_keys:
+            material.body_assets.append(asset)
+            existing_asset_keys.add(asset_key)
+            changes += 1
+        if asset.page_region is not None:
+            region_key = (
+                asset.page_region.page_number,
+                asset.page_region.x0,
+                asset.page_region.y0,
+                asset.page_region.x1,
+                asset.page_region.y1,
+            )
+            if region_key not in existing_region_keys:
+                material.body_regions.append(asset.page_region)
+                existing_region_keys.add(region_key)
+    if changes > 0:
+        material.body_regions.sort(
+            key=lambda region: (
+                region.page_number,
+                region.y0,
+                region.x0,
+                region.y1,
+                region.x1,
+            )
+        )
+    question.stem_assets = remaining_assets
+    return changes
+
+
 def remove_question(project: ExamProject, target: QuestionNode) -> bool:
     for section in project.sections:
         if section.kind == "data":
@@ -195,6 +307,22 @@ def remove_question(project: ExamProject, target: QuestionNode) -> bool:
             if target in section.questions:
                 section.questions.remove(target)
                 _cleanup_project(project)
+                return True
+    return False
+
+
+def insert_question_before(project: ExamProject, target: QuestionNode, new_question: QuestionNode) -> bool:
+    for section in project.sections:
+        if section.kind == "data":
+            for material in section.material_sets:
+                if target in material.questions:
+                    index = material.questions.index(target)
+                    material.questions.insert(index, new_question)
+                    return True
+        else:
+            if target in section.questions:
+                index = section.questions.index(target)
+                section.questions.insert(index, new_question)
                 return True
     return False
 
@@ -286,7 +414,7 @@ def merge_adjacent_materials(project: ExamProject, target: MaterialSet, directio
     return False
 
 
-def reclassify_objective_section(section: Section, new_kind: str) -> bool:
+def reclassify_objective_section(section: Section, new_kind: str, *, project: ExamProject | None = None) -> bool:
     normalized = (new_kind or "").strip().lower()
     if not normalized or normalized == "data":
         return False
@@ -296,7 +424,98 @@ def reclassify_objective_section(section: Section, new_kind: str) -> bool:
         return False
     section.kind = normalized
     section.title = SUBJECT_DISPLAY_NAMES.get(normalized, "未知科目")
+    if project is not None:
+        _cleanup_project(project)
     return True
+
+
+def section_subject_suggestion(section: Section) -> tuple[Optional[str], str]:
+    if section.kind == "data":
+        return None, "资料分析不走这条建议链路。"
+
+    suggestions = [
+        getattr(question, "suggested_subject", None)
+        for question in section.questions
+        if getattr(question, "suggested_subject", None) not in {None, "data"}
+    ]
+    if not suggestions:
+        return None, "当前篇题没有稳定的 AI 科目建议。"
+
+    target_kinds = {str(kind) for kind in suggestions if kind}
+    if len(target_kinds) != 1:
+        return None, "当前篇题内部存在冲突建议，暂不自动应用。"
+
+    target_kind = next(iter(target_kinds))
+    if target_kind == section.kind:
+        return None, "AI 建议与当前篇题科目一致。"
+
+    suggestion_count = len(suggestions)
+    total_questions = len(section.questions)
+    flagged_questions = [
+        question
+        for question in section.questions
+        if getattr(question, "suggested_subject", None) == target_kind
+    ]
+
+    if section.kind == "unknown":
+        return (
+            target_kind,
+            f"当前未知篇题中有 {suggestion_count}/{total_questions} 道题一致建议改为"
+            f" {SUBJECT_DISPLAY_NAMES.get(target_kind, target_kind)}。",
+        )
+
+    required_count = max(1, math.ceil(total_questions * 0.75))
+    if suggestion_count < required_count or suggestion_count != len(flagged_questions):
+        return None, "当前篇题只有部分题目建议换科目，暂不作为整段安全建议。"
+
+    return (
+        target_kind,
+        f"当前篇题 {suggestion_count}/{total_questions} 道题都一致建议改为"
+        f" {SUBJECT_DISPLAY_NAMES.get(target_kind, target_kind)}。",
+    )
+
+
+def apply_section_subject_suggestion(section: Section, *, project: ExamProject | None = None) -> bool:
+    target_kind, _reason = section_subject_suggestion(section)
+    if not target_kind:
+        return False
+    return reclassify_objective_section(section, target_kind, project=project)
+
+
+def apply_all_safe_subject_suggestions(project: ExamProject) -> int:
+    applied = 0
+    for section in list(project.sections):
+        if apply_section_subject_suggestion(section, project=project):
+            applied += 1
+    return applied
+
+
+def _refresh_selected_subjects(project: ExamProject) -> None:
+    seen: list[str] = []
+    for section in project.sections:
+        if section.kind in SUBJECT_DISPLAY_NAMES and section.kind not in {"data", "unknown"} and section.kind not in seen:
+            seen.append(section.kind)
+        elif section.kind == "data" and section.kind not in seen:
+            seen.append(section.kind)
+    project.selected_subjects = seen
+
+
+def _merge_adjacent_objective_sections(project: ExamProject) -> None:
+    from core.subject_inference import preferred_subject_title, should_merge_subject_sections
+
+    merged: list[Section] = []
+    for section in project.sections:
+        if (
+            merged
+            and section.kind != "data"
+            and merged[-1].kind == section.kind
+            and should_merge_subject_sections(section.kind, merged[-1].title, section.title)
+        ):
+            merged[-1].title = preferred_subject_title(section.kind, merged[-1].title, section.title)
+            merged[-1].questions.extend(section.questions)
+            continue
+        merged.append(section)
+    project.sections = merged
 
 
 def _cleanup_project(project: ExamProject) -> None:
@@ -310,3 +529,5 @@ def _cleanup_project(project: ExamProject) -> None:
             if section.questions:
                 filtered_sections.append(section)
     project.sections = filtered_sections
+    _merge_adjacent_objective_sections(project)
+    _refresh_selected_subjects(project)

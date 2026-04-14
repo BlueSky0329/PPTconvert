@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+from core.project_quality import annotate_project_quality
 from domain.selectors import parse_question_ranges, parse_subject_spec, select_project
 from exporters.docx_booklet import export_project_to_docx
 from exporters.manifest_json import export_project_manifest
@@ -54,6 +55,7 @@ def build_pdf_project(
         subjects=selected_subjects,
         question_ranges=question_ranges,
     )
+    annotate_project_quality(project)
     return project, chosen_asset_dir
 
 
@@ -104,6 +106,7 @@ def process_pdf_project(
     mode: str = "all",
     question_range_spec: str = "",
     asset_dir: str | None = None,
+    document_subject_hint=None,
     docx_output: str | None = None,
     ppt_output: str | None = None,
     manifest_output: str | None = None,
@@ -116,6 +119,7 @@ def process_pdf_project(
         mode=mode,
         question_range_spec=question_range_spec,
         asset_dir=asset_dir,
+        document_subject_hint=document_subject_hint,
     )
     outputs = export_project_outputs(
         project,

@@ -39,6 +39,13 @@ def require_fitz():
 
 
 _PAGE_NOISE_LINE = re.compile(r"^\s*第\s*\d+\s*页\s*[,，]\s*共\s*\d+\s*页\s*$")
+_TOPIC_HEADER_LINE = re.compile(
+    r"^\s*行测\s*[—\-–―]+\s*(数量关系|判断推理|言语理解|资料分析).*$"
+)
+_SCAN_AD_LINE = re.compile(
+    r"^\s*各种考试资料购买\s*[,，]\s*请加微信\s*[:：]\s*行测资料库\s*$"
+)
+_SCAN_AD_CHARS = ("扫", "码", "关", "注")
 
 
 def _block_sort_key(block: dict) -> tuple[float, float]:
@@ -131,6 +138,27 @@ def _column_side(block: dict, page_width: float) -> str:
     return "full"
 
 
+def _is_substantial_column_text_block(block: dict, page_width: float) -> bool:
+    if block.get("type") != 0:
+        return False
+    text = _block_text_content(block)
+    if not text:
+        return False
+    x0, _y0, x1, _y1 = _block_bbox(block)
+    width = max(0.0, x1 - x0)
+    return width >= page_width * 0.16 or len(text) >= 12
+
+
+def _column_vertical_overlap(blocks_a: list[dict], blocks_b: list[dict]) -> float:
+    if not blocks_a or not blocks_b:
+        return 0.0
+    top_a = min(_block_bbox(block)[1] for block in blocks_a)
+    bottom_a = max(_block_bbox(block)[3] for block in blocks_a)
+    top_b = min(_block_bbox(block)[1] for block in blocks_b)
+    bottom_b = max(_block_bbox(block)[3] for block in blocks_b)
+    return max(0.0, min(bottom_a, bottom_b) - max(top_a, top_b))
+
+
 def _order_page_blocks(page, blocks: list[dict]) -> list[dict]:
     ordered = sorted(blocks or [], key=_block_sort_key)
     candidates = [
@@ -142,9 +170,21 @@ def _order_page_blocks(page, blocks: list[dict]) -> list[dict]:
         return ordered
 
     page_width = float(page.rect.width or 1.0)
-    left = [block for block in candidates if _column_side(block, page_width) == "left"]
-    right = [block for block in candidates if _column_side(block, page_width) == "right"]
+    left = [
+        block
+        for block in candidates
+        if _column_side(block, page_width) == "left" and _is_substantial_column_text_block(block, page_width)
+    ]
+    right = [
+        block
+        for block in candidates
+        if _column_side(block, page_width) == "right" and _is_substantial_column_text_block(block, page_width)
+    ]
     if len(left) < 2 or len(right) < 2:
+        return ordered
+    page_height = float(page.rect.height or 1.0)
+    overlap = _column_vertical_overlap(left, right)
+    if overlap < max(120.0, page_height * 0.22):
         return ordered
 
     column_blocks = left + right
@@ -179,6 +219,12 @@ def _is_noise_text_line(text: str) -> bool:
     s = unicodedata.normalize("NFKC", (text or "").strip())
     if not s:
         return True
+    if _SCAN_AD_LINE.match(s):
+        return True
+    if _TOPIC_HEADER_LINE.match(s):
+        return True
+    if s.replace("，", ",") == "新起点,在奇点":
+        return True
     if s.startswith("· 本试卷由") and "生成" in s:
         return True
     if _PAGE_NOISE_LINE.match(s):
@@ -188,6 +234,38 @@ def _is_noise_text_line(text: str) -> bool:
     if s.startswith("正确答案:") or s.startswith("正确答案："):
         return True
     if s.startswith("你的答案:") or s.startswith("你的答案："):
+        return True
+    return False
+
+
+def _is_decorative_text_line(page, line: dict, text: str) -> bool:
+    s = unicodedata.normalize("NFKC", (text or "").strip())
+    if not s:
+        return True
+
+    bbox = line.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+    x0, y0, x1, y1 = [float(v) for v in bbox]
+    width = max(0.0, x1 - x0)
+    height = max(0.0, y1 - y0)
+    page_w = float(page.rect.width or 1.0)
+    page_h = float(page.rect.height or 1.0)
+    center_x = (x0 + x1) / 2.0
+
+    if re.fullmatch(r"\d{1,3}", s):
+        if (
+            y0 >= page_h * 0.9
+            and width <= page_w * 0.12
+            and abs(center_x - page_w / 2.0) <= page_w * 0.08
+        ):
+            return True
+    if (
+        s in _SCAN_AD_CHARS
+        and len(s) == 1
+        and y1 <= page_h * 0.12
+        and width <= page_w * 0.04
+        and height <= page_h * 0.03
+        and (x0 <= page_w * 0.22 or x1 >= page_w * 0.72)
+    ):
         return True
     return False
 
@@ -202,7 +280,30 @@ def _is_decorative_image_block(page, block: dict) -> bool:
 
     if width >= page_w * 0.9 and height >= page_h * 0.75:
         return True
+    if y0 <= max(12.0, page_h * 0.02) and width >= page_w * 0.82 and height <= page_h * 0.12:
+        return True
     if y1 <= 90 and width >= page_w * 0.7 and height <= 40:
+        return True
+    if (
+        y1 <= 70
+        and height <= 30
+        and width <= page_w * 0.28
+        and (x0 <= page_w * 0.22 or x1 >= page_w * 0.78)
+    ):
+        return True
+    if (
+        y1 <= page_h * 0.12
+        and width <= page_w * 0.16
+        and height <= page_h * 0.1
+        and (x0 <= page_w * 0.24 or x1 >= page_w * 0.76)
+    ):
+        return True
+    if (
+        width <= max(18.0, page_w * 0.03)
+        and height <= max(14.0, page_h * 0.025)
+        and y0 >= page_h * 0.08
+        and y1 <= page_h * 0.92
+    ):
         return True
     if height <= 5:
         return True
@@ -287,7 +388,7 @@ def extract_pdf_line_items_with_metadata(
                     lines = sorted(block.get("lines") or [], key=_line_sort_key)
                     for line in lines:
                         lt = _line_text(line)
-                        if lt and not _is_noise_text_line(lt):
+                        if lt and not _is_noise_text_line(lt) and not _is_decorative_text_line(page, line, lt):
                             line_parts.append(lt)
                     if line_parts:
                         raw_segments.append(("\n".join(line_parts), None))
@@ -353,4 +454,40 @@ def segments_to_lines(segments: list[tuple[str, str | None]]) -> list[tuple[str,
             buf.append(text.strip())
 
     flush_text()
-    return lines
+    return _strip_noise_line_sequences(lines)
+
+
+def _strip_noise_line_sequences(lines: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    cleaned: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(lines):
+        text, image_path = lines[i]
+        if image_path:
+            cleaned.append((text, image_path))
+            i += 1
+            continue
+
+        normalized = unicodedata.normalize("NFKC", (text or "").strip())
+        if _is_noise_text_line(normalized):
+            i += 1
+            continue
+
+        if i + len(_SCAN_AD_CHARS) < len(lines):
+            char_window = [
+                unicodedata.normalize("NFKC", (lines[i + offset][0] or "").strip())
+                for offset in range(len(_SCAN_AD_CHARS))
+            ]
+            tail_text, tail_image = lines[i + len(_SCAN_AD_CHARS)]
+            tail_normalized = unicodedata.normalize("NFKC", (tail_text or "").strip())
+            if (
+                all(lines[i + offset][1] is None for offset in range(len(_SCAN_AD_CHARS)))
+                and char_window == list(_SCAN_AD_CHARS)
+                and tail_image is None
+                and _SCAN_AD_LINE.match(tail_normalized)
+            ):
+                i += len(_SCAN_AD_CHARS) + 1
+                continue
+
+        cleaned.append((text, image_path))
+        i += 1
+    return cleaned

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 
 from core.exam_docx_writer import parsed_exam_is_empty, write_parsed_exam_to_docx
@@ -20,7 +21,7 @@ def pdf_to_exam_docx(
     """
     items, tmp_dir = extract_pdf_line_items(pdf_path)
     try:
-        exam = parse_line_items(items, mode=mode)
+        exam = parse_line_items(items, mode=mode, source_name=os.path.basename(pdf_path))
         if parsed_exam_is_empty(exam):
             raise ValueError(
                 "未能识别篇界。请确认 PDF 文字可选中，且含「一. 政治理论」到「六. 资料分析」"

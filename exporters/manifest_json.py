@@ -13,6 +13,7 @@ from domain.models import (
     PaperSource,
     QuestionNode,
     QuestionRange,
+    ReviewIssue,
     Section,
 )
 
@@ -64,6 +65,8 @@ def _load_option(data: dict) -> OptionNode:
 
 
 def _load_question(data: dict) -> QuestionNode:
+    raw_suggested_confidence = data.get("suggested_subject_confidence")
+    raw_subtype_confidence = data.get("inferred_subtype_confidence")
     return QuestionNode(
         source_number=str(data.get("source_number") or ""),
         stem=str(data.get("stem") or ""),
@@ -72,6 +75,30 @@ def _load_question(data: dict) -> QuestionNode:
         answer=data.get("answer") or None,
         page_numbers=[int(value) for value in data.get("page_numbers", []) or []],
         option_layout=data.get("option_layout") or None,
+        review_confidence=float(data.get("review_confidence") or 1.0),
+        review_issues=[
+            ReviewIssue(
+                code=str(item.get("code") or ""),
+                title=str(item.get("title") or ""),
+                detail=str(item.get("detail") or ""),
+                severity=str(item.get("severity") or "warning"),
+            )
+            for item in data.get("review_issues", []) or []
+        ],
+        suggested_subject=data.get("suggested_subject") or None,
+        suggested_subject_confidence=(
+            float(raw_suggested_confidence)
+            if raw_suggested_confidence not in (None, "")
+            else None
+        ),
+        suggested_subject_reason=str(data.get("suggested_subject_reason") or ""),
+        inferred_subtype=str(data.get("inferred_subtype") or ""),
+        inferred_subtype_confidence=(
+            float(raw_subtype_confidence)
+            if raw_subtype_confidence not in (None, "")
+            else None
+        ),
+        inferred_signals=[str(value) for value in data.get("inferred_signals", []) or []],
     )
 
 
@@ -118,11 +145,23 @@ def _load_question_range(data: dict) -> QuestionRange:
 
 
 def load_project_manifest_project(path: str) -> ExamProject:
+    from core.project_quality import annotate_project_quality
+
     payload = load_project_manifest(path)
-    return ExamProject(
+    project = ExamProject(
         title=str(payload.get("title") or os.path.splitext(os.path.basename(path))[0]),
         source=_load_paper_source(payload.get("source")),
         sections=[_load_section(item) for item in payload.get("sections", []) or []],
         selected_subjects=[str(value) for value in payload.get("selected_subjects", []) or []],
         selected_ranges=[_load_question_range(item) for item in payload.get("selected_ranges", []) or []],
     )
+    has_review_metadata = any(
+        bool(question.review_issues)
+        or float(question.review_confidence or 1.0) != 1.0
+        or bool(question.suggested_subject)
+        or bool(question.inferred_subtype)
+        for _section, _material, question in project.iter_questions()
+    )
+    if not has_review_metadata:
+        annotate_project_quality(project)
+    return project

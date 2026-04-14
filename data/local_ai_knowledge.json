@@ -1,0 +1,754 @@
+{
+  "version": 1,
+  "source_papers": [
+    {
+      "file": "模拟卷十一.pdf",
+      "subject_ranges": {
+        "politics": "1-15",
+        "common_sense": "16-25",
+        "verbal": "26-60",
+        "quant": "61-70",
+        "reasoning": "71-100",
+        "data": "101-120"
+      },
+      "layout_patterns": [
+        "quant_image_options_before_markers",
+        "single_column_with_inline_images",
+        "reasoning_graphic_stems"
+      ],
+      "observed_signatures": {
+        "politics": [
+          "政策文件或总书记讲话引出题干",
+          "题干常带 1/2/3/4 条政策表述",
+          "选项常为 1项/2项/3项/4项 或长陈述句"
+        ],
+        "common_sense": [
+          "法律规定、典故诗词、地貌颜色等知识判断",
+          "题干较短但选项多为完整事实陈述",
+          "法条情景题常见 甲乙丙丁 案例型选项"
+        ],
+        "verbal": [
+          "逻辑填空短词选项占比高",
+          "片段阅读常见长文段加概括型选项",
+          "语句表达常出现数字排序项"
+        ],
+        "reasoning": [
+          "图形推理图片题和分组分类题并存",
+          "定义判断偏定义正文加案例型选项",
+          "约束条件题和集合关系题容易与常识串扰"
+        ]
+      }
+    },
+    {
+      "file": "2026年国家公务员录用考试《行测》题（行政执法卷网友回忆版）.pdf",
+      "subject_ranges": {
+        "politics": "1-20",
+        "common_sense": "21-35",
+        "verbal": "36-65",
+        "quant": "66-75",
+        "reasoning": "76-110",
+        "data": "111-130"
+      },
+      "layout_patterns": [
+        "standard_six_subject_sequence",
+        "explicit_subject_titles",
+        "data_material_with_tables",
+        "data_assets_embedded_in_first_question"
+      ],
+      "observed_signatures": {
+        "politics": [
+          "政治理论与常识判断都大量使用 下列说法/表述正确",
+          "区分关键在于政策理论锚点与政策文件来源",
+          "组合项政治判断和长陈述政治判断同时存在"
+        ],
+        "verbal": [
+          "逻辑填空与片段阅读混排稳定",
+          "部分片段阅读尾部设问弱，需要结合概括型选项判断",
+          "语句排序题常用纯数字排序选项"
+        ],
+        "data": [
+          "资料分析首题可能只有短设问",
+          "图表可能被误挂到首题题干而不是材料区",
+          "图形型、表格型、文字型和综合型混合出现"
+        ]
+      }
+    },
+    {
+      "file": "AKA红猪·江苏历年真题.pdf",
+      "subject_ranges": {
+        "data": "整卷资料分析"
+      },
+      "layout_patterns": [
+        "all_data_document",
+        "generic_material_headers_only",
+        "year_sections_with_repeated_material_blocks"
+      ]
+    }
+  ],
+  "study_datasets": [
+    {
+      "title": "【02】最新行测5000题题库",
+      "path": "【02】最新行测5000题题库",
+      "question_pdfs": [
+        "行测——言语理解2000题.pdf",
+        "行测——判断推理（2000题）.pdf",
+        "行测——数量关系（850题）.pdf",
+        "行测——资料分析（950题）.pdf"
+      ],
+      "answer_pdfs": [
+        "行测——言语理解2000题参考答案及解析.pdf",
+        "行测——判断推理参考答案及解析.pdf",
+        "行测——数量关系参考答案及解析.pdf",
+        "行测——资料分析参考答案及解析.pdf"
+      ],
+      "generated_profile": "data/gongkao_corpus_profiles.json"
+    }
+  ],
+  "official_sources": [
+    {
+      "title": "安徽省2025年度考试录用公务员笔试科目和内容",
+      "url": "https://rsj.huainan.gov.cn/group4/M00/0F/29/rB40qWd6IT-AaJuKAAg3oDOYLRI708.pdf",
+      "focus": [
+        "六大模块整体结构",
+        "判断推理四种子类型",
+        "资料分析材料与题目关系",
+        "样题表达方式"
+      ]
+    },
+    {
+      "title": "陕西省2023统一考试录用公务员公共科目笔试考试大纲",
+      "url": "https://www.shaanxi.gov.cn/xw/ztzl/zxzt/zkzl/2023/2021gwyfj/202301/t20230120_2272742_wap.html",
+      "focus": [
+        "行政职业能力测验模块说明",
+        "言语理解题型说明",
+        "常识判断范围说明",
+        "数量关系与资料分析的官方定义"
+      ]
+    },
+    {
+      "title": "陕西省2025统一考试录用公务员公共科目笔试考试大纲",
+      "url": "https://www.shaanxi.gov.cn/xw/ztzl/zxzt/zkzl/2025/202501/t20250121_3428253_wap.html",
+      "focus": [
+        "最新公考模块描述",
+        "政治理论与常识判断边界",
+        "判断推理子模块名称",
+        "资料分析作答要求"
+      ]
+    },
+    {
+      "title": "中央机关及其直属机构2026年度考试录用公务员公共科目笔试考试大纲",
+      "url": "https://www.forestry.gov.cn/c/www/gsgg/645383.jhtml",
+      "focus": [
+        "六大模块官方顺序",
+        "政治理论官方定义",
+        "常识判断官方范围",
+        "言语理解官方能力描述"
+      ]
+    },
+    {
+      "title": "江苏省2026年度考试录用公务员公共科目笔试考试大纲",
+      "url": "https://zzb.wuxi.gov.cn/doc/2025/11/01/4674861.shtml",
+      "focus": [
+        "六大模块完整顺序",
+        "言语理解常见题型",
+        "判断推理四种子类型",
+        "资料分析材料形式定义"
+      ]
+    },
+    {
+      "title": "安徽省2026年度考试录用公务员笔试考试大纲",
+      "url": "https://hbxfw.gov.cn/prod-api/profile/Ueditor/2026/01/15/%E5%AE%89%E5%BE%BD%E7%9C%812026%E5%B9%B4%E5%BA%A6%E8%80%83%E8%AF%95%E5%BD%95%E7%94%A8%E5%85%AC%E5%8A%A1%E5%91%98%E7%AC%94%E8%AF%95%E8%80%83%E8%AF%95%E5%A4%A7%E7%BA%B2_20260115131038A139.pdf",
+      "focus": [
+        "示例题结构",
+        "政治理论多项表述模式",
+        "常识判断法律科技人文边界",
+        "题干编号与行测版式特征"
+      ]
+    }
+  ],
+  "public_sources": [
+    {
+      "title": "粉笔：天津市考考情分析兼备考指导—言语篇",
+      "url": "https://www.fenbi.com/page/zixundetail/58/422459764918272",
+      "focus": [
+        "片段阅读、选词填空、语句表达的公开分类",
+        "言语题常见设问方式",
+        "语句排序与衔接题的结构特征"
+      ]
+    },
+    {
+      "title": "粉笔：陕西省考考情分析兼备考指导—言语篇",
+      "url": "https://fenbi.com/page/zixundetail/58/422459624934400",
+      "focus": [
+        "言语理解细分题型",
+        "文段整体理解与语句关系区分",
+        "逻辑填空与片段阅读的边界",
+        "实词、成语、混搭填空的公开经验"
+      ]
+    },
+    {
+      "title": "华图：河北省行测判断推理大纲解读及考题趋势",
+      "url": "https://m.huatu.com/2024/0217/2726817.html",
+      "focus": [
+        "图形推理、定义判断、类比推理、逻辑判断四分法",
+        "图形推理特征图",
+        "逻辑判断方法套路",
+        "加强削弱、翻译推理等公开分类"
+      ]
+    },
+    {
+      "title": "粉笔：广东考情分析—数资篇",
+      "url": "https://www.fenbi.com/page/zixundetail/58/422456711728128",
+      "focus": [
+        "数量关系和资料分析的公开题型分布",
+        "资料分析考点结构",
+        "数资混合模块的公开特征"
+      ]
+    },
+    {
+      "title": "中公网校：安徽省考行测题型题量及命题规律分析",
+      "url": "https://www.eoffcn.com/kszx/detail/1193321.html",
+      "focus": [
+        "五大模块和细分题型的公开梳理",
+        "判断推理四分法",
+        "资料分析材料涉及图形、表格、文字和综合性"
+      ]
+    },
+    {
+      "title": "中公网校：青海公务员考试行测试题考情分析",
+      "url": "https://www.eoffcn.com/kszx/detail/1037885.html",
+      "focus": [
+        "逻辑判断中的加强削弱特征",
+        "图形推理公开考点",
+        "资料分析模块稳定结构"
+      ]
+    },
+    {
+      "title": "华图：2015国家公务员考试行测真题卷（公开 PDF）",
+      "url": "https://nmg.huatu.com/zt/gkzt/fj/2015gkxcdjzt.pdf",
+      "focus": [
+        "公开真题中的定义判断案例型选项",
+        "片段阅读尾部设问结构",
+        "常识判断的知识判断型选项",
+        "资料分析首题短设问与共享材料关系"
+      ]
+    }
+  ],
+  "subject_profiles": {
+    "politics": {
+      "positive_keywords": [
+        "习近平",
+        "新时代",
+        "中国特色社会主义",
+        "中国共产党",
+        "马克思主义",
+        "二十大",
+        "全面从严治党",
+        "中国式现代化",
+        "高质量发展",
+        "共同富裕",
+        "党的二十大报告"
+      ],
+      "negative_keywords": [
+        "根据上述定义",
+        "图形推理",
+        "增长率",
+        "填入画横线部分"
+      ],
+      "structural_markers": [
+        "时政理论",
+        "党政理论",
+        "政治理论"
+      ],
+      "subtypes": [
+        {
+          "name": "党的创新理论",
+          "positive_keywords": [
+            "习近平新时代中国特色社会主义思想",
+            "中国式现代化",
+            "高质量发展",
+            "全面从严治党"
+          ],
+          "structural_markers": [
+            "理论表述",
+            "政策方针",
+            "时政精神"
+          ]
+        },
+        {
+          "name": "党史党章时政",
+          "positive_keywords": [
+            "党章",
+            "二十大",
+            "中央经济工作会议",
+            "党内法规"
+          ],
+          "structural_markers": [
+            "会议精神",
+            "时政热点"
+          ]
+        }
+      ]
+    },
+    "common_sense": {
+      "positive_keywords": [
+        "下列关于",
+        "下列说法",
+        "宪法",
+        "民法典",
+        "刑法",
+        "行政处罚",
+        "经济",
+        "社会",
+        "生态",
+        "地理",
+        "历史",
+        "文化常识",
+        "科学",
+        "科技",
+        "人文"
+      ],
+      "negative_keywords": [
+        "根据上述定义",
+        "最能削弱",
+        "如果那么",
+        "增长率",
+        "材料一"
+      ],
+      "structural_markers": [
+        "知识判断",
+        "法律常识",
+        "科技常识"
+      ],
+      "subtypes": [
+        {
+          "name": "法律常识",
+          "positive_keywords": [
+            "宪法",
+            "民法典",
+            "刑法",
+            "行政处罚",
+            "行政许可",
+            "诉讼"
+          ],
+          "structural_markers": [
+            "法条场景",
+            "权利义务"
+          ]
+        },
+        {
+          "name": "科技人文地理",
+          "positive_keywords": [
+            "地理",
+            "历史",
+            "文化常识",
+            "天文",
+            "生物",
+            "化学",
+            "物理",
+            "科技",
+            "人文",
+            "生态"
+          ],
+          "structural_markers": [
+            "知识辨析",
+            "现象解释"
+          ]
+        }
+      ]
+    },
+    "verbal": {
+      "positive_keywords": [
+        "填入画横线部分",
+        "最恰当",
+        "词语",
+        "成语",
+        "语句",
+        "语序",
+        "排序",
+        "文段",
+        "作者意在",
+        "阅读",
+        "片段阅读",
+        "文章阅读",
+        "选词填空",
+        "衔接最恰当",
+        "标题的是",
+        "概括最准确",
+        "意在说明"
+      ],
+      "negative_keywords": [
+        "根据上述定义",
+        "增长率",
+        "图形推理",
+        "旋转木马"
+      ],
+      "structural_markers": [
+        "横线填空",
+        "片段阅读",
+        "语句排序",
+        "尾部设问"
+      ],
+      "subtypes": [
+        {
+          "name": "逻辑填空",
+          "positive_keywords": [
+            "填入画横线部分",
+            "最恰当",
+            "词语",
+            "成语",
+            "依次填入",
+            "最贴切",
+            "实词",
+            "成语填空"
+          ],
+          "structural_markers": [
+            "横线填空",
+            "词语辨析",
+            "短词选项",
+            "搭配语境",
+            "实词填空",
+            "双空三空",
+            "短词对比"
+          ]
+        },
+        {
+          "name": "片段阅读",
+          "positive_keywords": [
+            "这段文字",
+            "作者意在",
+            "主要想表达",
+            "文段",
+            "接下来最可能",
+            "这段文字主要",
+            "意在说明",
+            "标题的是",
+            "概括最准确",
+            "这段文字告诉我们"
+          ],
+          "structural_markers": [
+            "长文段",
+            "主旨概括",
+            "尾部设问",
+            "文意判断"
+          ]
+        },
+        {
+          "name": "语句表达",
+          "positive_keywords": [
+            "语句",
+            "语序",
+            "排序",
+            "重新排列",
+            "衔接最恰当",
+            "将以上",
+            "将上述"
+          ],
+          "structural_markers": [
+            "句子排序",
+            "衔接填空"
+          ]
+        }
+      ]
+    },
+    "quant": {
+      "positive_keywords": [
+        "利润",
+        "成本",
+        "折扣",
+        "浓度",
+        "速度",
+        "路程",
+        "工程",
+        "排列组合",
+        "概率",
+        "至少",
+        "最多",
+        "圆形旋转木马",
+        "数字推理",
+        "数学运算",
+        "几天",
+        "多少人"
+      ],
+      "negative_keywords": [
+        "根据上述定义",
+        "材料一",
+        "图表",
+        "最能削弱"
+      ],
+      "structural_markers": [
+        "数字密集",
+        "公式计算",
+        "纯数字选项"
+      ],
+      "subtypes": [
+        {
+          "name": "工程行程利润",
+          "positive_keywords": [
+            "工程",
+            "速度",
+            "路程",
+            "相遇",
+            "利润",
+            "成本",
+            "折扣"
+          ],
+          "structural_markers": [
+            "数量计算",
+            "应用题"
+          ]
+        },
+        {
+          "name": "排列组合概率",
+          "positive_keywords": [
+            "概率",
+            "随机",
+            "恰好",
+            "至少",
+            "最多",
+            "安排",
+            "圆形旋转木马"
+          ],
+          "structural_markers": [
+            "组合计数",
+            "概率模型"
+          ]
+        },
+        {
+          "name": "几何与数列",
+          "positive_keywords": [
+            "等边三角形",
+            "长方形",
+            "圆心",
+            "角度",
+            "数列",
+            "倍数",
+            "面积",
+            "体积"
+          ],
+          "structural_markers": [
+            "图形计算",
+            "几何关系"
+          ]
+        }
+      ]
+    },
+    "reasoning": {
+      "positive_keywords": [
+        "图形推理",
+        "定义判断",
+        "类比推理",
+        "逻辑判断",
+        "根据上述定义",
+        "符合定义",
+        "不符合定义",
+        "如果",
+        "那么",
+        "最能削弱",
+        "最能支持",
+        "能够推出",
+        "之于",
+        "相当于",
+        "问号处"
+      ],
+      "negative_keywords": [
+        "增长率",
+        "下表",
+        "同比",
+        "填入画横线部分"
+      ],
+      "structural_markers": [
+        "定义在前案例在后",
+        "图形问号位",
+        "条件推理"
+      ],
+      "subtypes": [
+        {
+          "name": "定义判断",
+          "positive_keywords": [
+            "根据上述定义",
+            "符合定义",
+            "不符合定义",
+            "是指"
+          ],
+          "structural_markers": [
+            "定义在前案例在后",
+            "定义匹配"
+          ]
+        },
+        {
+          "name": "逻辑判断",
+          "positive_keywords": [
+            "如果",
+            "那么",
+            "能够推出",
+            "不能推出",
+            "最能削弱",
+            "最能支持",
+            "除非",
+            "只有",
+            "加强型",
+            "削弱型"
+          ],
+          "structural_markers": [
+            "条件推理",
+            "加强削弱",
+            "翻译推理",
+            "分析推理"
+          ]
+        },
+        {
+          "name": "类比推理",
+          "positive_keywords": [
+            "之于",
+            "类似于",
+            "对应关系",
+            "相当于",
+            "对于",
+            "关系最为贴近"
+          ],
+          "structural_markers": [
+            "词项配对",
+            "关系映射"
+          ]
+        },
+        {
+          "name": "图形推理",
+          "positive_keywords": [
+            "问号处",
+            "呈现一定的规律",
+            "图形推理",
+            "最合适的一项",
+            "阴影",
+            "封闭区域",
+            "旋转"
+          ],
+          "structural_markers": [
+            "图形矩阵",
+            "图形序列",
+            "空间重构",
+            "平面图形"
+          ]
+        }
+      ]
+    },
+    "data": {
+      "positive_keywords": [
+        "根据以下资料",
+        "根据所给资料",
+        "资料显示",
+        "增长率",
+        "同比",
+        "环比",
+        "百分点",
+        "图表",
+        "表中",
+        "材料一",
+        "下表",
+        "下图",
+        "统计图",
+        "比重"
+      ],
+      "negative_keywords": [
+        "根据上述定义",
+        "最能削弱",
+        "填入画横线部分"
+      ],
+      "structural_markers": [
+        "共享材料",
+        "表格图表",
+        "一段材料带多题",
+        "首题短设问"
+      ],
+      "subtypes": [
+        {
+          "name": "表格型资料分析",
+          "positive_keywords": [
+            "表中",
+            "下表",
+            "如下表",
+            "表1",
+            "表2"
+          ],
+          "structural_markers": [
+            "表格数据",
+            "行列对比"
+          ]
+        },
+        {
+          "name": "图形型资料分析",
+          "positive_keywords": [
+            "图中",
+            "图表",
+            "柱状图",
+            "饼图",
+            "折线图",
+            "下图",
+            "如图"
+          ],
+          "structural_markers": [
+            "图表材料",
+            "趋势比较"
+          ]
+        },
+        {
+          "name": "综合型资料分析",
+          "positive_keywords": [
+            "根据以下资料",
+            "图中",
+            "表中",
+            "资料显示",
+            "综合性材料"
+          ],
+          "structural_markers": [
+            "多种材料混合",
+            "图表与文字并存",
+            "首题挂图待回收"
+          ]
+        },
+        {
+          "name": "文字型资料分析",
+          "positive_keywords": [
+            "资料显示",
+            "根据以下资料",
+            "根据所给资料"
+          ],
+          "structural_markers": [
+            "材料段落",
+            "多题共用材料"
+          ]
+        }
+      ]
+    }
+  },
+  "confidence": {
+    "display_floor": 0.18,
+    "display_cap": 0.98,
+    "unknown_cap": 0.34,
+    "low_margin_cap": 0.52,
+    "strong_threshold": 0.72
+  },
+  "workflow_notes": {
+    "pdf_flow": "PDF 试卷整理只负责抽取、解析、预览编辑、导出 Word/JSON。",
+    "word_flow": "Word 生成 PPT 可直接读取用户自己的 Word，也可承接 PDF 导出的 Word。",
+    "shared_preview": "结构树、待确认、PPT 页共用同一题目编辑区；人工修改后立即回写工程。"
+  },
+  "layout_patterns": [
+    {
+      "code": "quant_image_options_before_markers",
+      "description": "数量关系里可能出现图片选项先出现，A/B/C/D 字母标签后出现的版式。"
+    },
+    {
+      "code": "single_subject_without_titles",
+      "description": "单科整卷可能没有标准六大标题，需要按题块结构推断科目。"
+    },
+    {
+      "code": "data_material_with_generic_header",
+      "description": "资料分析可能只写通用“材料”，不写材料二、材料三。"
+    },
+    {
+      "code": "all_data_document",
+      "description": "整份试卷可能全部由资料分析构成，年份标题和通用材料头需要直接视作资料分析锚点。"
+    }
+  ]
+}

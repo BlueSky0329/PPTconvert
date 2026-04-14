@@ -8,6 +8,17 @@ from domain.models import ExamProject
 from exporters.material_crops import crop_material_regions
 
 
+def iter_project_question_nodes(project: ExamProject):
+    for section in project.sections:
+        if section.kind == "data":
+            for material in section.material_sets:
+                for question in material.questions:
+                    yield section, material, question
+        else:
+            for question in section.questions:
+                yield section, None, question
+
+
 def project_to_ppt_questions(
     project: ExamProject,
     *,
@@ -17,54 +28,50 @@ def project_to_ppt_questions(
     material_image_map = material_image_map or {}
     display_number = 1
 
-    for section in project.sections:
-        if section.kind == "data":
-            for material in section.material_sets:
-                material_images = material_image_map.get(material.material_id, [])
-                fallback_images = [asset.path for asset in material.body_assets if asset.path]
-                for question in material.questions:
-                    image_paths = list(material_images or fallback_images)
-                    image_paths.extend(asset.path for asset in question.stem_assets if asset.path)
-                    questions.append(
-                        Question(
-                            number=display_number,
-                            stem=question.stem,
-                            options=[
-                                Option(
-                                    letter=option.letter,
-                                    text=option.text,
-                                    image_path=option.image_path,
-                                )
-                                for option in question.options
-                            ],
-                            image_paths=image_paths,
-                            source_question_number=question.source_number or None,
-                            material_header=None if material_images else material.header or None,
-                            material_text=None if material_images else (material.body or None),
-                            option_layout=question.option_layout,
+    for section, material, question in iter_project_question_nodes(project):
+        if section.kind == "data" and material is not None:
+            material_images = material_image_map.get(material.material_id, [])
+            fallback_images = [asset.path for asset in material.body_assets if asset.path]
+            image_paths = list(material_images or fallback_images)
+            image_paths.extend(asset.path for asset in question.stem_assets if asset.path)
+            questions.append(
+                Question(
+                    number=display_number,
+                    stem=question.stem,
+                    options=[
+                        Option(
+                            letter=option.letter,
+                            text=option.text,
+                            image_path=option.image_path,
                         )
-                    )
-                    display_number += 1
-        else:
-            for question in section.questions:
-                questions.append(
-                    Question(
-                        number=display_number,
-                        stem=question.stem,
-                        options=[
-                            Option(
-                                letter=option.letter,
-                                text=option.text,
-                                image_path=option.image_path,
-                            )
-                            for option in question.options
-                        ],
-                        image_paths=[asset.path for asset in question.stem_assets if asset.path],
-                        source_question_number=question.source_number or None,
-                        option_layout=question.option_layout,
-                    )
+                        for option in question.options
+                    ],
+                    image_paths=image_paths,
+                    source_question_number=question.source_number or None,
+                    material_header=None if material_images else material.header or None,
+                    material_text=None if material_images else (material.body or None),
+                    option_layout=question.option_layout,
                 )
-                display_number += 1
+            )
+        else:
+            questions.append(
+                Question(
+                    number=display_number,
+                    stem=question.stem,
+                    options=[
+                        Option(
+                            letter=option.letter,
+                            text=option.text,
+                            image_path=option.image_path,
+                        )
+                        for option in question.options
+                    ],
+                    image_paths=[asset.path for asset in question.stem_assets if asset.path],
+                    source_question_number=question.source_number or None,
+                    option_layout=question.option_layout,
+                )
+            )
+        display_number += 1
     return questions
 
 

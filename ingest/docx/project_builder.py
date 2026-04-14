@@ -5,6 +5,8 @@ import shutil
 from typing import Optional
 
 from core.models import Question
+from core.project_quality import annotate_project_quality
+from core.subject_inference import preferred_subject_title, should_merge_subject_sections
 from core.word_parser import WordParser
 from domain.models import (
     ALL_SUBJECT_KINDS,
@@ -99,16 +101,24 @@ def build_exam_project_from_word_questions(
     for index, question in enumerate(questions, start=1):
         section_kind = _normalize_subject_kind(getattr(question, "section_kind", None))
         section_title = (getattr(question, "section_title", None) or "").strip() or _default_section_title(section_kind)
+        merge_into_current = (
+            current_section is not None
+            and current_section.kind == section_kind
+            and section_kind != "data"
+            and should_merge_subject_sections(section_kind, current_section.title, section_title)
+        )
         needs_new_section = (
             current_section is None
             or current_section.kind != section_kind
-            or current_section.title != section_title
+            or (not merge_into_current and current_section.title != section_title)
             or (section_kind == "data" and current_section.kind != "data")
         )
         if needs_new_section:
             current_section = Section(kind=section_kind, title=section_title)
             project.sections.append(current_section)
             current_material = None
+        elif merge_into_current:
+            current_section.title = preferred_subject_title(section_kind, current_section.title, section_title)
 
         question_node = _make_question_node(question)
         if current_section.kind != "data":
@@ -147,6 +157,7 @@ def build_exam_project_from_word_questions(
         if section.kind in ALL_SUBJECT_KINDS and section.kind not in seen_subjects:
             seen_subjects.append(section.kind)
     project.selected_subjects = seen_subjects
+    annotate_project_quality(project)
     return project
 
 

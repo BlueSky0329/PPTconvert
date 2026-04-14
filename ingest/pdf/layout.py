@@ -54,7 +54,11 @@ def extract_pdf_text_lines(pdf_path: str) -> list[PageTextLine]:
                 page_lines = sorted(block.get("lines") or [], key=legacy_extract._line_sort_key)
                 for line in page_lines:
                     text = _normalize_text(_line_text(line))
-                    if not text or legacy_extract._is_noise_text_line(text):
+                    if (
+                        not text
+                        or legacy_extract._is_noise_text_line(text)
+                        or legacy_extract._is_decorative_text_line(page, line, text)
+                    ):
                         continue
                     x0, y0, x1, y1 = [float(value) for value in (line.get("bbox") or block.get("bbox"))]
                     lines.append(

@@ -11,6 +11,7 @@ from domain.models import (
     PaperSource,
     QuestionNode,
     QuestionRange,
+    ReviewIssue,
     Section,
 )
 from exporters.manifest_json import export_project_manifest, load_project_manifest_project
@@ -67,6 +68,21 @@ class ManifestJsonTest(unittest.TestCase):
                                         ],
                                         page_numbers=[2],
                                         option_layout="one_row",
+                                        review_confidence=0.62,
+                                        review_issues=[
+                                            ReviewIssue(
+                                                code="option_count",
+                                                title="选项数量异常",
+                                                detail="当前识别到 1 个选项。",
+                                                severity="warning",
+                                            )
+                                        ],
+                                        suggested_subject="data",
+                                        suggested_subject_confidence=0.84,
+                                        suggested_subject_reason="题干里有明显资料分析信号。",
+                                        inferred_subtype="表格型资料分析",
+                                        inferred_subtype_confidence=0.88,
+                                        inferred_signals=["根据以下资料", "同比", "表中"],
                                     )
                                 ],
                             )
@@ -85,9 +101,16 @@ class ManifestJsonTest(unittest.TestCase):
             self.assertEqual(loaded.selected_subjects, ["data"])
             self.assertEqual(len(loaded.selected_ranges), 1)
             self.assertEqual(loaded.selected_ranges[0].start, 111)
-            self.assertEqual(loaded.sections[0].material_sets[0].questions[0].options[0].image_path, "option-a.png")
-            self.assertEqual(loaded.sections[0].material_sets[0].questions[0].options[0].source_page, 2)
-            self.assertIsNotNone(loaded.sections[0].material_sets[0].questions[0].options[0].page_region)
+            question = loaded.sections[0].material_sets[0].questions[0]
+            self.assertEqual(question.options[0].image_path, "option-a.png")
+            self.assertEqual(question.options[0].source_page, 2)
+            self.assertIsNotNone(question.options[0].page_region)
+            self.assertEqual(question.review_issues[0].code, "option_count")
+            self.assertAlmostEqual(question.review_confidence, 0.62, places=2)
+            self.assertEqual(question.suggested_subject, "data")
+            self.assertEqual(question.inferred_subtype, "表格型资料分析")
+            self.assertAlmostEqual(question.inferred_subtype_confidence, 0.88, places=2)
+            self.assertEqual(question.inferred_signals[:2], ["根据以下资料", "同比"])
 
 
 if __name__ == "__main__":

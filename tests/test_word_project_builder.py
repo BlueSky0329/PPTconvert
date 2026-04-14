@@ -77,6 +77,38 @@ class WordProjectBuilderTest(unittest.TestCase):
         self.assertEqual(data_section.material_sets[1].header, "材料二")
         self.assertEqual(data_section.material_sets[1].body_assets[0].path, "m2.png")
 
+    def test_build_project_merges_equivalent_objective_section_titles(self):
+        questions = [
+            Question(
+                number=1,
+                stem="判断题一",
+                options=[Option("A", "甲"), Option("B", "乙")],
+                source_question_number="76",
+                section_kind="reasoning",
+                section_title="判断推理",
+            ),
+            Question(
+                number=2,
+                stem="判断题二",
+                options=[Option("A", "丙"), Option("B", "丁")],
+                source_question_number="77",
+                section_kind="reasoning",
+                section_title="五. 判断推理",
+            ),
+        ]
+
+        project = build_exam_project_from_word_questions(
+            questions,
+            title="示例题库",
+            docx_path="sample.docx",
+            asset_dir="sample_assets",
+        )
+
+        self.assertEqual(len(project.sections), 1)
+        self.assertEqual(project.sections[0].kind, "reasoning")
+        self.assertEqual(project.sections[0].title, "五. 判断推理")
+        self.assertEqual([question.source_number for question in project.sections[0].questions], ["76", "77"])
+
 
 if __name__ == "__main__":
     unittest.main()

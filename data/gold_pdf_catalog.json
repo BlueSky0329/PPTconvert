@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "pdfs": [
+    {
+      "path": "模拟卷十一.pdf",
+      "form": "set_paper"
+    },
+    {
+      "path": "2026年国家公务员录用考试《行测》题（行政执法卷网友回忆版）.pdf",
+      "form": "set_paper"
+    },
+    {
+      "path": "【02】最新行测5000题题库/行测——判断推理（2000题）.pdf",
+      "form": "single_subject_book",
+      "subject": "reasoning"
+    },
+    {
+      "path": "【02】最新行测5000题题库/行测——数量关系（850题）.pdf",
+      "form": "single_subject_book",
+      "subject": "quant"
+    },
+    {
+      "path": "【02】最新行测5000题题库/行测——言语理解2000题.pdf",
+      "form": "single_subject_book",
+      "subject": "verbal"
+    },
+    {
+      "path": "【02】最新行测5000题题库/行测——资料分析（950题）.pdf",
+      "form": "single_subject_book",
+      "subject": "data"
+    }
+  ]
+}

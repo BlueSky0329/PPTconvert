@@ -13,6 +13,8 @@ SubjectKind = Literal[
     "unknown",
 ]
 
+ReviewSeverity = Literal["info", "warning", "error"]
+
 ALL_SUBJECT_KINDS: tuple[SubjectKind, ...] = (
     "politics",
     "common_sense",
@@ -70,6 +72,14 @@ class OptionNode:
 
 
 @dataclass
+class ReviewIssue:
+    code: str
+    title: str
+    detail: str = ""
+    severity: ReviewSeverity = "warning"
+
+
+@dataclass
 class QuestionNode:
     source_number: str
     stem: str
@@ -78,6 +88,14 @@ class QuestionNode:
     answer: Optional[str] = None
     page_numbers: list[int] = field(default_factory=list)
     option_layout: Optional[str] = None
+    review_confidence: float = 1.0
+    review_issues: list[ReviewIssue] = field(default_factory=list)
+    suggested_subject: Optional[SubjectKind] = None
+    suggested_subject_confidence: Optional[float] = None
+    suggested_subject_reason: str = ""
+    inferred_subtype: str = ""
+    inferred_subtype_confidence: Optional[float] = None
+    inferred_signals: list[str] = field(default_factory=list)
 
     @property
     def numeric_source_number(self) -> Optional[int]:

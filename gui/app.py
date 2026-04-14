@@ -12,8 +12,17 @@ from PIL import Image, ImageTk
 from ttkbootstrap.constants import *
 
 from core.word_parser import WordParser
+from core.ai_repair import (
+    AIRepairService,
+    apply_ai_question_patch,
+    repair_question_boundary,
+    repair_project_questions,
+)
+from core.subject_inference import infer_subject_diagnostics
 from domain.models import ALL_SUBJECT_KINDS, SUBJECT_DISPLAY_NAMES
 from domain.project_editor import (
+    apply_all_safe_subject_suggestions,
+    apply_section_subject_suggestion,
     clear_option_image,
     insert_option_after,
     insert_material_after,
@@ -26,16 +35,26 @@ from domain.project_editor import (
     replace_option_image,
     rename_material,
     renumber_question,
+    section_subject_suggestion,
     set_question_option_layout,
     update_option_text,
     update_question_stem,
 )
 from core.ppt_generator import PPTGenerator, PPTConfig
 from core.ppt_style import parse_hex_color
+from core.project_quality import (
+    annotate_project_quality,
+    is_flagged_question,
+    iter_flagged_question_rows,
+    question_max_severity,
+    question_review_summary,
+    severity_rank,
+)
 from core.models import Question
 from exporters.manifest_json import load_project_manifest_project
 from exporters.material_crops import crop_material_regions, crop_page_regions
-from exporters.pptx_slides import project_to_ppt_questions
+from exporters.pptx_slides import iter_project_question_nodes, project_to_ppt_questions
+from exporters.review_report import export_quality_report
 from gui.font_data import build_font_values
 from gui import ui_constants as U
 from workflows.project_flow import build_word_project
@@ -45,7 +64,7 @@ _PDF_WIZARD_STEPS = (
     ("导入 PDF", "选择试卷文件，向导会按文件名预填默认输出路径。"),
     ("识别设置", "决定要进入工程的题目范围；下一步会生成或刷新结构化预览。"),
     ("结果预览", "校对题号、材料和题目归属；这一步的人工修正会直接用于导出。"),
-    ("导出结果", "从同一份题目工程导出题本 Word、授课 PPT 和工程 JSON。"),
+    ("导出结果", "从当前题目工程导出 Word / JSON；需要做 PPT 时，再把 Word 交给 Word 工作流继续解析。"),
 )
 _PDF_SUBJECT_ORDER = tuple(ALL_SUBJECT_KINDS)
 _PDF_QUESTION_LAYOUT_CHOICES = (
@@ -93,6 +112,8 @@ class PPTConvertApp:
         self.use_template = tk.BooleanVar(value=False)
         self.word_document_subject = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
         self.pdf_document_subject = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
+        self.ai_only_flagged = tk.BooleanVar(value=True)
+        self.ai_batch_limit = tk.IntVar(value=12)
         self.option_layout = tk.StringVar(value="grid")
         self.font_size_stem = tk.IntVar(value=20)
         self.font_size_option = tk.IntVar(value=18)
@@ -143,6 +164,16 @@ class PPTConvertApp:
         self._pdf_stem_preview_paths: list[str] = []
         self._pdf_stem_preview_index = 0
         self._pdf_stem_preview_photo = None
+        self._pdf_slide_payload_ids: list[str] = []
+        self._pdf_slide_payload_to_item_id: dict[str, str] = {}
+        self._pdf_slide_item_to_payload_id: dict[str, str] = {}
+        self._pdf_slide_payload_to_number: dict[str, int] = {}
+        self._pdf_review_payload_ids: list[str] = []
+        self._pdf_review_payload_to_item_id: dict[str, str] = {}
+        self._pdf_review_item_to_payload_id: dict[str, str] = {}
+        self._pdf_preview_syncing_selection = False
+        self._pdf_slide_syncing_selection = False
+        self._pdf_review_syncing_selection = False
 
         self.pdf_path = tk.StringVar()
         self.pdf_word_out = tk.StringVar()
@@ -151,6 +182,8 @@ class PPTConvertApp:
         self.pdf_question_range = tk.StringVar()
         self._pdf_question_layout_var = tk.StringVar(value="")
         self._pdf_question_editor_message = tk.StringVar(value="选择一道题后，可在这里实时修改题干，并为该题单独切换选项布局。")
+        self._pdf_ai_suggestion_var = tk.StringVar(value="AI 建议会在这里显示，当前先聚焦待确认题。")
+        self._ai_status_var = tk.StringVar(value="本地 AI 修复会直接写回当前工程，不依赖外部接口。")
         self._pdf_subject_vars = {
             kind: tk.BooleanVar(value=True)
             for kind in _PDF_SUBJECT_ORDER
@@ -174,6 +207,9 @@ class PPTConvertApp:
         self._pdf_option_insert_buttons: dict[str, ttk.Button] = {}
         self._pdf_option_remove_buttons: dict[str, ttk.Button] = {}
         self._pdf_project_dirty = False
+        self._pdf_slide_status_var = tk.StringVar(value="选择左侧 PPT 页后，可以逐页预览并实时编辑。")
+        self._pdf_review_status_var = tk.StringVar(value="AI 质检会在预览生成后自动标出待确认题目。")
+        self._ai_repair_busy = False
 
         self._build_ui()
         self._bind_pdf_wizard_updates()
@@ -182,6 +218,11 @@ class PPTConvertApp:
             self._pdf_question_layout_var.trace_add("write", lambda *_: self._on_pdf_question_layout_change())
         except Exception:
             pass
+        for variable in (self.ai_only_flagged,):
+            try:
+                variable.trace_add("write", lambda *_: self._refresh_pdf_ai_suggestion())
+            except Exception:
+                pass
         self._schedule_preview_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -510,8 +551,45 @@ class PPTConvertApp:
             bootstyle="secondary",
         ).pack(anchor=W, pady=(6, 0))
 
+        self._build_ai_settings_section(frame)
         self._build_template_section(frame)
         self._build_config_section(frame)
+
+    def _build_ai_settings_section(self, parent):
+        frame = ttk.Labelframe(parent, text=" 本地 AI 修复 ", bootstyle="warning", padding=_PAD)
+        frame.pack(fill=X, pady=(0, 10))
+
+        ttk.Label(
+            frame,
+            text=(
+                "这里是内置的本地低阶 AI 修复器，本质上是规则 + 打分 + 自动修复。"
+                "它会结合题干、选项、材料、相邻题和待确认项，直接把安全修复写回当前工程。"
+            ),
+            wraplength=860,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 8))
+
+        row1 = ttk.Frame(frame)
+        row1.pack(fill=X, pady=(0, 6))
+        ttk.Label(row1, text="批量上限", width=10).pack(side=LEFT)
+        ttk.Spinbox(row1, from_=1, to=50, textvariable=self.ai_batch_limit, width=8).pack(side=LEFT)
+        ttk.Checkbutton(
+            row1,
+            text="批量时仅处理待确认题",
+            variable=self.ai_only_flagged,
+            bootstyle="round-toggle",
+        ).pack(side=LEFT, padx=(12, 0))
+
+        row2 = ttk.Frame(frame)
+        row2.pack(fill=X)
+        ttk.Label(
+            row2,
+            textvariable=self._ai_status_var,
+            wraplength=680,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(12, 0))
 
     def _build_pdf_wizard(self, parent):
         step_bar = ttk.Frame(parent, padding=(12, 6, 12, 6))
@@ -751,23 +829,22 @@ class PPTConvertApp:
         box.pack(fill=X, pady=(0, 8))
 
         self._file_row(box, "题本 Word", self.pdf_word_out, self._browse_pdf_word, "另存为...", pady=(0, 0))
-        self._file_row(box, "授课 PPT", self.pdf_ppt_out, self._browse_pdf_ppt, "另存为...", pady=(6, 0))
         self._file_row(box, "工程 JSON", self.pdf_manifest_out, self._browse_pdf_manifest, "另存为...", pady=(6, 0))
 
-        template_row = ttk.Frame(box)
-        template_row.pack(fill=X, pady=(10, 0))
-        ttk.Label(template_row, text="PPT 设置", width=10).pack(side=LEFT)
+        handoff_row = ttk.Frame(box)
+        handoff_row.pack(fill=X, pady=(10, 0))
+        ttk.Label(handoff_row, text="下一步", width=10).pack(side=LEFT)
         ttk.Label(
-            template_row,
-            text="模板、字号、颜色和布局统一在“PPT 导出设置”标签页调整。",
+            handoff_row,
+            text="需要做 PPT 时，请把 Word 交给“Word 生成 PPT”；解析后会进入同一套共享预览。",
             bootstyle="secondary",
         ).pack(side=LEFT, fill=X, expand=YES)
         ttk.Button(
-            template_row,
-            text="打开设置",
-            command=self._open_ppt_settings_tab,
+            handoff_row,
+            text="打开 Word 工作流",
+            command=self._open_word_workspace_tab,
             bootstyle="info-outline",
-            width=10,
+            width=14,
         ).pack(side=RIGHT)
 
         action_row = ttk.Frame(parent, padding=(0, 4))
@@ -781,24 +858,17 @@ class PPTConvertApp:
         ).pack(side=LEFT)
         ttk.Button(
             action_row,
-            text="仅导出 Word",
+            text="导出 Word / 工程",
             command=self._export_pdf_word,
             bootstyle="info-outline",
-            width=12,
+            width=14,
         ).pack(side=RIGHT, padx=(4, 0))
         ttk.Button(
             action_row,
-            text="仅导出 PPT",
-            command=self._export_pdf_ppt,
-            bootstyle="success-outline",
-            width=12,
-        ).pack(side=RIGHT, padx=4)
-        ttk.Button(
-            action_row,
-            text="导出 Word + PPT",
-            command=self._export_pdf_bundle,
+            text="导出 Word 并进入 PPT",
+            command=self._export_pdf_word_and_open_ppt_flow,
             bootstyle="success",
-            width=16,
+            width=18,
         ).pack(side=RIGHT, padx=4)
 
     def _build_progress_footer(self, parent):
@@ -818,6 +888,12 @@ class PPTConvertApp:
         settings_tab = getattr(self, "_ppt_settings_tab", None)
         if notebook is not None and settings_tab is not None:
             notebook.select(settings_tab)
+
+    def _open_word_workspace_tab(self):
+        notebook = getattr(self, "_workspace_notebook", None)
+        word_tab = getattr(self, "_word_workspace_tab", None)
+        if notebook is not None and word_tab is not None:
+            notebook.select(word_tab)
 
     def _open_pdf_preview_workspace(self):
         notebook = getattr(self, "_workspace_notebook", None)
@@ -1039,7 +1115,7 @@ class PPTConvertApp:
             self._pdf_next_btn.configure(text="生成预览", state=NORMAL, bootstyle="primary")
         elif self._pdf_wizard_step == 2:
             state = NORMAL if self._pdf_project_matches_current_selection() else DISABLED
-            self._pdf_next_btn.configure(text="下一步：导出结果", state=state, bootstyle="success")
+            self._pdf_next_btn.configure(text="下一步：导出 Word / 继续 PPT", state=state, bootstyle="success")
         else:
             self._pdf_next_btn.configure(text="已到最后一步", state=DISABLED, bootstyle="secondary")
 
@@ -1078,7 +1154,7 @@ class PPTConvertApp:
                 f"当前 Word：{os.path.basename(docx_file)}\n"
                 f"素材目录：{self._pdf_project_context.get('asset_dir', '-')}\n"
                 f"整份科目：{self._document_subject_label(self._pdf_project_context.get('document_subject_hint', 'auto'))}\n"
-                f"默认课件：{self.pdf_ppt_out.get().strip() or docx_base + '.pptx'}\n"
+                f"默认 PPT：{self.output_path.get().strip() or docx_base + '.pptx'}\n"
                 f"默认工程：{self.pdf_manifest_out.get().strip() or docx_base + '_工程.json'}"
             )
         elif pdf_file:
@@ -1086,7 +1162,6 @@ class PPTConvertApp:
                 f"当前试卷：{base_name}\n"
                 f"整份科目：{document_subject_text}\n"
                 f"默认题本：{self.pdf_word_out.get().strip() or os.path.splitext(pdf_file)[0] + '_真题.docx'}\n"
-                f"默认课件：{self.pdf_ppt_out.get().strip() or os.path.splitext(pdf_file)[0] + '_授课.pptx'}\n"
                 f"默认工程：{self.pdf_manifest_out.get().strip() or os.path.splitext(pdf_file)[0] + '_工程.json'}"
             )
         elif source_kind == "manifest" and manifest_file:
@@ -1095,7 +1170,7 @@ class PPTConvertApp:
                 f"当前工程：{os.path.basename(manifest_file)}\n"
                 f"来源 PDF：{self.pdf_path.get().strip() or '未记录 / 不可用'}\n"
                 f"默认题本：{self.pdf_word_out.get().strip() or manifest_base + '_真题.docx'}\n"
-                f"默认课件：{self.pdf_ppt_out.get().strip() or manifest_base + '_授课.pptx'}"
+                f"默认工程：{self.pdf_manifest_out.get().strip() or manifest_base + '_工程.json'}"
             )
         if getattr(self, "_pdf_import_summary", None):
             self._pdf_import_summary.configure(text=import_summary)
@@ -1133,7 +1208,7 @@ class PPTConvertApp:
             asset_dir = self._pdf_project_context.get("asset_dir", "-")
             export_summary = (
                 f"当前工程共 {self.pdf_project.question_count} 道题，素材目录：{asset_dir}\n"
-                "导出会直接复用当前预览中的人工修改。"
+                "这里会导出 Word / JSON；如果要做 PPT，请把导出的 Word 交给 Word 工作流继续解析。"
             )
         else:
             export_summary = "请先在上一步生成当前设置对应的预览工程。"
@@ -1155,9 +1230,23 @@ class PPTConvertApp:
         split.add(left, weight=2)
         split.add(right, weight=5)
 
+        left_tabs = ttk.Notebook(left, bootstyle="info")
+        left_tabs.pack(fill=BOTH, expand=YES)
+        self._pdf_preview_left_tabs = left_tabs
+
+        structure_tab = ttk.Frame(left_tabs)
+        review_tab = ttk.Frame(left_tabs)
+        slide_tab = ttk.Frame(left_tabs)
+        left_tabs.add(structure_tab, text=" 结构树 ")
+        left_tabs.add(review_tab, text=" 待确认 ")
+        left_tabs.add(slide_tab, text=" PPT 页 ")
+        self._pdf_preview_structure_tab = structure_tab
+        self._pdf_preview_review_tab = review_tab
+        self._pdf_preview_slide_tab = slide_tab
+
         cols = ("kind", "source", "count")
         self.pdf_tree = ttk.Treeview(
-            left,
+            structure_tab,
             columns=cols,
             show="tree headings",
             height=12,
@@ -1172,13 +1261,97 @@ class PPTConvertApp:
         self.pdf_tree.column("source", width=70, anchor=CENTER)
         self.pdf_tree.column("count", width=60, anchor=CENTER)
         self.pdf_tree.pack(side=LEFT, fill=BOTH, expand=YES)
-        sb = ttk.Scrollbar(left, orient=VERTICAL, command=self.pdf_tree.yview)
+        sb = ttk.Scrollbar(structure_tab, orient=VERTICAL, command=self.pdf_tree.yview)
         self.pdf_tree.configure(yscrollcommand=sb.set)
         sb.pack(side=RIGHT, fill=Y)
         self.pdf_tree.bind("<<TreeviewSelect>>", self._on_pdf_preview_select)
 
+        review_cols = ("severity", "score", "source", "subject", "issue")
+        self._pdf_review_tree = ttk.Treeview(
+            review_tab,
+            columns=review_cols,
+            show="headings",
+            height=12,
+            bootstyle="warning",
+        )
+        self._pdf_review_tree.heading("severity", text="级别")
+        self._pdf_review_tree.heading("score", text="置信度")
+        self._pdf_review_tree.heading("source", text="题号")
+        self._pdf_review_tree.heading("subject", text="科目")
+        self._pdf_review_tree.heading("issue", text="待确认原因")
+        self._pdf_review_tree.column("severity", width=64, anchor=CENTER)
+        self._pdf_review_tree.column("score", width=74, anchor=CENTER)
+        self._pdf_review_tree.column("source", width=64, anchor=CENTER)
+        self._pdf_review_tree.column("subject", width=92, anchor=CENTER)
+        self._pdf_review_tree.column("issue", width=280)
+        self._pdf_review_tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        review_sb = ttk.Scrollbar(review_tab, orient=VERTICAL, command=self._pdf_review_tree.yview)
+        self._pdf_review_tree.configure(yscrollcommand=review_sb.set)
+        review_sb.pack(side=RIGHT, fill=Y)
+        self._pdf_review_tree.bind("<<TreeviewSelect>>", self._on_pdf_review_select)
+
+        slide_cols = ("page", "source", "subject", "stem")
+        self._pdf_slide_tree = ttk.Treeview(
+            slide_tab,
+            columns=slide_cols,
+            show="headings",
+            height=12,
+            bootstyle="info",
+        )
+        self._pdf_slide_tree.heading("page", text="页码")
+        self._pdf_slide_tree.heading("source", text="题号")
+        self._pdf_slide_tree.heading("subject", text="科目")
+        self._pdf_slide_tree.heading("stem", text="题干摘要")
+        self._pdf_slide_tree.column("page", width=64, anchor=CENTER)
+        self._pdf_slide_tree.column("source", width=64, anchor=CENTER)
+        self._pdf_slide_tree.column("subject", width=92, anchor=CENTER)
+        self._pdf_slide_tree.column("stem", width=280)
+        self._pdf_slide_tree.pack(side=LEFT, fill=BOTH, expand=YES)
+        slide_sb = ttk.Scrollbar(slide_tab, orient=VERTICAL, command=self._pdf_slide_tree.yview)
+        self._pdf_slide_tree.configure(yscrollcommand=slide_sb.set)
+        slide_sb.pack(side=RIGHT, fill=Y)
+        self._pdf_slide_tree.bind("<<TreeviewSelect>>", self._on_pdf_slide_select)
+
         action_box = ttk.Frame(right)
         action_box.pack(fill=X, pady=(0, 6))
+        slide_row = ttk.Frame(action_box)
+        slide_row.pack(fill=X, pady=(0, 6))
+        self._pdf_slide_status_label = ttk.Label(
+            slide_row,
+            textvariable=self._pdf_slide_status_var,
+            bootstyle="secondary",
+        )
+        self._pdf_slide_status_label.pack(side=LEFT, fill=X, expand=YES)
+        self._pdf_slide_prev_btn = ttk.Button(
+            slide_row,
+            text="上一页",
+            command=lambda: self._step_pdf_slide(-1),
+            bootstyle="secondary-outline",
+            width=8,
+            state=DISABLED,
+        )
+        self._pdf_slide_prev_btn.pack(side=LEFT, padx=(6, 4))
+        self._pdf_slide_next_btn = ttk.Button(
+            slide_row,
+            text="下一页",
+            command=lambda: self._step_pdf_slide(1),
+            bootstyle="secondary-outline",
+            width=8,
+            state=DISABLED,
+        )
+        self._pdf_slide_next_btn.pack(side=LEFT)
+        ttk.Label(
+            slide_row,
+            textvariable=self._pdf_review_status_var,
+            bootstyle="warning",
+        ).pack(side=LEFT, padx=(12, 0))
+        ttk.Button(
+            slide_row,
+            text="下一个待确认",
+            command=self._jump_to_next_pdf_review_item,
+            bootstyle="warning-outline",
+            width=12,
+        ).pack(side=LEFT, padx=(8, 0))
         action_row = ttk.Frame(action_box)
         action_row.pack(fill=X)
         ttk.Button(
@@ -1188,6 +1361,13 @@ class PPTConvertApp:
             bootstyle="secondary-outline",
             width=12,
         ).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(
+            action_row,
+            text="导出 AI 质检报告",
+            command=self._export_pdf_review_report,
+            bootstyle="warning-outline",
+            width=14,
+        ).pack(side=LEFT, padx=4)
         ttk.Button(
             action_row,
             text="改题号",
@@ -1217,6 +1397,13 @@ class PPTConvertApp:
             bootstyle="info-outline",
             width=7,
         ).pack(side=LEFT, padx=(0, 4))
+        ttk.Button(
+            action_row,
+            text="批量应用 AI 安全建议",
+            command=self._apply_all_safe_ai_suggestions,
+            bootstyle="warning-outline",
+            width=18,
+        ).pack(side=LEFT, padx=(8, 0))
         action_row2 = ttk.Frame(action_box)
         action_row2.pack(fill=X, pady=(6, 0))
         ttk.Button(
@@ -1292,6 +1479,52 @@ class PPTConvertApp:
             justify=LEFT,
             bootstyle="secondary",
         ).pack(anchor=W, pady=(0, 8))
+
+        ai_box = ttk.Labelframe(parent, text=" AI 修复建议 ", bootstyle="warning", padding=(8, 6))
+        ai_box.pack(fill=X, pady=(0, 8))
+        ttk.Label(
+            ai_box,
+            textvariable=self._pdf_ai_suggestion_var,
+            wraplength=430,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 6))
+        ai_action_row = ttk.Frame(ai_box)
+        ai_action_row.pack(fill=X)
+        self._pdf_repair_current_ai_btn = ttk.Button(
+            ai_action_row,
+            text="AI 修当前题",
+            command=self._repair_selected_question_with_ai,
+            bootstyle="warning",
+            width=12,
+            state=DISABLED,
+        )
+        self._pdf_repair_current_ai_btn.pack(side=LEFT, padx=(0, 6))
+        self._pdf_repair_batch_ai_btn = ttk.Button(
+            ai_action_row,
+            text="AI 批量修复",
+            command=self._repair_flagged_questions_with_ai,
+            bootstyle="warning-outline",
+            width=12,
+            state=DISABLED,
+        )
+        self._pdf_repair_batch_ai_btn.pack(side=LEFT, padx=(0, 6))
+        self._pdf_apply_ai_suggestion_btn = ttk.Button(
+            ai_action_row,
+            text="应用当前篇题建议",
+            command=self._apply_selected_ai_subject_suggestion,
+            bootstyle="warning-outline",
+            width=16,
+            state=DISABLED,
+        )
+        self._pdf_apply_ai_suggestion_btn.pack(side=LEFT, padx=(0, 6))
+        ttk.Button(
+            ai_action_row,
+            text="跳到下一个待确认",
+            command=self._jump_to_next_pdf_review_item,
+            bootstyle="secondary-outline",
+            width=14,
+        ).pack(side=LEFT)
 
         layout_box = ttk.Labelframe(parent, text=" 单题选项布局 ", bootstyle="secondary", padding=(8, 6))
         layout_box.pack(fill=X, pady=(0, 8))
@@ -1828,8 +2061,6 @@ class PPTConvertApp:
             self.pdf_path.set(path)
             if not self.pdf_word_out.get().strip():
                 self.pdf_word_out.set(os.path.splitext(path)[0] + "_真题.docx")
-            if not self.pdf_ppt_out.get().strip():
-                self.pdf_ppt_out.set(os.path.splitext(path)[0] + "_授课.pptx")
             if not self.pdf_manifest_out.get().strip():
                 self.pdf_manifest_out.set(os.path.splitext(path)[0] + "_工程.json")
 
@@ -1841,15 +2072,6 @@ class PPTConvertApp:
         )
         if path:
             self.pdf_word_out.set(path)
-
-    def _browse_pdf_ppt(self):
-        path = filedialog.asksaveasfilename(
-            title="保存授课 PPT",
-            defaultextension=".pptx",
-            filetypes=[("PowerPoint", "*.pptx"), ("All", "*.*")],
-        )
-        if path:
-            self.pdf_ppt_out.set(path)
 
     def _browse_pdf_manifest(self):
         path = filedialog.asksaveasfilename(
@@ -1894,7 +2116,6 @@ class PPTConvertApp:
         self.pdf_manifest_out.set(path)
         default_base = os.path.splitext(pdf_path or path)[0]
         self.pdf_word_out.set(default_base + "_真题.docx")
-        self.pdf_ppt_out.set(default_base + "_授课.pptx")
 
         self._apply_project_subject_selection(project.selected_subjects)
         self.pdf_question_range.set(self._format_question_ranges_for_gui(project.selected_ranges))
@@ -1914,13 +2135,10 @@ class PPTConvertApp:
     def _export_pdf_word(self):
         self._run_pdf_project(export_word=True, export_ppt=False)
 
-    def _export_pdf_ppt(self):
-        self._run_pdf_project(export_word=False, export_ppt=True)
+    def _export_pdf_word_and_open_ppt_flow(self):
+        self._run_pdf_project(export_word=True, export_ppt=False, open_word_preview=True)
 
-    def _export_pdf_bundle(self):
-        self._run_pdf_project(export_word=True, export_ppt=True)
-
-    def _run_pdf_project(self, *, export_word: bool, export_ppt: bool):
+    def _run_pdf_project(self, *, export_word: bool, export_ppt: bool, open_word_preview: bool = False):
         from workflows.project_flow import build_pdf_project, export_project_outputs
 
         pdf_file = self.pdf_path.get().strip()
@@ -1966,7 +2184,9 @@ class PPTConvertApp:
             self.pdf_manifest_out.set(manifest_output)
 
         template = self.template_path.get().strip() or None
-        if template and not os.path.exists(template):
+        if not export_ppt:
+            template = None
+        if export_ppt and template and not os.path.exists(template):
             messagebox.showerror("错误", "PPT 模板文件不存在")
             return
 
@@ -1998,13 +2218,20 @@ class PPTConvertApp:
                     template_path=template,
                     ppt_config=ppt_config,
                 )
-                self.root.after(0, lambda: self._on_pdf_project_done(project, outputs))
+                self.root.after(
+                    0,
+                    lambda: self._on_pdf_project_done(
+                        project,
+                        outputs,
+                        open_word_preview=open_word_preview,
+                    ),
+                )
             except Exception as exc:
                 self.root.after(0, lambda e=exc: self._on_pdf_project_error(str(e)))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_pdf_project_done(self, project, outputs):
+    def _on_pdf_project_done(self, project, outputs, *, open_word_preview: bool = False):
         self.pdf_project = project
         self._pdf_project_dirty = False
         source_kind = self._pdf_project_context.get("source_kind", "")
@@ -2040,6 +2267,17 @@ class PPTConvertApp:
             result_lines.append(f"授课 PPT：{outputs.pptx_path}")
         if outputs.manifest_path:
             result_lines.append(f"工程 JSON：{outputs.manifest_path}")
+        if open_word_preview and outputs.docx_path:
+            self._set_status("PDF 已整理完成，正在把导出的 Word 送入 PPT 工作流…")
+            handed_off = self._load_docx_into_word_workflow(
+                outputs.docx_path,
+                document_subject_hint="auto",
+                auto_preview=True,
+                skip_confirm=True,
+            )
+            if handed_off:
+                return
+            self._set_status("Word 已导出，可在“Word 生成 PPT”中继续解析。")
         if outputs.docx_path or outputs.pptx_path or outputs.manifest_path:
             messagebox.showinfo(
                 "完成",
@@ -2079,11 +2317,26 @@ class PPTConvertApp:
         self._pdf_wizard_pending_step = None
         self._pdf_project_context = {}
         self._pdf_preview_payloads.clear()
+        self._pdf_slide_payload_ids = []
+        self._pdf_slide_payload_to_item_id = {}
+        self._pdf_slide_item_to_payload_id = {}
+        self._pdf_slide_payload_to_number = {}
+        self._pdf_review_payload_ids = []
+        self._pdf_review_payload_to_item_id = {}
+        self._pdf_review_item_to_payload_id = {}
         self._reset_pdf_material_preview_session()
         self._clear_pdf_question_editor()
         if getattr(self, "pdf_tree", None):
             for item in self.pdf_tree.get_children():
                 self.pdf_tree.delete(item)
+        if getattr(self, "_pdf_review_tree", None):
+            for item in self._pdf_review_tree.get_children():
+                self._pdf_review_tree.delete(item)
+        if getattr(self, "_pdf_slide_tree", None):
+            for item in self._pdf_slide_tree.get_children():
+                self._pdf_slide_tree.delete(item)
+        self._refresh_pdf_slide_status("")
+        self._refresh_pdf_review_status("")
         self._set_pdf_detail("")
         self._refresh_pdf_wizard_ui()
 
@@ -2101,12 +2354,203 @@ class PPTConvertApp:
         selected = self.pdf_tree.selection()
         return selected[0] if selected else ""
 
+    def _selected_pdf_slide_payload_id(self) -> str:
+        slide_tree = getattr(self, "_pdf_slide_tree", None)
+        if slide_tree is None:
+            return ""
+        selected = slide_tree.selection()
+        if not selected:
+            return ""
+        return self._pdf_slide_item_to_payload_id.get(selected[0], "")
+
+    def _selected_pdf_review_payload_id(self) -> str:
+        review_tree = getattr(self, "_pdf_review_tree", None)
+        if review_tree is None:
+            return ""
+        selected = review_tree.selection()
+        if not selected:
+            return ""
+        return self._pdf_review_item_to_payload_id.get(selected[0], "")
+
+    def _focus_pdf_left_tab(self, tab_name: str | None):
+        left_tabs = getattr(self, "_pdf_preview_left_tabs", None)
+        if left_tabs is None or not tab_name:
+            return
+        target_tab = {
+            "structure": getattr(self, "_pdf_preview_structure_tab", None),
+            "review": getattr(self, "_pdf_preview_review_tab", None),
+            "slide": getattr(self, "_pdf_preview_slide_tab", None),
+        }.get(tab_name)
+        if target_tab is not None:
+            left_tabs.select(target_tab)
+
+    def _release_pdf_preview_sync_selection(self):
+        self._pdf_preview_syncing_selection = False
+
+    def _release_pdf_review_sync_selection(self):
+        self._pdf_review_syncing_selection = False
+
+    def _subject_hint_percent(self, value: float | None) -> int:
+        try:
+            numeric = float(value or 0.0)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        numeric = max(0.0, min(numeric, 1.0))
+        return int(round(numeric * 100))
+
+    def _apply_pdf_preview_selection(self, item_id: str, *, focus_left_tab: str | None = None):
+        if not item_id:
+            self._clear_pdf_question_editor()
+            self._show_pdf_material_preview_for_payload({})
+            self._sync_selected_section_subject({})
+            self._sync_pdf_slide_selection("")
+            self._sync_pdf_review_selection("")
+            self._focus_pdf_left_tab(focus_left_tab)
+            return
+
+        payload = self._pdf_preview_payloads.get(item_id, {})
+        self._set_pdf_detail(payload.get("text", "暂无内容"))
+        self._sync_selected_section_subject(payload)
+        self._populate_pdf_question_editor(payload)
+        self._show_pdf_material_preview_for_payload(payload)
+        self._sync_pdf_slide_selection(item_id)
+        self._sync_pdf_review_selection(item_id)
+        self._focus_pdf_left_tab(focus_left_tab)
+
+    def _select_pdf_preview_item(self, item_id: str, *, focus_left_tab: str | None = None):
+        if not item_id or not getattr(self, "pdf_tree", None):
+            return
+        current_selected = self._selected_pdf_item_id()
+        if current_selected != item_id:
+            try:
+                self._pdf_preview_syncing_selection = True
+                self.pdf_tree.selection_set(item_id)
+                self.pdf_tree.focus(item_id)
+                self.pdf_tree.see(item_id)
+            finally:
+                self.root.after_idle(self._release_pdf_preview_sync_selection)
+        self._apply_pdf_preview_selection(item_id, focus_left_tab=focus_left_tab)
+
+    def _find_preview_item_for_question(self, question) -> str:
+        if question is None:
+            return ""
+        for item_id, payload in self._pdf_preview_payloads.items():
+            if payload.get("kind") == "question" and payload.get("question") is question:
+                return item_id
+        return ""
+
+    def _refresh_pdf_slide_status(self, payload_id: str = ""):
+        total = len(self._pdf_slide_payload_ids)
+        if total <= 0:
+            self._pdf_slide_status_var.set("当前工程暂无可导出的 PPT 页。")
+            if getattr(self, "_pdf_slide_prev_btn", None):
+                self._pdf_slide_prev_btn.configure(state=DISABLED)
+            if getattr(self, "_pdf_slide_next_btn", None):
+                self._pdf_slide_next_btn.configure(state=DISABLED)
+            return
+
+        slide_number = self._pdf_slide_payload_to_number.get(payload_id, 0)
+        if slide_number:
+            payload = self._pdf_preview_payloads.get(payload_id, {})
+            question = payload.get("question")
+            source_number = getattr(question, "source_number", "") or "-"
+            subject_label = self._document_subject_label(payload.get("section_kind") or "unknown")
+            self._pdf_slide_status_var.set(
+                f"当前 PPT 第 {slide_number}/{total} 页 · 原题号 {source_number} · {subject_label}"
+            )
+        else:
+            self._pdf_slide_status_var.set(f"当前工程共 {total} 页 PPT；选择左侧某一页可逐页预览并实时编辑。")
+
+        if getattr(self, "_pdf_slide_prev_btn", None):
+            self._pdf_slide_prev_btn.configure(state=NORMAL if slide_number > 1 else DISABLED)
+        if getattr(self, "_pdf_slide_next_btn", None):
+            self._pdf_slide_next_btn.configure(state=NORMAL if slide_number and slide_number < total else DISABLED)
+
+    def _refresh_pdf_review_status(self, payload_id: str = ""):
+        total = len(self._pdf_review_payload_ids)
+        if total <= 0:
+            self._pdf_review_status_var.set("AI 质检未发现明显异常。")
+            return
+
+        if payload_id:
+            payload = self._pdf_preview_payloads.get(payload_id, {})
+            question = payload.get("question")
+            if question is not None:
+                score = int(round((getattr(question, "review_confidence", 1.0) or 1.0) * 100))
+                self._pdf_review_status_var.set(
+                    f"待确认 {total} 题 · 当前原题号 {question.source_number or '-'} · 置信度 {score}%"
+                )
+                return
+        self._pdf_review_status_var.set(f"AI 质检标出 {total} 道待确认题，建议优先处理。")
+
+    def _sync_pdf_slide_selection(self, payload_id: str):
+        slide_tree = getattr(self, "_pdf_slide_tree", None)
+        if slide_tree is None:
+            return
+        self._refresh_pdf_slide_status(payload_id)
+
+    def _sync_pdf_review_selection(self, payload_id: str):
+        review_tree = getattr(self, "_pdf_review_tree", None)
+        if review_tree is None:
+            return
+        review_item_id = self._pdf_review_payload_to_item_id.get(payload_id, "")
+        current_selected = review_tree.selection()
+        current_item_id = current_selected[0] if current_selected else ""
+        if current_item_id != review_item_id:
+            try:
+                self._pdf_review_syncing_selection = True
+                if review_item_id:
+                    review_tree.selection_set(review_item_id)
+                    review_tree.focus(review_item_id)
+                    review_tree.see(review_item_id)
+                else:
+                    review_tree.selection_remove(review_tree.selection())
+            finally:
+                self.root.after_idle(self._release_pdf_review_sync_selection)
+        self._refresh_pdf_review_status(payload_id)
+
+    def _jump_to_next_pdf_review_item(self):
+        if not self._pdf_review_payload_ids:
+            return
+        current_payload = self._selected_pdf_item_id() or self._selected_pdf_review_payload_id()
+        if current_payload not in self._pdf_review_payload_ids:
+            target_payload = self._pdf_review_payload_ids[0]
+        else:
+            index = self._pdf_review_payload_ids.index(current_payload)
+            target_payload = self._pdf_review_payload_ids[(index + 1) % len(self._pdf_review_payload_ids)]
+        self._select_pdf_preview_item(target_payload, focus_left_tab="review")
+
+    def _review_severity_label(self, question) -> str:
+        severity = question_max_severity(question)
+        return {
+            "error": "高风险",
+            "warning": "注意",
+            "info": "提示",
+        }.get(severity, "稳定")
+
+    def _step_pdf_slide(self, delta: int):
+        if not self._pdf_slide_payload_ids:
+            return
+        current_payload = self._selected_pdf_item_id()
+        if current_payload not in self._pdf_slide_payload_to_number:
+            current_payload = self._selected_pdf_slide_payload_id()
+        if current_payload not in self._pdf_slide_payload_to_number:
+            target_payload = self._pdf_slide_payload_ids[0]
+        else:
+            index = self._pdf_slide_payload_to_number[current_payload] - 1
+            target_index = max(0, min(len(self._pdf_slide_payload_ids) - 1, index + delta))
+            target_payload = self._pdf_slide_payload_ids[target_index]
+        self._select_pdf_preview_item(target_payload, focus_left_tab="slide")
+
     def _question_tree_label(self, question) -> str:
         compact = " ".join((question.stem or "").split())
         stem_short = compact[:38]
         if len(compact) > 38:
             stem_short += "..."
-        return stem_short or "未命名题目"
+        label = stem_short or "未命名题目"
+        if is_flagged_question(question):
+            return f"[待确认] {label}"
+        return label
 
     def _option_layout_label(self, layout: str | None) -> str:
         normalized = (layout or "").strip().lower()
@@ -2130,6 +2574,11 @@ class PPTConvertApp:
         if self.pdf_project is None:
             return
         self._pdf_project_dirty = True
+
+    def _reanalyze_pdf_project(self):
+        if self.pdf_project is None:
+            return None
+        return annotate_project_quality(self.pdf_project)
 
     def _confirm_discard_pdf_project_edits(self, action_text: str) -> bool:
         if not self._pdf_project_dirty or self.pdf_project is None:
@@ -2296,18 +2745,158 @@ class PPTConvertApp:
         section_name = SUBJECT_DISPLAY_NAMES.get(section_kind, section_kind)
         material = payload.get("material")
         parts = [section_name, f"原题号 {question.source_number or '-'}"]
+        slide_number = payload.get("slide_number")
+        if slide_number:
+            parts.insert(0, f"PPT 第 {slide_number} 页")
         if material is not None:
             parts.append(material.header or material.material_id)
         layout_source = "单题覆盖" if question.option_layout else "跟随全局"
         layout_label = self._option_layout_label(question.option_layout or self._effective_question_option_layout(question))
         message = " · ".join(parts)
         message += f"\n当前布局：{layout_source}（{layout_label}）"
+        if getattr(question, "inferred_subtype", ""):
+            message += f" · 子题型 {question.inferred_subtype}"
         if question.stem_assets:
             message += f" · 题干图片 {len(question.stem_assets)} 张"
         image_option_count = sum(1 for option in question.options if option.image_path)
         if image_option_count:
             message += f" · 图片选项 {image_option_count} 个"
+        if is_flagged_question(question):
+            message += (
+                f"\nAI 质检：置信度 {int(round((question.review_confidence or 1.0) * 100))}%"
+                f" · {question_review_summary(question)}"
+            )
+            hint = self._display_subject_hint(payload)
+            if hint is not None:
+                label, score, _reason = hint
+                message += f" · 更像 {label}（{score}%）"
+        else:
+            message += "\nAI 质检：结构稳定"
         self._pdf_question_editor_message.set(message)
+
+    def _display_subject_hint(self, payload: dict) -> tuple[str, int, str] | None:
+        question = payload.get("question")
+        section = payload.get("section")
+        material = payload.get("material")
+        if question is None:
+            return None
+
+        suggested_kind = getattr(question, "suggested_subject", None)
+        suggested_confidence = getattr(question, "suggested_subject_confidence", None)
+        suggested_reason = (getattr(question, "suggested_subject_reason", "") or "").strip()
+        if suggested_kind:
+            label = self._document_subject_label(suggested_kind)
+            score = self._subject_hint_percent(suggested_confidence or question.review_confidence or 0.0)
+            return label, score, suggested_reason or f"当前这道题更像 {label}。"
+
+        diagnostics = infer_subject_diagnostics(
+            stem=getattr(question, "stem", "") or "",
+            options=[option.text or "" for option in getattr(question, "options", [])],
+            material_text=(getattr(material, "body", "") or "") if material is not None else "",
+            image_count=len(getattr(question, "stem_assets", []) or [])
+            + sum(1 for option in getattr(question, "options", []) if getattr(option, "image_path", None)),
+            material_header=(getattr(material, "header", "") or "") if material is not None else "",
+            allow_data=True,
+        )
+        inferred_kind = diagnostics.kind
+        inferred_confidence = diagnostics.confidence
+        current_kind = getattr(section, "kind", "unknown")
+        has_subject_issue = any(
+            issue.code in {"subject_mismatch", "subject_suggestion", "unknown_subject"}
+            for issue in (getattr(question, "review_issues", None) or [])
+        )
+        min_confidence = 0.38 if has_subject_issue else 0.58
+        if inferred_kind in {"unknown", current_kind} or inferred_confidence < min_confidence:
+            return None
+        label = self._document_subject_label(inferred_kind)
+        if diagnostics.subtype:
+            label = f"{label} / {diagnostics.subtype}"
+        score = self._subject_hint_percent(inferred_confidence)
+        reason_prefix = "本地低置信度判断" if inferred_confidence < 0.58 else "本地判断"
+        signal_text = ""
+        if diagnostics.matched_signals:
+            signal_text = "命中线索：" + "、".join(diagnostics.matched_signals[:3]) + "。"
+        return label, score, f"{signal_text}{reason_prefix}这道题更像 {label}，建议人工确认。"
+
+    def _refresh_pdf_ai_suggestion(self, payload: dict | None = None):
+        payload = payload or self._selected_pdf_payload()
+        button = getattr(self, "_pdf_apply_ai_suggestion_btn", None)
+        repair_current_btn = getattr(self, "_pdf_repair_current_ai_btn", None)
+        repair_batch_btn = getattr(self, "_pdf_repair_batch_ai_btn", None)
+        can_batch = (
+            self.pdf_project is not None
+            and not self._ai_repair_busy
+            and (
+                bool(self._pdf_review_payload_ids)
+                if self.ai_only_flagged.get()
+                else getattr(self.pdf_project, "question_count", 0) > 0
+            )
+        )
+        if payload.get("kind") != "question":
+            self._pdf_ai_suggestion_var.set("选中一道题后，这里会显示 AI 修复建议。")
+            if button is not None:
+                button.configure(state=DISABLED)
+            if repair_current_btn is not None:
+                repair_current_btn.configure(state=DISABLED)
+            if repair_batch_btn is not None:
+                repair_batch_btn.configure(state=NORMAL if can_batch else DISABLED)
+            return
+
+        question = payload.get("question")
+        section = payload.get("section")
+        if question is None or section is None:
+            self._pdf_ai_suggestion_var.set("选中一道题后，这里会显示 AI 修复建议。")
+            if button is not None:
+                button.configure(state=DISABLED)
+            if repair_current_btn is not None:
+                repair_current_btn.configure(state=DISABLED)
+            if repair_batch_btn is not None:
+                repair_batch_btn.configure(state=NORMAL if can_batch else DISABLED)
+            return
+
+        target_kind, section_reason = section_subject_suggestion(section)
+        hint = self._display_subject_hint(payload)
+        if target_kind:
+            target_label = self._document_subject_label(target_kind)
+            self._pdf_ai_suggestion_var.set(
+                f"整段建议：这组题更像 {target_label}。\n{section_reason}"
+            )
+            if button is not None:
+                button.configure(state=NORMAL)
+        elif hint is not None:
+            label, score, reason = hint
+            self._pdf_ai_suggestion_var.set(
+                f"单题建议：这道题更像 {label}（置信度 {score}%）。\n"
+                f"{reason or '当前只有单题级建议，暂不自动改整段。'}"
+            )
+        elif getattr(question, "review_issues", None):
+            subject_issue = next(
+                (
+                    issue
+                    for issue in question.review_issues
+                    if issue.code in {"subject_mismatch", "subject_suggestion", "unknown_subject"} and issue.detail
+                ),
+                None,
+            )
+            if subject_issue is not None:
+                self._pdf_ai_suggestion_var.set(
+                    f"单题提醒：{subject_issue.title}\n{subject_issue.detail}"
+                )
+            else:
+                self._pdf_ai_suggestion_var.set(
+                    "AI 目前只给出质检提醒，没有形成可安全应用的整段建议。\n"
+                    f"当前主要问题：{question_review_summary(question)}"
+                )
+        else:
+            self._pdf_ai_suggestion_var.set("当前题目结构稳定，暂时没有 AI 修复建议。")
+        if button is not None:
+            button.configure(state=NORMAL if target_kind and not self._ai_repair_busy else DISABLED)
+        if repair_current_btn is not None:
+            repair_current_btn.configure(
+                state=NORMAL if not self._ai_repair_busy else DISABLED
+            )
+        if repair_batch_btn is not None:
+            repair_batch_btn.configure(state=NORMAL if can_batch else DISABLED)
 
     def _set_pdf_question_editor_state(self, enabled: bool):
         state = NORMAL if enabled else DISABLED
@@ -2329,6 +2918,8 @@ class PPTConvertApp:
         ):
             for button in button_map.values():
                 button.configure(state=state)
+        if getattr(self, "_pdf_apply_ai_suggestion_btn", None) is not None and not enabled:
+            self._pdf_apply_ai_suggestion_btn.configure(state=DISABLED)
         if enabled:
             for letter in getattr(self, "_pdf_option_image_labels", {}).keys():
                 self._refresh_pdf_option_image_status(letter)
@@ -2428,6 +3019,7 @@ class PPTConvertApp:
         self._pdf_question_editor_message.set(
             message or "选择一道题后，可在这里实时修改题干、选项内容，并为该题单独切换选项布局。"
         )
+        self._refresh_pdf_ai_suggestion({})
         self._render_pdf_question_editor_preview()
 
     def _populate_pdf_question_editor(self, payload: dict):
@@ -2451,6 +3043,7 @@ class PPTConvertApp:
         self._pdf_editor_updating = False
         self._set_pdf_question_editor_state(True)
         self._refresh_pdf_question_editor_message(payload)
+        self._refresh_pdf_ai_suggestion(payload)
         self._render_pdf_question_editor_preview()
 
     def _sync_selected_question_preview_payload(self):
@@ -2463,7 +3056,12 @@ class PPTConvertApp:
         if question is None or section is None:
             return
 
-        payload["text"] = self._question_preview_text(section, material, question)
+        payload["text"] = self._question_preview_text(
+            section,
+            material,
+            question,
+            slide_number=payload.get("slide_number"),
+        )
         item_id = self._selected_pdf_item_id()
         if item_id:
             self.pdf_tree.item(
@@ -2471,8 +3069,20 @@ class PPTConvertApp:
                 text=self._question_tree_label(question),
                 values=("question", question.source_number or "-", len(question.options)),
             )
+        slide_item_id = self._pdf_slide_payload_to_item_id.get(item_id)
+        if slide_item_id and getattr(self, "_pdf_slide_tree", None):
+            self._pdf_slide_tree.item(
+                slide_item_id,
+                values=(
+                    payload.get("slide_number") or "-",
+                    question.source_number or "-",
+                    self._document_subject_label(payload.get("section_kind") or "unknown"),
+                    self._question_tree_label(question),
+                ),
+            )
         self._set_pdf_detail(payload["text"])
         self._refresh_pdf_question_editor_message(payload)
+        self._refresh_pdf_ai_suggestion(payload)
         self._render_pdf_question_editor_preview()
 
     def _on_pdf_question_stem_change(self, _event=None):
@@ -3239,9 +3849,14 @@ class PPTConvertApp:
     def _refresh_pdf_preview_after_edit(self, detail_text: str | None = None):
         if self.pdf_project is None:
             return
+        selected_question = self._pdf_question_editor_target
         self._reset_pdf_material_preview_session()
         self._clear_pdf_question_editor()
         self._populate_pdf_preview(self.pdf_project)
+        if selected_question is not None:
+            item_id = self._find_preview_item_for_question(selected_question)
+            if item_id:
+                self._select_pdf_preview_item(item_id)
         if detail_text:
             self._set_pdf_detail(detail_text)
 
@@ -3376,21 +3991,56 @@ class PPTConvertApp:
                 )
         return "\n".join(lines)
 
-    def _question_preview_text(self, section, material, question) -> str:
+    def _question_preview_text(self, section, material, question, *, slide_number: int | None = None) -> str:
         effective_layout = self._effective_question_option_layout(question)
         layout_text = self._option_layout_label(question.option_layout or effective_layout)
         layout_source = "单题覆盖" if question.option_layout else "跟随全局"
+        confidence_text = f"{int(round((getattr(question, 'review_confidence', 1.0) or 1.0) * 100))}%"
         lines = [
             f"科目：{section.kind}",
             f"原题号：{question.source_number or '-'}",
             f"选项数：{len(question.options)}",
             f"题干图片：{len(question.stem_assets)}",
             f"选项布局：{layout_source}（{layout_text}）",
+            f"AI 质检置信度：{confidence_text}",
         ]
+        if getattr(question, "inferred_subtype", ""):
+            subtype_conf = getattr(question, "inferred_subtype_confidence", None)
+            subtype_line = f"推断子题型：{question.inferred_subtype}"
+            if subtype_conf is not None:
+                subtype_line += f"（{int(round(max(0.0, min(subtype_conf, 1.0)) * 100))}%）"
+            lines.append(subtype_line)
+        if getattr(question, "inferred_signals", None):
+            lines.append("命中线索：" + "、".join(question.inferred_signals[:4]))
+        if slide_number:
+            lines.insert(0, f"PPT 页码：第 {slide_number} 页")
         if material is not None:
             lines.append(f"所属材料：{material.header or material.material_id}")
         if question.page_numbers:
             lines.append("来源页码：" + ", ".join(str(page_no) for page_no in question.page_numbers))
+        if getattr(question, "review_issues", None):
+            lines.extend(["", "待确认项："])
+            for issue in question.review_issues:
+                detail = f"：{issue.detail}" if issue.detail else ""
+                lines.append(f"[{issue.severity}] {issue.title}{detail}")
+        if getattr(question, "suggested_subject", None):
+            suggestion_label = self._document_subject_label(question.suggested_subject)
+            if getattr(question, "inferred_subtype", ""):
+                suggestion_label += f" / {question.inferred_subtype}"
+            lines.extend(
+                [
+                    "",
+                    "AI 建议：",
+                    f"更像 {suggestion_label}"
+                    + (
+                        f"（置信度 {int(round(max(0.0, min(question.suggested_subject_confidence, 1.0)) * 100))}%）"
+                        if question.suggested_subject_confidence is not None
+                        else ""
+                    ),
+                ]
+            )
+            if question.suggested_subject_reason:
+                lines.append(question.suggested_subject_reason)
         lines.extend(["", "题干：", question.stem or "-"])
         if question.options:
             lines.extend(["", "选项："])
@@ -3424,18 +4074,283 @@ class PPTConvertApp:
         new_kind = self._document_subject_key(self._pdf_section_subject_var.get())
         if new_kind == "auto":
             new_kind = "unknown"
-        if not reclassify_objective_section(section, new_kind):
+        if not reclassify_objective_section(section, new_kind, project=self.pdf_project):
             return
         self._mark_pdf_project_dirty()
         self._refresh_pdf_preview_after_edit(f"已将当前篇题调整为：{self._document_subject_label(new_kind)}")
 
+    def _apply_selected_ai_subject_suggestion(self):
+        if self.pdf_project is None:
+            return
+        payload = self._selected_pdf_payload()
+        section = payload.get("section")
+        if section is None:
+            messagebox.showinfo("提示", "请先选中一道题目，再应用 AI 建议。", parent=self.root)
+            return
+        target_kind, reason = section_subject_suggestion(section)
+        if not target_kind:
+            messagebox.showinfo("提示", reason or "当前没有可安全应用的 AI 建议。", parent=self.root)
+            return
+        changed = apply_section_subject_suggestion(section, project=self.pdf_project)
+        if not changed:
+            messagebox.showinfo("提示", "AI 建议与当前篇题一致，未发生变化。", parent=self.root)
+            return
+        self._mark_pdf_project_dirty()
+        self._refresh_pdf_preview_after_edit(
+            f"已按 AI 建议将当前篇题调整为：{self._document_subject_label(target_kind)}"
+        )
+
+    def _apply_all_safe_ai_suggestions(self):
+        if self.pdf_project is None:
+            return
+        applied = apply_all_safe_subject_suggestions(self.pdf_project)
+        if applied <= 0:
+            messagebox.showinfo("提示", "当前没有可安全批量应用的 AI 科目建议。", parent=self.root)
+            return
+        self._mark_pdf_project_dirty()
+        self._refresh_pdf_preview_after_edit(f"已批量应用 {applied} 条 AI 安全建议。")
+
+    def _ai_batch_limit_value(self) -> int:
+        try:
+            value = int(self.ai_batch_limit.get())
+        except Exception:
+            value = 12
+        return max(1, min(50, value))
+
+    def _build_ai_service(self) -> AIRepairService:
+        service = AIRepairService()
+        self._ai_status_var.set("本地 AI 修复器已启用：会优先做安全修复，不依赖任何在线模型。")
+        return service
+
+    def _set_ai_repair_busy(self, busy: bool, status_text: str | None = None):
+        self._ai_repair_busy = busy
+        if status_text:
+            self._set_status(status_text)
+        self._refresh_pdf_ai_suggestion()
+
+    def _ai_neighbor_questions(self, section, material, question):
+        if section is None or question is None:
+            return None, None
+        if getattr(section, "kind", "") == "data":
+            rows = list(getattr(material, "questions", []) or [])
+        else:
+            rows = list(getattr(section, "questions", []) or [])
+        for index, item in enumerate(rows):
+            if item is question:
+                previous_question = rows[index - 1] if index > 0 else None
+                next_question = rows[index + 1] if index + 1 < len(rows) else None
+                return previous_question, next_question
+        return None, None
+
+    def _repair_selected_question_with_ai(self):
+        if self.pdf_project is None:
+            messagebox.showinfo("提示", "请先生成或载入工程。", parent=self.root)
+            return
+        payload = self._selected_pdf_payload()
+        if payload.get("kind") != "question":
+            messagebox.showinfo("提示", "请先在左侧选择一道题目。", parent=self.root)
+            return
+        question = payload.get("question")
+        section = payload.get("section")
+        material = payload.get("material")
+        if question is None or section is None:
+            return
+        service = self._build_ai_service()
+        previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+        original_number = question.source_number or "-"
+        self._set_ai_repair_busy(True, f"AI 正在修复原题号 {original_number}…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = 1
+
+        def work():
+            try:
+                boundary_changes, boundary_reason = repair_question_boundary(
+                    self.pdf_project,
+                    section,
+                    material,
+                    question,
+                )
+                previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+                result = service.repair_question(
+                    section=section,
+                    material=material,
+                    question=question,
+                    previous_question=previous_question,
+                    next_question=next_question,
+                )
+                changes, subject_changed = apply_ai_question_patch(
+                    question,
+                    result.patch,
+                    section=section,
+                    material=material,
+                    project=self.pdf_project,
+                )
+                annotate_project_quality(self.pdf_project)
+                self.root.after(
+                    0,
+                    lambda r=result, c=changes, s=subject_changed, n=original_number, bc=boundary_changes, br=boundary_reason: self._on_ai_single_repair_done(
+                        n,
+                        r,
+                        c,
+                        s,
+                        bc,
+                        br,
+                    ),
+                )
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_ai_repair_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ai_single_repair_done(
+        self,
+        original_number: str,
+        result,
+        changes: int,
+        subject_changed: bool,
+        boundary_changes: int = 0,
+        boundary_reason: str = "",
+    ):
+        self.progress["value"] = self.progress["maximum"]
+        self._set_ai_repair_busy(False)
+        if not getattr(result.patch, "should_apply", False):
+            if boundary_changes > 0:
+                self._mark_pdf_project_dirty()
+                self._refresh_pdf_preview_after_edit(
+                    f"本地 AI 已完成边界修复：{boundary_reason or '已把串到当前题开头的选项拆回上一题。'}"
+                )
+                return
+            summary = (getattr(result.patch, "summary", "") or "AI 判断当前题暂不适合自动写回。").strip()
+            self._set_status(summary)
+            self._refresh_pdf_ai_suggestion()
+            return
+
+        total_changes = changes + boundary_changes
+        if total_changes <= 0:
+            summary = (getattr(result.patch, "summary", "") or "AI 完成检查，但没有形成需要写回的字段变化。").strip()
+            self._set_status(summary)
+            self._refresh_pdf_ai_suggestion()
+            return
+
+        if subject_changed:
+            self._mark_pdf_project_dirty()
+        else:
+            self._mark_pdf_project_dirty()
+        summary = (getattr(result.patch, "summary", "") or "AI 已写回当前题的结构修复。").strip()
+        if boundary_changes > 0:
+            summary = (boundary_reason or "已处理跨题边界串题") + "；" + summary
+        self._refresh_pdf_preview_after_edit(f"AI 已修复原题号 {original_number}：{summary}")
+
+    def _repair_flagged_questions_with_ai(self):
+        if self.pdf_project is None:
+            messagebox.showinfo("提示", "请先生成或载入工程。", parent=self.root)
+            return
+        service = self._build_ai_service()
+        only_flagged = bool(self.ai_only_flagged.get())
+        if only_flagged and not self._pdf_review_payload_ids:
+            messagebox.showinfo("提示", "当前没有待确认题，暂时不需要批量 AI 修复。", parent=self.root)
+            return
+        limit = self._ai_batch_limit_value()
+        scope_text = "待确认题" if only_flagged else "当前工程题目"
+        self._set_ai_repair_busy(True, f"AI 正在批量修复{scope_text}…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = limit
+
+        def work():
+            try:
+                summary = repair_project_questions(
+                    self.pdf_project,
+                    service=service,
+                    only_flagged=only_flagged,
+                    limit=limit,
+                )
+                self.root.after(0, lambda s=summary: self._on_ai_batch_repair_done(s))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_ai_repair_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_ai_batch_repair_done(self, summary):
+        self.progress["value"] = self.progress["maximum"]
+        self._set_ai_repair_busy(False)
+        if summary.changed_questions > 0:
+            self._mark_pdf_project_dirty()
+            message = (
+                f"AI 批量处理 {summary.attempted_questions} 题，"
+                f"写回 {summary.changed_questions} 题，"
+                f"共 {summary.total_field_changes} 处字段"
+            )
+            if summary.subject_changes:
+                message += f"，其中科目调整 {summary.subject_changes} 处"
+            if summary.errors:
+                message += f"，另有 {len(summary.errors)} 题未成功"
+            self._refresh_pdf_preview_after_edit(message + "。")
+            return
+
+        if summary.errors:
+            preview = "\n".join(summary.errors[:3])
+            messagebox.showwarning(
+                "AI 修复",
+                f"本次没有成功写回字段，失败 {len(summary.errors)} 题。\n\n{preview}",
+                parent=self.root,
+            )
+            self._set_status("AI 批量修复未能写回字段。")
+            self._refresh_pdf_ai_suggestion()
+            return
+
+        self._set_status("AI 批量检查完成，但没有形成需要写回的修复。")
+        self._refresh_pdf_ai_suggestion()
+
+    def _on_ai_repair_error(self, message: str):
+        self._set_ai_repair_busy(False)
+        self.progress["value"] = 0
+        self._set_status("AI 修复失败")
+        messagebox.showerror("AI 修复失败", message, parent=self.root)
+
+    def _export_pdf_review_report(self):
+        if self.pdf_project is None:
+            messagebox.showinfo("提示", "请先生成预览工程。", parent=self.root)
+            return
+        default_path = self._default_pdf_base_path() + "_AI质检报告.json"
+        path = filedialog.asksaveasfilename(
+            title="导出 AI 质检报告",
+            defaultextension=".json",
+            initialfile=os.path.basename(default_path),
+            initialdir=os.path.dirname(default_path) or None,
+            filetypes=[("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            export_quality_report(self.pdf_project, path)
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc), parent=self.root)
+            return
+        self._set_status(f"已导出 AI 质检报告：{path}")
+        messagebox.showinfo("完成", f"AI 质检报告已导出：\n{path}", parent=self.root)
+
     def _populate_pdf_preview(self, project):
+        quality = self._reanalyze_pdf_project()
         self._pdf_preview_payloads.clear()
         self._clear_pdf_question_editor()
         for item in self.pdf_tree.get_children():
             self.pdf_tree.delete(item)
+        if getattr(self, "_pdf_review_tree", None):
+            for item in self._pdf_review_tree.get_children():
+                self._pdf_review_tree.delete(item)
+        if getattr(self, "_pdf_slide_tree", None):
+            for item in self._pdf_slide_tree.get_children():
+                self._pdf_slide_tree.delete(item)
+        self._pdf_review_payload_ids = []
+        self._pdf_review_payload_to_item_id = {}
+        self._pdf_review_item_to_payload_id = {}
+        self._pdf_slide_payload_ids = []
+        self._pdf_slide_payload_to_item_id = {}
+        self._pdf_slide_item_to_payload_id = {}
+        self._pdf_slide_payload_to_number = {}
 
         section_index = 0
+        question_payload_ids: dict[int, str] = {}
         for section in project.sections:
             section_index += 1
             count = len(section.questions) if section.kind != "data" else sum(
@@ -3484,8 +4399,9 @@ class PPTConvertApp:
                             "section_kind": section.kind,
                             "material": material,
                             "question": question,
-                            "text": self._question_preview_text(section, material, question),
+                            "text": "",
                         }
+                        question_payload_ids[id(question)] = qid
             else:
                 for question in section.questions:
                     qid = self.pdf_tree.insert(
@@ -3500,26 +4416,125 @@ class PPTConvertApp:
                         "section_kind": section.kind,
                         "material": None,
                         "question": question,
-                        "text": self._question_preview_text(section, None, question),
+                        "text": "",
                     }
+                    question_payload_ids[id(question)] = qid
 
-        self._set_pdf_detail(f"已加载 {project.question_count} 道题。\n请在左侧查看篇题、材料和题目结构。")
+        flagged_rows = list(iter_flagged_question_rows(project))
+        flagged_payload_order = {id(question): index for index, (_section, _material, question) in enumerate(flagged_rows)}
+
+        for slide_number, (section, material, question) in enumerate(iter_project_question_nodes(project), start=1):
+            payload_id = question_payload_ids.get(id(question))
+            if not payload_id:
+                continue
+            payload = self._pdf_preview_payloads[payload_id]
+            payload["slide_number"] = slide_number
+            payload["text"] = self._question_preview_text(
+                section,
+                material,
+                question,
+                slide_number=slide_number,
+            )
+            if getattr(self, "_pdf_slide_tree", None):
+                slide_item_id = self._pdf_slide_tree.insert(
+                    "",
+                    END,
+                    values=(
+                        slide_number,
+                        question.source_number or "-",
+                        self._document_subject_label(section.kind),
+                        self._question_tree_label(question),
+                    ),
+                )
+                self._pdf_slide_payload_ids.append(payload_id)
+                self._pdf_slide_payload_to_item_id[payload_id] = slide_item_id
+                self._pdf_slide_item_to_payload_id[slide_item_id] = payload_id
+                self._pdf_slide_payload_to_number[payload_id] = slide_number
+        if getattr(self, "_pdf_review_tree", None):
+            sorted_flagged_payloads = sorted(
+                (
+                    payload_id
+                    for payload_id in self._pdf_preview_payloads
+                    if self._pdf_preview_payloads[payload_id].get("kind") == "question"
+                    and is_flagged_question(self._pdf_preview_payloads[payload_id].get("question"))
+                ),
+                key=lambda payload_id: (
+                    -severity_rank(question_max_severity(self._pdf_preview_payloads[payload_id]["question"])),
+                    float(getattr(self._pdf_preview_payloads[payload_id]["question"], "review_confidence", 1.0) or 1.0),
+                    flagged_payload_order.get(id(self._pdf_preview_payloads[payload_id]["question"]), 10**6),
+                ),
+            )
+            for payload_id in sorted_flagged_payloads:
+                payload = self._pdf_preview_payloads[payload_id]
+                question = payload["question"]
+                section = payload["section"]
+                review_item_id = self._pdf_review_tree.insert(
+                    "",
+                    END,
+                    values=(
+                        self._review_severity_label(question),
+                        f"{int(round((question.review_confidence or 1.0) * 100))}%",
+                        question.source_number or "-",
+                        self._document_subject_label(section.kind),
+                        question_review_summary(question),
+                    ),
+                )
+                self._pdf_review_payload_ids.append(payload_id)
+                self._pdf_review_payload_to_item_id[payload_id] = review_item_id
+                self._pdf_review_item_to_payload_id[review_item_id] = payload_id
+
+        review_count = len(self._pdf_review_payload_ids)
+        detail_text = f"已加载 {project.question_count} 道题。"
+        if review_count:
+            detail_text += (
+                f"\nAI 质检标出 {review_count} 道待确认题"
+                + (
+                    f"，其中高风险 {quality.severe_questions} 题"
+                    if quality is not None
+                    else ""
+                )
+                + "，可切到左侧“待确认”页签优先处理。"
+            )
+        else:
+            detail_text += "\nAI 质检暂未发现明显异常。"
+        detail_text += "\n请在左侧查看篇题、材料和题目结构。"
+        self._set_pdf_detail(detail_text)
+        self._refresh_pdf_slide_status("")
+        self._refresh_pdf_review_status("")
+        if self._pdf_review_payload_ids:
+            self._select_pdf_preview_item(self._pdf_review_payload_ids[0], focus_left_tab="review")
+        elif self._pdf_slide_payload_ids:
+            self._select_pdf_preview_item(self._pdf_slide_payload_ids[0], focus_left_tab="slide")
         self._refresh_pdf_wizard_ui()
 
     def _on_pdf_preview_select(self, _event=None):
         if not getattr(self, "pdf_tree", None):
             return
+        if self._pdf_preview_syncing_selection:
+            return
         selected = self.pdf_tree.selection()
         if not selected:
-            self._clear_pdf_question_editor()
-            self._show_pdf_material_preview_for_payload({})
-            self._sync_selected_section_subject({})
+            self._apply_pdf_preview_selection("", focus_left_tab="structure")
             return
-        payload = self._pdf_preview_payloads.get(selected[0], {})
-        self._set_pdf_detail(payload.get("text", "暂无内容"))
-        self._sync_selected_section_subject(payload)
-        self._populate_pdf_question_editor(payload)
-        self._show_pdf_material_preview_for_payload(payload)
+        self._apply_pdf_preview_selection(selected[0], focus_left_tab="structure")
+
+    def _on_pdf_slide_select(self, _event=None):
+        if self._pdf_slide_syncing_selection:
+            return
+        payload_id = self._selected_pdf_slide_payload_id()
+        if not payload_id:
+            self._refresh_pdf_slide_status("")
+            return
+        self._select_pdf_preview_item(payload_id, focus_left_tab="slide")
+
+    def _on_pdf_review_select(self, _event=None):
+        if self._pdf_review_syncing_selection:
+            return
+        payload_id = self._selected_pdf_review_payload_id()
+        if not payload_id:
+            self._refresh_pdf_review_status("")
+            return
+        self._select_pdf_preview_item(payload_id, focus_left_tab="review")
 
     def _close_parser(self):
         if self.parser:
@@ -3535,12 +4550,29 @@ class PPTConvertApp:
             == self._document_subject_key(self.word_document_subject.get())
         )
 
+    def _load_docx_into_word_workflow(
+        self,
+        docx_path: str,
+        *,
+        document_subject_hint: str = "auto",
+        auto_preview: bool = False,
+        skip_confirm: bool = False,
+    ) -> bool:
+        resolved = os.path.abspath(docx_path)
+        self.word_path.set(resolved)
+        self.output_path.set(os.path.splitext(resolved)[0] + ".pptx")
+        self.word_document_subject.set(self._document_subject_label(document_subject_hint))
+        self._open_word_workspace_tab()
+        if not auto_preview:
+            self._set_status(f"已准备好 Word 工作流：{os.path.basename(resolved)}")
+            return True
+        return self._start_word_preview_flow(skip_confirm=skip_confirm)
+
     def _load_word_project_into_preview(self, project, *, docx_path: str, asset_dir: str):
         docx_base = os.path.splitext(os.path.abspath(docx_path))[0]
         default_ppt = self.output_path.get().strip() or docx_base + ".pptx"
         default_manifest = self.pdf_manifest_out.get().strip() or docx_base + "_工程.json"
         self.output_path.set(default_ppt)
-        self.pdf_ppt_out.set(default_ppt)
         self.pdf_manifest_out.set(default_manifest)
         self.pdf_project = project
         self._pdf_project_dirty = False
@@ -3556,6 +4588,8 @@ class PPTConvertApp:
         }
         self._reset_pdf_material_preview_session()
         self._populate_pdf_preview(project)
+        if getattr(self, "_pdf_preview_left_tabs", None):
+            self._pdf_preview_left_tabs.select(self._pdf_preview_slide_tab)
 
     def _make_ppt_config(self) -> PPTConfig:
         from pptx.util import Inches, Pt
@@ -3598,7 +4632,7 @@ class PPTConvertApp:
                 values[attr] = rgb
         return PPTConfig.from_mapping(values)
 
-    def _parse_word_file(self) -> bool:
+    def _parse_word_file(self, *, skip_confirm: bool = False) -> bool:
         word_file = self.word_path.get().strip()
         if not word_file:
             messagebox.showwarning("提示", "请先选择 Word 文件")
@@ -3606,7 +4640,7 @@ class PPTConvertApp:
         if not os.path.exists(word_file):
             messagebox.showerror("错误", f"文件不存在：{word_file}")
             return False
-        if not self._confirm_discard_pdf_project_edits("重新解析 Word 结构"):
+        if not skip_confirm and not self._confirm_discard_pdf_project_edits("重新解析 Word 结构"):
             return False
 
         self._set_status("正在解析...")
@@ -3630,12 +4664,16 @@ class PPTConvertApp:
             messagebox.showerror("解析错误", str(exc))
             return False
 
-    def _parse_preview(self):
-        if not self._parse_word_file():
-            return
+    def _start_word_preview_flow(self, *, skip_confirm: bool = False) -> bool:
+        if not self._parse_word_file(skip_confirm=skip_confirm):
+            return False
         self._open_pdf_preview_workspace()
         if not self.questions:
             messagebox.showinfo("提示", "未解析到任何题目，请检查 Word 格式")
+        return True
+
+    def _parse_preview(self):
+        self._start_word_preview_flow()
 
     def _convert_all(self):
         word_file = self.word_path.get().strip()

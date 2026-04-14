@@ -1,19 +1,26 @@
 import unittest
 
 from core.pdf_exam_models import DataAnalysisSection, ExamQuestion, MaterialUnit, ParsedExam, QuantSection, RichLine
-from domain.models import AssetRef, PageRegion
+from core.pdf_exam_models import CommonSenseSection, ReasoningSection
+from domain.models import AssetRef, MaterialSet, OptionNode, PageRegion, QuestionNode
 from domain.project_editor import (
+    apply_all_safe_subject_suggestions,
+    apply_section_subject_suggestion,
     clear_option_image,
+    insert_question_before,
     insert_option_after,
     insert_material_after,
     merge_adjacent_materials,
     move_option,
+    move_stem_assets_to_material,
     move_data_question,
     remove_question,
     remove_option,
     replace_option_image,
+    reclassify_objective_section,
     rename_material,
     renumber_question,
+    section_subject_suggestion,
     set_question_option_layout,
     update_option_text,
     update_question_stem,
@@ -178,6 +185,42 @@ class ProjectEditorTest(unittest.TestCase):
         self.assertIsNone(question.options[1].image_path)
         self.assertFalse(update_option_text(question, "Z", "x"))
 
+    def test_move_stem_assets_to_material(self):
+        material = MaterialSet(
+            material_id="m1",
+            header="材料一",
+            body="2024年相关数据如下。",
+            questions=[
+                QuestionNode(
+                    source_number="101",
+                    stem="根据上述资料，下列说法正确的是",
+                    stem_assets=[
+                        AssetRef(
+                            kind="image",
+                            path="chart.png",
+                            source_page=2,
+                            page_region=PageRegion(page_number=2, x0=10, y0=20, x1=110, y1=160),
+                        )
+                    ],
+                    options=[
+                        OptionNode(letter="A", text="甲"),
+                        OptionNode(letter="B", text="乙"),
+                        OptionNode(letter="C", text="丙"),
+                        OptionNode(letter="D", text="丁"),
+                    ],
+                )
+            ],
+        )
+        question = material.questions[0]
+
+        moved = move_stem_assets_to_material(material, question)
+
+        self.assertEqual(moved, 1)
+        self.assertEqual(question.stem_assets, [])
+        self.assertEqual(len(material.body_assets), 1)
+        self.assertEqual(material.body_assets[0].path, "chart.png")
+        self.assertEqual(len(material.body_regions), 1)
+
     def test_move_insert_and_remove_option(self):
         exam = ParsedExam(
             quant_sections=[
@@ -309,6 +352,41 @@ class ProjectEditorTest(unittest.TestCase):
         self.assertTrue(inserted)
         self.assertEqual([m.header for m in project.sections[0].material_sets], ["材料一", "材料二"])
 
+    def test_insert_question_before(self):
+        exam = ParsedExam(
+            quant_sections=[
+                QuantSection(
+                    title="四. 数量关系",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("66题题干")],
+                            option_lines=[_text_line("A. 1"), _text_line("B. 2")],
+                            source_number="66",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        existing = project.sections[0].questions[0]
+        inserted = insert_question_before(
+            project,
+            existing,
+            QuestionNode(
+                source_number="65",
+                stem="新插入题干",
+                options=[
+                    OptionNode(letter="A", text="甲"),
+                    OptionNode(letter="B", text="乙"),
+                    OptionNode(letter="C", text="丙"),
+                    OptionNode(letter="D", text="丁"),
+                ],
+            ),
+        )
+
+        self.assertTrue(inserted)
+        self.assertEqual([q.source_number for q in project.sections[0].questions], ["65", "66"])
+
     def test_merge_adjacent_materials_with_next(self):
         exam = ParsedExam(
             data_sections=[
@@ -391,6 +469,137 @@ class ProjectEditorTest(unittest.TestCase):
         self.assertTrue(inserted_twice)
         material_ids = [material.material_id for material in project.sections[0].material_sets]
         self.assertEqual(len(material_ids), len(set(material_ids)))
+
+    def test_reclassify_section_merges_adjacent_equivalent_sections_and_refreshes_subjects(self):
+        exam = ParsedExam(
+            common_sense_sections=[
+                CommonSenseSection(
+                    title="二. 常识判断",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("1题题干")],
+                            option_lines=[_text_line("A. 甲"), _text_line("B. 乙")],
+                            source_number="1",
+                        )
+                    ]
+                )
+            ],
+            reasoning_sections=[
+                ReasoningSection(
+                    title="判断推理",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("76题题干")],
+                            option_lines=[_text_line("A. 丙"), _text_line("B. 丁")],
+                            source_number="76",
+                        )
+                    ]
+                )
+            ],
+        )
+        project = build_project_from_parsed_exam(exam)
+
+        changed = reclassify_objective_section(project.sections[0], "reasoning", project=project)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(project.sections), 1)
+        self.assertEqual(project.sections[0].kind, "reasoning")
+        self.assertEqual(project.sections[0].title, "判断推理")
+        self.assertEqual([question.source_number for question in project.sections[0].questions], ["1", "76"])
+        self.assertEqual(project.selected_subjects, ["reasoning"])
+
+    def test_apply_section_subject_suggestion_updates_unknown_section(self):
+        exam = ParsedExam(
+            common_sense_sections=[
+                CommonSenseSection(
+                    title="题目列表",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("下列关于宪法的说法正确的是")],
+                            option_lines=[
+                                _text_line("A. 甲"),
+                                _text_line("B. 乙"),
+                                _text_line("C. 丙"),
+                                _text_line("D. 丁"),
+                            ],
+                            source_number="1",
+                        )
+                    ],
+                )
+            ]
+        )
+        project = build_project_from_parsed_exam(exam)
+        project.sections[0].kind = "unknown"
+        project.sections[0].title = "题目列表"
+        project.sections[0].questions[0].suggested_subject = "common_sense"
+
+        target, reason = section_subject_suggestion(project.sections[0])
+        changed = apply_section_subject_suggestion(project.sections[0], project=project)
+
+        self.assertEqual(target, "common_sense")
+        self.assertIn("一致建议改为", reason)
+        self.assertTrue(changed)
+        self.assertEqual(project.sections[0].kind, "common_sense")
+
+    def test_apply_all_safe_subject_suggestions_skips_conflicting_section(self):
+        exam = ParsedExam(
+            common_sense_sections=[
+                CommonSenseSection(
+                    title="题目列表",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("下列关于宪法的说法正确的是")],
+                            option_lines=[
+                                _text_line("A. 甲"),
+                                _text_line("B. 乙"),
+                                _text_line("C. 丙"),
+                                _text_line("D. 丁"),
+                            ],
+                            source_number="1",
+                        )
+                    ],
+                )
+            ],
+            reasoning_sections=[
+                ReasoningSection(
+                    title="题目列表",
+                    questions=[
+                        ExamQuestion(
+                            stem_lines=[_text_line("根据上述定义，下列符合定义的是")],
+                            option_lines=[
+                                _text_line("A. 甲"),
+                                _text_line("B. 乙"),
+                                _text_line("C. 丙"),
+                                _text_line("D. 丁"),
+                            ],
+                            source_number="71",
+                        ),
+                        ExamQuestion(
+                            stem_lines=[_text_line("如果甲成立，那么乙成立。由此可以推出")],
+                            option_lines=[
+                                _text_line("A. 甲"),
+                                _text_line("B. 乙"),
+                                _text_line("C. 丙"),
+                                _text_line("D. 丁"),
+                            ],
+                            source_number="72",
+                        ),
+                    ],
+                )
+            ],
+        )
+        project = build_project_from_parsed_exam(exam)
+        project.sections[0].kind = "unknown"
+        project.sections[0].title = "题目列表"
+        project.sections[0].questions[0].suggested_subject = "common_sense"
+        project.sections[1].questions[0].suggested_subject = "reasoning"
+        project.sections[1].questions[1].suggested_subject = "common_sense"
+
+        applied = apply_all_safe_subject_suggestions(project)
+
+        self.assertEqual(applied, 1)
+        self.assertEqual(project.sections[0].kind, "common_sense")
+        self.assertEqual(project.sections[1].kind, "reasoning")
 
 
 if __name__ == "__main__":

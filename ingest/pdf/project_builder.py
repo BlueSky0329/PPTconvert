@@ -10,10 +10,81 @@ from typing import Iterable, Mapping, Optional
 from core.pdf_exam_extract import ExtractedImageRegion, extract_pdf_line_items_with_metadata
 from core.pdf_exam_models import ObjectiveSection, ParsedExam, RichLine
 from core.pdf_exam_parse import parse_line_items
+from core.project_quality import annotate_project_quality
+from core.subject_inference import preferred_subject_title, should_merge_subject_sections
 from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, PageRegion, PaperSource, QuestionNode, Section, SubjectKind
 from ingest.pdf.layout import PageTextLine, extract_pdf_text_lines
 
 _OPTION_PREFIX = re.compile(r"^\s*([A-Z])\s*[.．、:：\)）]\s*", re.IGNORECASE)
+_OPTION_MARKER = re.compile(r"(?<![A-Za-z])([A-Z])\s*[.\uFF0E\u3001)\uFF09:：]\s*", re.IGNORECASE)
+_ENUMERATED_STEM_LINE = re.compile(r"^(?:[1-9](?!\d)[\u4e00-\u9fffA-Za-z]|[①②③④⑤⑥⑦⑧⑨⑩])")
+_LEADING_BLANK_PUNCT = re.compile(r"^[,，、:：;；]")
+_PROMPT_AFTER_ENUMERATION = re.compile(r"^(?:将以上|将下列|下列|根据|依次|这段|作者|最适合|填入|与原文|以下|对此)")
+_TRAILING_SHORT_NUMBER = re.compile(r"(\d{1,2})$")
+_LEADING_SHORT_NUMBER = re.compile(r"^(\d{1,2})(.*)$")
+
+
+def _split_option_fragments(text: str) -> list[tuple[str, str]]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return []
+
+    matches = list(_OPTION_MARKER.finditer(normalized))
+    if not matches:
+        match = _OPTION_PREFIX.match(normalized)
+        if not match:
+            return []
+        return [(match.group(1).upper(), normalized[match.end() :].strip())]
+
+    fragments: list[tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        body_start = match.end()
+        body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(normalized)
+        fragments.append((match.group(1).upper(), normalized[body_start:body_end].strip()))
+    return fragments
+
+
+def _normalize_option_letters(options: list[OptionNode]) -> list[OptionNode]:
+    if not options:
+        return options
+    expected = [chr(ord("A") + idx) for idx in range(len(options))]
+    actual = [option.letter for option in options]
+    if actual == expected:
+        return options
+    if len(set(actual)) != len(actual) or any(letter not in {"A", "B", "C", "D"} for letter in actual):
+        for option, letter in zip(options, expected):
+            option.letter = letter
+    return options
+
+
+def _rebalance_image_only_options_from_stem_assets(
+    stem_assets: list[AssetRef],
+    options: list[OptionNode],
+) -> tuple[list[AssetRef], list[OptionNode]]:
+    if len(options) != 4 or not stem_assets:
+        return stem_assets, options
+    if any((option.text or "").strip() for option in options):
+        return stem_assets, options
+
+    option_images = [
+        (option.image_path, option.source_page, option.page_region)
+        for option in options
+        if option.image_path
+    ]
+    if len(option_images) != len(options) - 1:
+        return stem_assets, options
+
+    if len(stem_assets) + len(option_images) != len(options):
+        return stem_assets, options
+
+    ordered_images = [
+        (asset.path, asset.source_page, asset.page_region) for asset in stem_assets
+    ] + option_images
+    for option, (image_path, source_page, page_region) in zip(options, ordered_images):
+        option.image_path = image_path
+        option.source_page = source_page
+        option.page_region = page_region
+    return [], options
 
 
 class _LayoutLocator:
@@ -67,6 +138,58 @@ def _join_wrapped_lines(lines: list[str]) -> str:
             merged = line
             continue
         merged += (" " if _needs_space_between(merged, line) else "") + line
+    return merged.strip()
+
+
+def _normalize_stem_line(line: str, *, first: bool) -> str:
+    normalized = (line or "").strip()
+    if first and _LEADING_BLANK_PUNCT.match(normalized):
+        return "____" + normalized
+    return normalized
+
+
+def _merge_stem_fragment(left: str, right: str) -> str:
+    left = (left or "").rstrip()
+    right = (right or "").lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+
+    tail = _TRAILING_SHORT_NUMBER.search(left)
+    head = _LEADING_SHORT_NUMBER.match(right)
+    if tail and head:
+        suffix = head.group(1)
+        rest = head.group(2)
+        if len(suffix) >= 2 and suffix[0] == tail.group(1)[-1]:
+            suffix = suffix[1:]
+        return left + "/" + suffix + rest
+
+    if right[:1] in "-—－/" or left.endswith(("-","—","－","/")):
+        return left + right
+    return left + (" " if _needs_space_between(left, right) else "") + right
+
+
+def _join_stem_lines(lines: list[str]) -> str:
+    merged = ""
+    saw_enumeration = False
+    for index, raw_line in enumerate(item for item in lines if item and item.strip()):
+        line = _normalize_stem_line(raw_line, first=index == 0)
+        if not merged:
+            merged = line
+            saw_enumeration = bool(_ENUMERATED_STEM_LINE.match(line))
+            continue
+        if _TRAILING_SHORT_NUMBER.search(merged.rstrip()) and _LEADING_SHORT_NUMBER.match(line):
+            merged = _merge_stem_fragment(merged, line)
+            continue
+        if _ENUMERATED_STEM_LINE.match(line):
+            merged += "\n" + line
+            saw_enumeration = True
+            continue
+        if saw_enumeration and _PROMPT_AFTER_ENUMERATION.match(line):
+            merged += "\n" + line
+            continue
+        merged = _merge_stem_fragment(merged, line)
     return merged.strip()
 
 
@@ -190,29 +313,59 @@ def _question_from_rich(
 
     options: list[OptionNode] = []
     current: Optional[OptionNode] = None
+    pending_option_images: list[tuple[str, PageRegion | None]] = []
+
+    def attach_pending_image(option: Optional[OptionNode]) -> None:
+        if option is None or option.image_path or not pending_option_images:
+            return
+        image_path, region = pending_option_images.pop(0)
+        option.image_path = image_path
+        option.source_page = region.page_number if region else None
+        option.page_region = region
+
     for rich_line in option_lines:
         text = _rich_line_text(rich_line)
-        images = _rich_line_images(rich_line)
+        images = [
+            (
+                image_path,
+                _region_from_extracted_image((image_regions or {}).get(image_path)),
+            )
+            for image_path in _rich_line_images(rich_line)
+        ]
+        if images:
+            if text:
+                pending_option_images.extend(images)
+            elif current is not None and not current.image_path and not pending_option_images:
+                image_path, region = images[0]
+                current.image_path = image_path
+                current.source_page = region.page_number if region else None
+                current.page_region = region
+                pending_option_images.extend(images[1:])
+            else:
+                pending_option_images.extend(images)
         if text:
-            match = _OPTION_PREFIX.match(text)
-            if match:
+            fragments = _split_option_fragments(text)
+            if fragments:
+                attach_pending_image(current)
                 if current is not None:
                     options.append(current)
-                current = OptionNode(
-                    letter=match.group(1).upper(),
-                    text=text[match.end() :].strip(),
-                )
+                for letter, body in fragments[:-1]:
+                    option = OptionNode(letter=letter, text=body)
+                    attach_pending_image(option)
+                    options.append(option)
+                last_letter, last_body = fragments[-1]
+                current = OptionNode(letter=last_letter, text=last_body)
+                attach_pending_image(current)
             elif current is not None:
                 current.text = _join_wrapped_lines([current.text, text])
-        if current is not None and images and not current.image_path:
-            current.image_path = images[0]
-            region = _region_from_extracted_image((image_regions or {}).get(images[0]))
-            current.source_page = region.page_number if region else None
-            current.page_region = region
+                attach_pending_image(current)
+    attach_pending_image(current)
     if current is not None:
         options.append(current)
+    options = _normalize_option_letters(options)
+    stem_assets, options = _rebalance_image_only_options_from_stem_assets(stem_assets, options)
 
-    stem = _join_wrapped_lines(stem_text_lines)
+    stem = _join_stem_lines(stem_text_lines)
     return QuestionNode(
         source_number=(source_number or "").strip(),
         stem=stem,
@@ -239,8 +392,18 @@ def _append_objective_project_section(
                 image_regions=image_regions,
             )
         )
-    if section.questions:
-        project.sections.append(section)
+    if not section.questions:
+        return
+    last_section = project.sections[-1] if project.sections else None
+    if (
+        last_section is not None
+        and last_section.kind == section.kind
+        and should_merge_subject_sections(section.kind, last_section.title, section.title)
+    ):
+        last_section.title = preferred_subject_title(section.kind, last_section.title, section.title)
+        last_section.questions.extend(section.questions)
+        return
+    project.sections.append(section)
 
 
 def build_project_from_parsed_exam(
@@ -307,6 +470,7 @@ def build_project_from_parsed_exam(
         if section.material_sets:
             project.sections.append(section)
 
+    annotate_project_quality(project)
     return project
 
 
@@ -323,6 +487,7 @@ def build_exam_project_from_pdf(
             items,
             mode=mode,
             document_subject_hint=document_subject_hint,
+            source_name=os.path.basename(pdf_path),
         )  # type: ignore[arg-type]
         layout_lines = extract_pdf_text_lines(pdf_path)
         project = build_project_from_parsed_exam(

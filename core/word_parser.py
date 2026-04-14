@@ -7,7 +7,13 @@ from docx.text.paragraph import Paragraph
 
 from core.image_extractor import ImageExtractor
 from core.models import Option, Question
-from core.subject_inference import default_subject_title, infer_document_subject, infer_subject_from_content
+from core.subject_inference import (
+    OBJECTIVE_SUBJECT_KINDS,
+    default_subject_title,
+    infer_document_subject,
+    infer_subject_from_content,
+    resolve_objective_section_kinds,
+)
 from core.word_math import paragraph_full_text, paragraph_has_drawing
 
 LOGGER = logging.getLogger(__name__)
@@ -449,26 +455,39 @@ class WordParser:
                 inferred_kind = document_hint  # type: ignore[assignment]
             inferred_pairs.append((inferred_kind, confidence))
 
-        for index in range(1, len(inferred_pairs) - 1):
-            prev_kind = inferred_pairs[index - 1][0]
-            current_kind, current_confidence = inferred_pairs[index]
-            next_kind = inferred_pairs[index + 1][0]
-            if current_kind != prev_kind and prev_kind == next_kind and current_confidence < 1.4:
-                inferred_pairs[index] = (prev_kind, current_confidence)
+        strong_text_signals = [
+            len((question.stem or "").strip()) >= 10
+            or sum(len((option.text or "").strip()) for option in question.options) >= 18
+            for question in questions
+        ]
+        resolved_kinds = ["unknown"] * len(questions)
+        start = 0
+        while start < len(questions):
+            base_kind = (questions[start].section_kind or "").strip().lower() or "unknown"
+            normalized_base = base_kind if base_kind in OBJECTIVE_SUBJECT_KINDS or base_kind == "unknown" else "unknown"
+            end = start + 1
+            while end < len(questions):
+                next_base = (questions[end].section_kind or "").strip().lower() or "unknown"
+                next_base = next_base if next_base in OBJECTIVE_SUBJECT_KINDS or next_base == "unknown" else "unknown"
+                if next_base != normalized_base:
+                    break
+                end += 1
+            segment_kinds = resolve_objective_section_kinds(
+                default_kind=normalized_base,  # type: ignore[arg-type]
+                inferred_pairs=inferred_pairs[start:end],
+                source_numbers=[question.source_question_number or str(question.number) for question in questions[start:end]],
+                strong_text_signals=strong_text_signals[start:end],
+                strict_default=normalized_base != "unknown",
+            )
+            resolved_kinds[start:end] = segment_kinds
+            start = end
 
-        for question, (inferred_kind, confidence) in zip(questions, inferred_pairs):
+        for question, (inferred_kind, confidence), resolved_kind in zip(questions, inferred_pairs, resolved_kinds):
             base_kind = (question.section_kind or "").strip().lower()
-            strong_text_signal = len((question.stem or "").strip()) >= 10 or sum(
-                len((option.text or "").strip()) for option in question.options
-            ) >= 18
             if question.material_header or question.material_text:
                 question.section_kind = "data"
-            elif base_kind in {"", "unknown"}:
-                question.section_kind = inferred_kind if inferred_kind != "unknown" else "unknown"
-            elif inferred_kind not in {"unknown", base_kind} and confidence >= 0.9 and strong_text_signal:
-                question.section_kind = inferred_kind
             else:
-                question.section_kind = base_kind
+                question.section_kind = resolved_kind if resolved_kind != "unknown" or base_kind in {"", "unknown"} else "unknown"
             if not question.section_title or question.section_title == default_subject_title(base_kind or "unknown"):
                 question.section_title = default_subject_title(question.section_kind)
         return questions
