@@ -44,7 +44,8 @@ def build_pdf_project(
     selected_subjects = parse_subject_spec(mode)
     project = build_exam_project_from_pdf(
         pdf_path,
-        mode="all",
+        # Keep parser selection aligned with the later project filter.
+        mode=mode,
         asset_dir=chosen_asset_dir,
         document_subject_hint=document_subject_hint,
     )

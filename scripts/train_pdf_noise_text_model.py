@@ -11,11 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.learned_subject_model import MetaFieldExtractor, TextFieldExtractor
+from core.pdf_noise_model import MetaFieldExtractor, TextFieldExtractor
 
 
-DEFAULT_DATASET = ROOT / "data" / "datasets" / "subject_gold.jsonl"
-DEFAULT_MODEL = ROOT / "data" / "models" / "subject_classifier.pkl"
+DEFAULT_DATASET = ROOT / "data" / "datasets" / "pdf_noise_text.jsonl"
+DEFAULT_MODEL = ROOT / "data" / "models" / "pdf_noise_text_classifier.pkl"
 
 
 def _load_rows(path: Path) -> list[dict]:
@@ -27,34 +27,6 @@ def _load_rows(path: Path) -> list[dict]:
                 continue
             rows.append(json.loads(line))
     return rows
-
-
-def _covers_all_labels(indexes, labels) -> bool:
-    return {labels[idx] for idx in indexes} == set(labels)
-
-
-def _minimum_train_label_support(total_count: int) -> int:
-    if total_count <= 1:
-        return total_count
-    if total_count < 50:
-        target = 10
-    else:
-        target = max(25, round(total_count * 0.2))
-    return max(1, min(total_count - 1, target))
-
-
-def _has_minimum_train_label_support(labels: list[str], train_idx: list[int]) -> bool:
-    total_counts: dict[str, int] = {}
-    train_counts: dict[str, int] = {}
-    for label in labels:
-        total_counts[label] = total_counts.get(label, 0) + 1
-    for idx in train_idx:
-        label = labels[idx]
-        train_counts[label] = train_counts.get(label, 0) + 1
-    for label, total_count in total_counts.items():
-        if train_counts.get(label, 0) < _minimum_train_label_support(total_count):
-            return False
-    return True
 
 
 def _choose_grouped_split(labels: list[str], groups: list[str]) -> tuple[list[int], list[int], bool]:
@@ -75,8 +47,6 @@ def _choose_grouped_split(labels: list[str], groups: list[str]) -> tuple[list[in
             train_idx = [index for index, group in enumerate(groups) if group not in test_groups]
             test_idx = [index for index, group in enumerate(groups) if group in test_groups]
             if not train_idx or not test_idx:
-                continue
-            if not _has_minimum_train_label_support(labels, train_idx):
                 continue
 
             train_labels = {labels[idx] for idx in train_idx}
@@ -101,61 +71,14 @@ def _choose_grouped_split(labels: list[str], groups: list[str]) -> tuple[list[in
     return best_choice[1], best_choice[2], best_choice[3]
 
 
-def _build_sample_weights(
-    rows: list[dict],
-    *,
-    preferred_forms: set[str] | None = None,
-    preferred_weight: float = 3.0,
-    secondary_weight: float = 0.35,
-    backfill_weight: float = 1.5,
-) -> tuple[list[float], dict[str, float]]:
-    preferred_forms = {item for item in (preferred_forms or set()) if item}
-    if not preferred_forms:
-        return [1.0] * len(rows), {"default": float(len(rows))}
-
-    preferred_labels = {
-        str(row.get("subject") or "")
-        for row in rows
-        if str(row.get("source_form") or "").strip() in preferred_forms and str(row.get("subject") or "").strip()
-    }
-
-    weights: list[float] = []
-    summary = {
-        "preferred": 0.0,
-        "fallback_same_label": 0.0,
-        "fallback_missing_label": 0.0,
-    }
-    for row in rows:
-        source_form = str(row.get("source_form") or "").strip()
-        subject = str(row.get("subject") or "").strip()
-        if source_form in preferred_forms:
-            weights.append(preferred_weight)
-            summary["preferred"] += 1.0
-        elif subject in preferred_labels:
-            weights.append(secondary_weight)
-            summary["fallback_same_label"] += 1.0
-        else:
-            weights.append(backfill_weight)
-            summary["fallback_missing_label"] += 1.0
-    return weights, summary
-
-
-def train_subject_model(
-    dataset_path: Path,
-    model_path: Path,
-    *,
-    preferred_forms: set[str] | None = None,
-    preferred_weight: float = 3.0,
-    secondary_weight: float = 0.35,
-    backfill_weight: float = 1.5,
-) -> dict:
+def train_pdf_noise_model(dataset_path: Path, model_path: Path) -> dict:
     try:
         from sklearn.base import clone
         from sklearn.feature_extraction import DictVectorizer
         from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.linear_model import LogisticRegression
         from sklearn.metrics import classification_report
         from sklearn.pipeline import FeatureUnion, Pipeline
-        from sklearn.svm import LinearSVC
     except ModuleNotFoundError as exc:
         raise SystemExit(
             "缺少训练依赖。请先安装 requirements-ml.txt 再运行训练脚本。"
@@ -165,8 +88,12 @@ def train_subject_model(
     if not rows:
         raise SystemExit("训练集为空，无法训练。")
 
-    labels = [row["subject"] for row in rows]
-    groups = [row["source_pdf"] for row in rows]
+    labels = [str(row["label"]) for row in rows]
+    groups = [str(row["source_pdf"]) for row in rows]
+    samples = [row["feature_record"] for row in rows]
+
+    train_idx, test_idx, full_label_coverage = _choose_grouped_split(labels, groups)
+    split_strategy = "grouped_by_pdf" if full_label_coverage else "grouped_by_pdf_partial_labels"
 
     feature_pipeline = FeatureUnion(
         transformer_list=[
@@ -191,37 +118,25 @@ def train_subject_model(
         ]
     )
 
-    samples = [row["feature_record"] for row in rows]
-    train_idx, test_idx, full_label_coverage = _choose_grouped_split(labels, groups)
-    split_strategy = "grouped_by_pdf" if full_label_coverage else "grouped_by_pdf_partial_labels"
-    sample_weights, sample_weight_summary = _build_sample_weights(
-        rows,
-        preferred_forms=preferred_forms,
-        preferred_weight=preferred_weight,
-        secondary_weight=secondary_weight,
-        backfill_weight=backfill_weight,
-    )
-
     X_train = [samples[idx] for idx in train_idx]
     y_train = [labels[idx] for idx in train_idx]
     X_test = [samples[idx] for idx in test_idx]
     y_test = [labels[idx] for idx in test_idx]
-    train_weights = [sample_weights[idx] for idx in train_idx]
 
     model = Pipeline(
         steps=[
             ("features", feature_pipeline),
             (
                 "classifier",
-                LinearSVC(
+                LogisticRegression(
                     class_weight="balanced",
-                    dual="auto",
-                    max_iter=12000,
+                    max_iter=2000,
+                    solver="liblinear",
                 ),
             ),
         ]
     )
-    model.fit(X_train, y_train, classifier__sample_weight=train_weights)
+    model.fit(X_train, y_train)
     predictions = model.predict(X_test)
     all_sorted_labels = sorted({str(label) for label in labels})
     report = classification_report(
@@ -232,9 +147,11 @@ def train_subject_model(
         zero_division=0,
     )
     final_model = clone(model)
-    final_model.fit(samples, labels, classifier__sample_weight=sample_weights)
-    macro_f1 = report.get("macro avg", {}).get("f1-score", 0.0)
-    ready_for_runtime = bool(full_label_coverage and macro_f1 >= 0.45)
+    final_model.fit(samples, labels)
+    macro_f1 = float(report.get("macro avg", {}).get("f1-score", 0.0))
+    noise_precision = float(report.get("noise", {}).get("precision", 0.0))
+    noise_recall = float(report.get("noise", {}).get("recall", 0.0))
+    ready_for_runtime = bool(full_label_coverage and macro_f1 >= 0.85 and noise_precision >= 0.98 and noise_recall >= 0.7)
 
     bundle = {
         "version": 1,
@@ -247,8 +164,6 @@ def train_subject_model(
         "split_strategy": split_strategy,
         "full_label_coverage": full_label_coverage,
         "ready_for_runtime": ready_for_runtime,
-        "preferred_forms": sorted(preferred_forms or []),
-        "sample_weight_summary": sample_weight_summary,
     }
     model_path.parent.mkdir(parents=True, exist_ok=True)
     with model_path.open("wb") as fh:
@@ -264,41 +179,19 @@ def train_subject_model(
         "split_strategy": split_strategy,
         "full_label_coverage": full_label_coverage,
         "macro_f1": macro_f1,
+        "noise_precision": noise_precision,
+        "noise_recall": noise_recall,
         "ready_for_runtime": ready_for_runtime,
-        "preferred_forms": sorted(preferred_forms or []),
-        "sample_weight_summary": sample_weight_summary,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="训练本地公务员题目科目分类模型")
+    parser = argparse.ArgumentParser(description="训练 PDF 文本噪声分类模型")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument(
-        "--preferred-form",
-        action="append",
-        dest="preferred_forms",
-        default=None,
-        help="优先信任的训练来源 form，可重复传入；默认会优先使用 single_subject_book。",
-    )
-    parser.add_argument("--preferred-weight", type=float, default=3.0)
-    parser.add_argument("--secondary-weight", type=float, default=0.35)
-    parser.add_argument("--backfill-weight", type=float, default=1.5)
     args = parser.parse_args()
 
-    preferred_forms = (
-        {str(item).strip() for item in args.preferred_forms if str(item).strip()}
-        if args.preferred_forms
-        else {"single_subject_book"}
-    )
-    summary = train_subject_model(
-        args.dataset,
-        args.model,
-        preferred_forms=preferred_forms,
-        preferred_weight=args.preferred_weight,
-        secondary_weight=args.secondary_weight,
-        backfill_weight=args.backfill_weight,
-    )
+    summary = train_pdf_noise_model(args.dataset, args.model)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

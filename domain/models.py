@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 SubjectKind = Literal[
     "politics",
@@ -83,6 +83,7 @@ class ReviewIssue:
 class QuestionNode:
     source_number: str
     stem: str
+    question_id: str = ""
     options: list[OptionNode] = field(default_factory=list)
     stem_assets: list[AssetRef] = field(default_factory=list)
     answer: Optional[str] = None
@@ -147,6 +148,8 @@ class ExamProject:
     sections: list[Section] = field(default_factory=list)
     selected_subjects: list[SubjectKind] = field(default_factory=list)
     selected_ranges: list[QuestionRange] = field(default_factory=list)
+    repair_session_id: str = ""
+    repair_log: list["RepairLogEntry"] = field(default_factory=list)
 
     def iter_questions(self):
         for section in self.sections:
@@ -161,3 +164,17 @@ class ExamProject:
     @property
     def question_count(self) -> int:
         return sum(1 for _section, _material, _question in self.iter_questions())
+
+
+@dataclass
+class RepairLogEntry:
+    timestamp: str
+    source: str
+    action: str
+    question_id: str = ""
+    question_no: str = ""
+    section_kind: str = "unknown"
+    material_id: str = ""
+    before_state: dict[str, Any] = field(default_factory=dict)
+    after_state: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)

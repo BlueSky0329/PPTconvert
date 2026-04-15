@@ -146,6 +146,14 @@ python .\scripts\train_local_subject_model.py
 - [本次整理记录](C:/Users/17679/Desktop/PPTconvert/docs/WORKLOG.md)
 - [GitHub 协作说明](C:/Users/17679/Desktop/PPTconvert/docs/GITHUB.md)
 
+## 仓库清洁与 Git 约定
+
+- 代码提交只建议包含 `core/`、`gui/`、`scripts/`、`tests/`、`docs/` 这类源码和文档改动。
+- `data/datasets/`、`data/models/`、根目录试卷 PDF、导出的 `docx/pptx/json`、`*_assets/` 都视为本地生成物，默认不纳入版本库。
+- 提交前优先用 `git add <paths>` 按范围暂存，不建议直接 `git add .`。
+- 推送前建议先看一次 `git status --short --ignored`，确认没有误带本地题库、缓存和导出产物。
+- 如果需要共享真实样例，优先放到 `examples/`，并先确认不含隐私与版权风险。
+
 ## 测试
 
 常用回归命令：
@@ -153,6 +161,14 @@ python .\scripts\train_local_subject_model.py
 ```powershell
 python -m unittest discover -s tests -v
 python -m py_compile .\main.py .\gui\app.py
+```
+
+仓库缓存清理可以用：
+
+```powershell
+Get-ChildItem -Recurse -Directory -Force |
+  Where-Object { $_.Name -in @('__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache') } |
+  Remove-Item -Recurse -Force
 ```
 
 ## 当前边界

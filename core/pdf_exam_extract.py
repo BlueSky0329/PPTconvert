@@ -8,7 +8,15 @@ import os
 import re
 import tempfile
 import unicodedata
-from typing import Iterator
+from typing import Any, Iterator
+
+from core.pdf_noise_image_model import (
+    build_pdf_noise_image_visual_stats,
+    is_background_like_pdf_image_meta,
+    is_watermark_like_pdf_image_meta,
+    predict_pdf_noise_image_distribution,
+)
+from core.pdf_noise_model import predict_pdf_noise_distribution
 
 LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +54,8 @@ _SCAN_AD_LINE = re.compile(
     r"^\s*各种考试资料购买\s*[,，]\s*请加微信\s*[:：]\s*行测资料库\s*$"
 )
 _SCAN_AD_CHARS = ("扫", "码", "关", "注")
+_NOISE_MODEL_THRESHOLD = 0.86
+_IMAGE_NOISE_MODEL_THRESHOLD = 0.92
 
 
 def _block_sort_key(block: dict) -> tuple[float, float]:
@@ -238,17 +248,44 @@ def _is_noise_text_line(text: str) -> bool:
     return False
 
 
-def _is_decorative_text_line(page, line: dict, text: str) -> bool:
-    s = unicodedata.normalize("NFKC", (text or "").strip())
+def _build_text_line_record(
+    *,
+    text: str,
+    page_number: int,
+    page_width: float,
+    page_height: float,
+    bbox: tuple[float, float, float, float],
+    line_index_in_block: int = 0,
+    line_count_in_block: int = 1,
+) -> dict[str, Any]:
+    x0, y0, x1, y1 = [float(value) for value in bbox]
+    return {
+        "text": unicodedata.normalize("NFKC", (text or "").strip()),
+        "page_number": int(page_number),
+        "page_width": float(page_width),
+        "page_height": float(page_height),
+        "x0": x0,
+        "y0": y0,
+        "x1": x1,
+        "y1": y1,
+        "line_index_in_block": int(line_index_in_block),
+        "line_count_in_block": int(max(1, line_count_in_block)),
+    }
+
+
+def _is_decorative_text_record(record: dict[str, Any]) -> bool:
+    s = unicodedata.normalize("NFKC", str(record.get("text") or "").strip())
     if not s:
         return True
 
-    bbox = line.get("bbox") or (0.0, 0.0, 0.0, 0.0)
-    x0, y0, x1, y1 = [float(v) for v in bbox]
+    x0 = float(record.get("x0") or 0.0)
+    y0 = float(record.get("y0") or 0.0)
+    x1 = float(record.get("x1") or 0.0)
+    y1 = float(record.get("y1") or 0.0)
     width = max(0.0, x1 - x0)
     height = max(0.0, y1 - y0)
-    page_w = float(page.rect.width or 1.0)
-    page_h = float(page.rect.height or 1.0)
+    page_w = float(record.get("page_width") or 1.0)
+    page_h = float(record.get("page_height") or 1.0)
     center_x = (x0 + x1) / 2.0
 
     if re.fullmatch(r"\d{1,3}", s):
@@ -270,6 +307,65 @@ def _is_decorative_text_line(page, line: dict, text: str) -> bool:
     return False
 
 
+def _is_decorative_text_line(page, line: dict, text: str) -> bool:
+    record = _build_text_line_record(
+        text=text,
+        page_number=1,
+        page_width=float(page.rect.width or 1.0),
+        page_height=float(page.rect.height or 1.0),
+        bbox=tuple(float(v) for v in (line.get("bbox") or (0.0, 0.0, 0.0, 0.0))),
+    )
+    return _is_decorative_text_record(record)
+
+
+def _is_noise_model_candidate(record: dict[str, Any]) -> bool:
+    text = str(record.get("text") or "")
+    if not text:
+        return False
+    y0 = float(record.get("y0") or 0.0)
+    y1 = float(record.get("y1") or 0.0)
+    page_h = max(1.0, float(record.get("page_height") or 1.0))
+    x0 = float(record.get("x0") or 0.0)
+    x1 = float(record.get("x1") or 0.0)
+    page_w = max(1.0, float(record.get("page_width") or 1.0))
+    center_x = (x0 + x1) / 2.0
+    near_margin = y0 <= page_h * 0.16 or y1 >= page_h * 0.84
+    centered = abs(center_x - page_w / 2.0) <= page_w * 0.1
+    short_text = len(text) <= 32
+    keyword_like = any(marker in text for marker in ("微信", "扫码", "资料", "答案", "页", "行测", "考试"))
+    numeric_only = bool(re.fullmatch(r"\d{1,3}", text))
+    return (near_margin and short_text) or keyword_like or (numeric_only and centered)
+
+
+def _is_learned_noise_text_record(record: dict[str, Any]) -> bool:
+    if not _is_noise_model_candidate(record):
+        return False
+    prediction = predict_pdf_noise_distribution(
+        str(record.get("text") or ""),
+        x0=float(record.get("x0") or 0.0),
+        y0=float(record.get("y0") or 0.0),
+        x1=float(record.get("x1") or 0.0),
+        y1=float(record.get("y1") or 0.0),
+        page_width=float(record.get("page_width") or 0.0),
+        page_height=float(record.get("page_height") or 0.0),
+        page_number=int(record.get("page_number") or 1),
+        line_index_in_block=int(record.get("line_index_in_block") or 0),
+        line_count_in_block=int(record.get("line_count_in_block") or 1),
+    )
+    if prediction is None:
+        return False
+    return prediction.best_label == "noise" and prediction.best_confidence >= _NOISE_MODEL_THRESHOLD
+
+
+def _should_drop_text_line_record(record: dict[str, Any]) -> bool:
+    text = str(record.get("text") or "")
+    if _is_noise_text_line(text):
+        return True
+    if _is_decorative_text_record(record):
+        return True
+    return _is_learned_noise_text_record(record)
+
+
 def _is_decorative_image_block(page, block: dict) -> bool:
     bbox = block.get("bbox") or (0.0, 0.0, 0.0, 0.0)
     x0, y0, x1, y1 = [float(v) for v in bbox]
@@ -278,8 +374,7 @@ def _is_decorative_image_block(page, block: dict) -> bool:
     page_w = float(page.rect.width or 1.0)
     page_h = float(page.rect.height or 1.0)
 
-    if width >= page_w * 0.9 and height >= page_h * 0.75:
-        return True
+    # 合法题面里会出现整页图表、地图题或科学示意图，不能只因“很大”就把图片过滤掉。
     if y0 <= max(12.0, page_h * 0.02) and width >= page_w * 0.82 and height <= page_h * 0.12:
         return True
     if y1 <= 90 and width >= page_w * 0.7 and height <= 40:
@@ -308,6 +403,99 @@ def _is_decorative_image_block(page, block: dict) -> bool:
     if height <= 5:
         return True
     return False
+
+
+def _is_noise_image_candidate(page, block: dict) -> bool:
+    x0, y0, x1, y1 = [float(v) for v in (block.get("bbox") or (0.0, 0.0, 0.0, 0.0))]
+    width = max(0.0, x1 - x0)
+    height = max(0.0, y1 - y0)
+    page_w = float(page.rect.width or 1.0)
+    page_h = float(page.rect.height or 1.0)
+    top_ratio = y0 / page_h
+    bottom_ratio = y1 / page_h
+    left_ratio = x0 / page_w
+    right_ratio = x1 / page_w
+    width_ratio = width / page_w
+    height_ratio = height / page_h
+    near_margin = top_ratio <= 0.2 or bottom_ratio >= 0.8
+    corner_like = (left_ratio <= 0.25 or right_ratio >= 0.75) and near_margin
+    banner_like = top_ratio <= 0.2 and width_ratio >= 0.45 and height_ratio <= 0.25
+    smallish = width_ratio <= 0.22 and height_ratio <= 0.18 and near_margin
+    page_cover_like = width_ratio >= 0.72 and height_ratio >= 0.55 and abs((x0 + x1) / 2.0 - page_w / 2.0) <= page_w * 0.16
+    return corner_like or banner_like or smallish or page_cover_like
+
+
+def _is_background_like_image_block(page, block: dict, image_path: str, *, page_number: int) -> bool:
+    x0, y0, x1, y1 = [float(v) for v in (block.get("bbox") or (0.0, 0.0, 0.0, 0.0))]
+    try:
+        visual_stats = build_pdf_noise_image_visual_stats(image_path)
+    except Exception:
+        return False
+    meta = {
+        "page_number": float(page_number),
+        "page_top_ratio": float(y0) / max(1.0, float(page.rect.height or 1.0)),
+        "page_bottom_ratio": float(y1) / max(1.0, float(page.rect.height or 1.0)),
+        "width_ratio": max(0.0, float(x1) - float(x0)) / max(1.0, float(page.rect.width or 1.0)),
+        "height_ratio": max(0.0, float(y1) - float(y0)) / max(1.0, float(page.rect.height or 1.0)),
+        "center_offset_ratio": abs((float(x0) + float(x1)) / 2.0 - float(page.rect.width or 1.0) / 2.0)
+        / max(1.0, float(page.rect.width or 1.0)),
+        "page_cover_like": 1.0
+        if (
+            max(0.0, float(x1) - float(x0)) / max(1.0, float(page.rect.width or 1.0)) >= 0.72
+            and max(0.0, float(y1) - float(y0)) / max(1.0, float(page.rect.height or 1.0)) >= 0.55
+            and abs((float(x0) + float(x1)) / 2.0 - float(page.rect.width or 1.0) / 2.0)
+            <= float(page.rect.width or 1.0) * 0.16
+        )
+        else 0.0,
+        **visual_stats,
+    }
+    return is_background_like_pdf_image_meta(meta)
+
+
+def _is_watermark_like_image_block(page, block: dict, image_path: str, *, page_number: int) -> bool:
+    x0, y0, x1, y1 = [float(v) for v in (block.get("bbox") or (0.0, 0.0, 0.0, 0.0))]
+    try:
+        visual_stats = build_pdf_noise_image_visual_stats(image_path)
+    except Exception:
+        return False
+    meta = {
+        "page_number": float(page_number),
+        "page_top_ratio": float(y0) / max(1.0, float(page.rect.height or 1.0)),
+        "page_bottom_ratio": float(y1) / max(1.0, float(page.rect.height or 1.0)),
+        "width_ratio": max(0.0, float(x1) - float(x0)) / max(1.0, float(page.rect.width or 1.0)),
+        "height_ratio": max(0.0, float(y1) - float(y0)) / max(1.0, float(page.rect.height or 1.0)),
+        "center_offset_ratio": abs((float(x0) + float(x1)) / 2.0 - float(page.rect.width or 1.0) / 2.0)
+        / max(1.0, float(page.rect.width or 1.0)),
+        "page_cover_like": 1.0
+        if (
+            max(0.0, float(x1) - float(x0)) / max(1.0, float(page.rect.width or 1.0)) >= 0.72
+            and max(0.0, float(y1) - float(y0)) / max(1.0, float(page.rect.height or 1.0)) >= 0.55
+            and abs((float(x0) + float(x1)) / 2.0 - float(page.rect.width or 1.0) / 2.0)
+            <= float(page.rect.width or 1.0) * 0.16
+        )
+        else 0.0,
+        **visual_stats,
+    }
+    return is_watermark_like_pdf_image_meta(meta)
+
+
+def _is_learned_noise_image_block(page, block: dict, image_path: str, *, page_number: int) -> bool:
+    if not _is_noise_image_candidate(page, block):
+        return False
+    x0, y0, x1, y1 = [float(v) for v in (block.get("bbox") or (0.0, 0.0, 0.0, 0.0))]
+    prediction = predict_pdf_noise_image_distribution(
+        image_path,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+        page_width=float(page.rect.width or 1.0),
+        page_height=float(page.rect.height or 1.0),
+        page_number=page_number,
+    )
+    if prediction is None:
+        return False
+    return prediction.best_label == "noise" and prediction.best_confidence >= _IMAGE_NOISE_MODEL_THRESHOLD
 
 
 def _save_image_bytes(data: bytes, ext: str, out_dir: str, prefix: str, index: int) -> str:
@@ -358,6 +546,36 @@ def _line_text(line: dict) -> str:
     return "".join(parts).strip()
 
 
+def iter_pdf_text_line_records(pdf_path: str) -> Iterator[dict[str, Any]]:
+    require_fitz()
+    doc = fitz.open(pdf_path)
+    try:
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            data = page.get_text("dict")
+            blocks = _order_page_blocks(page, _merge_page_image_blocks(page, list(data.get("blocks") or [])))
+            for block in blocks:
+                if block.get("type") != 0:
+                    continue
+                lines = sorted(block.get("lines") or [], key=_line_sort_key)
+                line_count = len(lines)
+                for line_index, line in enumerate(lines):
+                    lt = _line_text(line)
+                    if not lt:
+                        continue
+                    yield _build_text_line_record(
+                        text=lt,
+                        page_number=page_index + 1,
+                        page_width=float(page.rect.width or 1.0),
+                        page_height=float(page.rect.height or 1.0),
+                        bbox=tuple(float(v) for v in (line.get("bbox") or (0.0, 0.0, 0.0, 0.0))),
+                        line_index_in_block=line_index,
+                        line_count_in_block=line_count,
+                    )
+    finally:
+        doc.close()
+
+
 def extract_pdf_line_items_with_metadata(
     pdf_path: str,
     temp_dir: str | None = None,
@@ -386,9 +604,21 @@ def extract_pdf_line_items_with_metadata(
                 if btype == 0:
                     line_parts: list[str] = []
                     lines = sorted(block.get("lines") or [], key=_line_sort_key)
-                    for line in lines:
+                    line_count = len(lines)
+                    for line_index, line in enumerate(lines):
                         lt = _line_text(line)
-                        if lt and not _is_noise_text_line(lt) and not _is_decorative_text_line(page, line, lt):
+                        if not lt:
+                            continue
+                        record = _build_text_line_record(
+                            text=lt,
+                            page_number=page_index + 1,
+                            page_width=float(page.rect.width or 1.0),
+                            page_height=float(page.rect.height or 1.0),
+                            bbox=tuple(float(v) for v in (line.get("bbox") or (0.0, 0.0, 0.0, 0.0))),
+                            line_index_in_block=line_index,
+                            line_count_in_block=line_count,
+                        )
+                        if not _should_drop_text_line_record(record):
                             line_parts.append(lt)
                     if line_parts:
                         raw_segments.append(("\n".join(line_parts), None))
@@ -398,6 +628,24 @@ def extract_pdf_line_items_with_metadata(
                     path = _extract_image_from_block(doc, block, out_dir, prefix, img_counter)
                     img_counter += 1
                     if path:
+                        if _is_background_like_image_block(page, block, path, page_number=page_index + 1):
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                LOGGER.warning("删除背景噪声图片失败: %s", path, exc_info=True)
+                            continue
+                        if _is_watermark_like_image_block(page, block, path, page_number=page_index + 1):
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                LOGGER.warning("删除水印噪声图片失败: %s", path, exc_info=True)
+                            continue
+                        if _is_learned_noise_image_block(page, block, path, page_number=page_index + 1):
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                LOGGER.warning("删除学习模型判定为噪声的图片失败: %s", path, exc_info=True)
+                            continue
                         x0, y0, x1, y1 = [float(value) for value in (block.get("bbox") or (0.0, 0.0, 0.0, 0.0))]
                         image_regions[path] = ExtractedImageRegion(
                             path=path,

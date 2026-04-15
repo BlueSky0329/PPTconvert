@@ -3,11 +3,27 @@
   "pdfs": [
     {
       "path": "模拟卷十一.pdf",
-      "form": "set_paper"
+      "form": "set_paper",
+      "sections": {
+        "politics": ["1-15"],
+        "common_sense": ["16-25"],
+        "verbal": ["26-60"],
+        "quant": ["61-70"],
+        "reasoning": ["71-100"],
+        "data": ["101-120"]
+      }
     },
     {
       "path": "2026年国家公务员录用考试《行测》题（行政执法卷网友回忆版）.pdf",
-      "form": "set_paper"
+      "form": "set_paper",
+      "sections": {
+        "politics": ["1-20"],
+        "common_sense": ["21-35"],
+        "verbal": ["36-65"],
+        "quant": ["66-75"],
+        "reasoning": ["76-110"],
+        "data": ["111-130"]
+      }
     },
     {
       "path": "【02】最新行测5000题题库/行测——判断推理（2000题）.pdf",
@@ -28,6 +44,11 @@
       "path": "【02】最新行测5000题题库/行测——资料分析（950题）.pdf",
       "form": "single_subject_book",
       "subject": "data"
+    },
+    {
+      "path": "【02】最新行测5000题题库/政治理论题本.pdf",
+      "form": "single_subject_book",
+      "subject": "politics"
     }
   ]
 }

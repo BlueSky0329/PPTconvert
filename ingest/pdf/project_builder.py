@@ -225,7 +225,8 @@ def _coalesce_regions(regions: Iterable[PageRegion]) -> list[PageRegion]:
         grouped[region.page_number].append(region)
 
     merged: list[PageRegion] = []
-    for page_number, page_regions in grouped.items():
+    for page_number in sorted(grouped):
+        page_regions = grouped[page_number]
         merged.append(
             PageRegion(
                 page_number=page_number,
@@ -235,7 +236,32 @@ def _coalesce_regions(regions: Iterable[PageRegion]) -> list[PageRegion]:
                 y1=max(region.y1 for region in page_regions),
             )
         )
-    merged.sort(key=lambda region: region.page_number)
+    return merged
+
+
+def _merge_adjacent_page_regions(regions: list[PageRegion]) -> list[PageRegion]:
+    """合并相邻页面且纵向区域接近连续的 PageRegion（跨页表格/材料正文）。"""
+    if len(regions) <= 1:
+        return list(regions)
+    ordered = sorted(regions, key=lambda r: (r.page_number, r.y0))
+    merged: list[PageRegion] = [ordered[0]]
+    for region in ordered[1:]:
+        prev = merged[-1]
+        if (
+            region.page_number == prev.page_number + 1
+            and abs(region.x0 - prev.x0) < 60.0
+            and abs(region.x1 - prev.x1) < 60.0
+        ):
+            merged[-1] = PageRegion(
+                page_number=prev.page_number,
+                x0=min(prev.x0, region.x0),
+                y0=prev.y0,
+                x1=max(prev.x1, region.x1),
+                y1=prev.y1,
+            )
+            merged.append(region)
+        else:
+            merged.append(region)
     return merged
 
 
@@ -253,13 +279,25 @@ def _region_from_extracted_image(info: ExtractedImageRegion | None) -> PageRegio
 
 def _copy_asset(path: str, asset_dir: str, seen: dict[str, str]) -> str:
     source = os.path.abspath(path)
+    target_dir = os.path.abspath(asset_dir)
     cached = seen.get(source)
     if cached:
         return cached
 
+    source_dir = os.path.dirname(source)
+    try:
+        already_materialized = os.path.samefile(source_dir, target_dir)
+    except OSError:
+        already_materialized = os.path.normcase(os.path.normpath(source_dir)) == os.path.normcase(
+            os.path.normpath(target_dir)
+        )
+    if already_materialized:
+        seen[source] = source
+        return source
+
     name = os.path.basename(source)
     stem, ext = os.path.splitext(name)
-    candidate = os.path.join(asset_dir, name)
+    candidate = os.path.join(target_dir, name)
     counter = 1
     while os.path.exists(candidate):
         candidate = os.path.join(asset_dir, f"{stem}_{counter}{ext}")

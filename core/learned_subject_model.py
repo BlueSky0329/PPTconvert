@@ -10,8 +10,10 @@ from typing import Any, Iterable, Optional
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_MODEL_PATH = _ROOT / "data" / "models" / "subject_classifier.pkl"
+_TRUSTED_MODEL_DIR = _DEFAULT_MODEL_PATH.parent.resolve()
 _CACHE_KEY: tuple[str, float] | None = None
 _CACHE_BUNDLE: dict[str, Any] | None = None
+_ENABLE_MODEL_ENV = "PPTCONVERT_ENABLE_PICKLED_SUBJECT_MODEL"
 
 
 def _clean_text(parts: Iterable[str]) -> str:
@@ -91,6 +93,32 @@ class MetaFieldExtractor(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         return [dict((row or {}).get(self.field, {}) or {}) for row in X]
+
+
+def _is_default_model_path(path: Path) -> bool:
+    try:
+        return path.resolve() == _DEFAULT_MODEL_PATH.resolve()
+    except Exception:
+        return False
+
+
+def _pickle_model_loading_enabled(path: Path) -> bool:
+    configured = os.environ.get(_ENABLE_MODEL_ENV, "").strip().lower()
+    if configured in {"0", "false", "no"}:
+        return False
+    if configured in {"1", "true", "yes"}:
+        return True
+    return _is_default_model_path(path)
+
+
+def _is_trusted_model_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return False
+    if os.environ.get("PPTCONVERT_TRUST_SUBJECT_MODEL", "").strip() == "1":
+        return True
+    return resolved.parent == _TRUSTED_MODEL_DIR
 
 
 def default_model_path() -> Path:
@@ -181,6 +209,10 @@ def _load_bundle(model_path: Path | None = None) -> dict[str, Any] | None:
     global _CACHE_BUNDLE, _CACHE_KEY
     path = Path(model_path or default_model_path())
     if not path.exists():
+        return None
+    if not _pickle_model_loading_enabled(path):
+        return None
+    if not _is_trusted_model_path(path):
         return None
     key = (str(path.resolve()), path.stat().st_mtime)
     if _CACHE_KEY == key:

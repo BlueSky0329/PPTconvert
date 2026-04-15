@@ -1413,7 +1413,11 @@ def parse_material_body(
             )
         )
 
-    return MaterialUnit(header=header, intro_lines=intro, questions=questions)
+    return MaterialUnit(
+        header=_normalize_material_header_question_range(header, questions),
+        intro_lines=intro,
+        questions=questions,
+    )
 
 
 def _split_into_material_units(unit: MaterialUnit) -> list[MaterialUnit]:
@@ -1450,6 +1454,147 @@ def _split_into_material_units(unit: MaterialUnit) -> list[MaterialUnit]:
             chunk_questions[0].stem_lines = stem
         out.append(MaterialUnit(header=f"材料{label}", intro_lines=intro, questions=chunk_questions))
     return out
+
+
+_MATERIAL_CONTINUATION_ENDS = re.compile(r"[，,、；;：:—–\-]$")
+_MATERIAL_TABLE_HEADER = re.compile(
+    r"^\s*表\s*[一二三四五六七八九十\d1-9]|^\s*[（(]\s*单位\s*[：:)]|"
+    r"^\s*年\s*份\s*[|│]|^\s*项\s*目\s*[|│]|^\s*指\s*标\s*[|│]"
+)
+_TABLE_CONTINUATION_CHARS = frozenset("│|—─┼┤├┬┴┌┐└┘╔╗╚╝═║")
+_MATERIAL_QUESTION_RANGE = re.compile(
+    r"(回答\s*)(\d{1,3})(\s*[-—–~～至到]+\s*)(\d{1,3})(\s*题)"
+)
+
+
+def _material_intro_looks_truncated(intro_lines: list[RichLine]) -> bool:
+    """判断材料正文是否在跨页时被截断：句末是逗号/分号等非终结标点。"""
+    if not intro_lines:
+        return False
+    text_lines = [_rich_line_text_value(line) for line in intro_lines if _line_has_text(line)]
+    if not text_lines:
+        return False
+    last_text = text_lines[-1].rstrip()
+    if not last_text:
+        return False
+    if _MATERIAL_CONTINUATION_ENDS.search(last_text):
+        return True
+    if last_text[-1] not in "。！？!?.）)」》】":
+        if len(last_text) >= 8 and not _starts_new_question_line(last_text):
+            return True
+    return False
+
+
+def _looks_like_material_continuation_text(text: str) -> bool:
+    """判断文本行是否像是材料正文的续行（非题干、非选项、非标题）。"""
+    s = _nfkc((text or "").strip())
+    if not s:
+        return False
+    if _starts_new_question_line(s):
+        return False
+    if _has_option_markers_pdf(s):
+        return False
+    if _detect_subject_section_kind(s):
+        return False
+    if _is_other_section_title(s):
+        return False
+    if material_header_line(s) or generic_material_header_line(s):
+        return False
+    if len(s) >= 8:
+        return True
+    return bool(_TABLE_CONTINUATION_CHARS & set(s)) or bool(_MATERIAL_TABLE_HEADER.match(s))
+
+
+def _looks_like_table_continuation(intro_lines: list[RichLine], next_lines: list[RichLine]) -> bool:
+    """判断前后两组 intro 是否像被跨页拆断的同一张表格。"""
+    if not intro_lines or not next_lines:
+        return False
+    last_text = _rich_line_text_value(intro_lines[-1]) if _line_has_text(intro_lines[-1]) else ""
+    first_text = _rich_line_text_value(next_lines[0]) if _line_has_text(next_lines[0]) else ""
+    if _TABLE_CONTINUATION_CHARS & set(last_text) and _TABLE_CONTINUATION_CHARS & set(first_text):
+        return True
+    return False
+
+
+def _material_header_question_range(header: str) -> tuple[int, int] | None:
+    match = _MATERIAL_QUESTION_RANGE.search(_nfkc(header or ""))
+    if not match:
+        return None
+    start = int(match.group(2))
+    end = int(match.group(4))
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def _actual_question_range(questions: list[ExamQuestion]) -> tuple[int, int] | None:
+    numeric_numbers: list[int] = []
+    for question in questions:
+        text = str(getattr(question, "source_number", "") or "").strip()
+        if not text:
+            continue
+        try:
+            numeric_numbers.append(int(text))
+        except ValueError:
+            continue
+    if not numeric_numbers:
+        return None
+    return min(numeric_numbers), max(numeric_numbers)
+
+
+def _normalize_material_header_question_range(header: str, questions: list[ExamQuestion]) -> str:
+    actual_range = _actual_question_range(questions)
+    if actual_range is None:
+        return header
+    parsed_range = _material_header_question_range(header)
+    if parsed_range is None or parsed_range == actual_range:
+        return header
+    match = _MATERIAL_QUESTION_RANGE.search(header or "")
+    if not match:
+        return header
+    corrected = (
+        f"{match.group(1)}{actual_range[0]}{match.group(3)}{actual_range[1]}{match.group(5)}"
+    )
+    return f"{header[:match.start()]}{corrected}{header[match.end():]}"
+
+
+def _headers_indicate_distinct_material(prev: MaterialUnit, current: MaterialUnit) -> bool:
+    prev_range = _material_header_question_range(prev.header)
+    current_range = _material_header_question_range(current.header)
+    if prev_range and current_range and prev_range != current_range:
+        return True
+    return False
+
+
+def _merge_cross_page_material_units(materials: list[MaterialUnit]) -> list[MaterialUnit]:
+    """合并因跨页截断而被拆成相邻两个 MaterialUnit 的材料组。"""
+    if len(materials) <= 1:
+        return materials
+    merged: list[MaterialUnit] = [materials[0]]
+    for current in materials[1:]:
+        prev = merged[-1]
+        if _headers_indicate_distinct_material(prev, current):
+            merged.append(current)
+            continue
+        should_merge = False
+        if _material_intro_looks_truncated(prev.intro_lines) and current.intro_lines:
+            first_text = _rich_line_text_value(current.intro_lines[0]) if current.intro_lines else ""
+            if _looks_like_material_continuation_text(first_text):
+                should_merge = True
+        if not should_merge and _looks_like_table_continuation(prev.intro_lines, current.intro_lines):
+            should_merge = True
+        if not should_merge and not current.intro_lines and prev.questions and current.questions:
+            prev_last_q = prev.questions[-1]
+            prev_last_opts = [_rich_line_text_value(line) for line in prev_last_q.option_lines if _line_has_text(line)]
+            if len(prev_last_opts) < 2:
+                should_merge = True
+
+        if should_merge:
+            prev.intro_lines = list(prev.intro_lines) + list(current.intro_lines)
+            prev.questions.extend(current.questions)
+        else:
+            merged.append(current)
+    return merged
 
 
 def parse_material_block(
@@ -1773,11 +1918,16 @@ def _looks_like_standard_set_paper_sequence(questions: list[ExamQuestion]) -> bo
     numeric_numbers = [number for number in numeric_numbers if number is not None]
     if len(numeric_numbers) < 5:
         return False
-    min_number = min(numeric_numbers)
-    max_number = max(numeric_numbers)
-    if min_number > 5 or max_number < 60:
+    if numeric_numbers != sorted(numeric_numbers):
         return False
-    return _resolve_set_paper_objective_kinds(questions) is not None
+    min_number = min(numeric_numbers)
+    if min_number > 20:
+        return False
+    resolved = _resolve_set_paper_objective_kinds(questions)
+    if not resolved:
+        return False
+    distinct_kinds = {kind for kind in resolved if kind != "unknown"}
+    return len(distinct_kinds) >= 2
 
 
 def _append_adaptive_set_paper_objective_sections(
@@ -1861,13 +2011,17 @@ def _parse_whole_document_as_subject(
         if not material_blocks:
             unit = parse_material_body(items, body_start, len(items), "材料一")
             if unit:
-                for split_unit in _split_into_material_units(unit):
+                split_units = _split_into_material_units(unit)
+                for split_unit in _merge_cross_page_material_units(split_units):
                     sec.materials.append(split_unit)
         else:
+            raw_units: list[MaterialUnit] = []
             for m_start, m_next, header in material_blocks:
                 unit = parse_material_block(items, m_start, m_next, header=header)
                 if unit:
-                    sec.materials.append(unit)
+                    raw_units.append(unit)
+            for unit in _merge_cross_page_material_units(raw_units):
+                sec.materials.append(unit)
         if sec.materials:
             exam.data_sections.append(sec)
         return
@@ -2055,13 +2209,17 @@ def _append_data_section_from_body(
     if not material_blocks:
         unit = parse_material_body(items, body_start, body_end, "材料一")
         if unit:
-            for split_unit in _split_into_material_units(unit):
+            split_units = _split_into_material_units(unit)
+            for split_unit in _merge_cross_page_material_units(split_units):
                 sec.materials.append(split_unit)
     else:
+        raw_units: list[MaterialUnit] = []
         for m_start, m_next, header in material_blocks:
             unit = parse_material_block(items, m_start, m_next, header=header)
             if unit:
-                sec.materials.append(unit)
+                raw_units.append(unit)
+        for unit in _merge_cross_page_material_units(raw_units):
+            sec.materials.append(unit)
     if sec.materials:
         exam.data_sections.append(sec)
 

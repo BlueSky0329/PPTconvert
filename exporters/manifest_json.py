@@ -13,6 +13,7 @@ from domain.models import (
     PaperSource,
     QuestionNode,
     QuestionRange,
+    RepairLogEntry,
     ReviewIssue,
     Section,
 )
@@ -70,6 +71,7 @@ def _load_question(data: dict) -> QuestionNode:
     return QuestionNode(
         source_number=str(data.get("source_number") or ""),
         stem=str(data.get("stem") or ""),
+        question_id=str(data.get("question_id") or ""),
         options=[_load_option(item) for item in data.get("options", []) or []],
         stem_assets=[_load_asset_ref(item) for item in data.get("stem_assets", []) or []],
         answer=data.get("answer") or None,
@@ -99,6 +101,21 @@ def _load_question(data: dict) -> QuestionNode:
             else None
         ),
         inferred_signals=[str(value) for value in data.get("inferred_signals", []) or []],
+    )
+
+
+def _load_repair_log_entry(data: dict) -> RepairLogEntry:
+    return RepairLogEntry(
+        timestamp=str(data.get("timestamp") or ""),
+        source=str(data.get("source") or ""),
+        action=str(data.get("action") or ""),
+        question_id=str(data.get("question_id") or ""),
+        question_no=str(data.get("question_no") or ""),
+        section_kind=str(data.get("section_kind") or "unknown"),
+        material_id=str(data.get("material_id") or ""),
+        before_state=dict(data.get("before_state") or {}),
+        after_state=dict(data.get("after_state") or {}),
+        metadata=dict(data.get("metadata") or {}),
     )
 
 
@@ -154,6 +171,8 @@ def load_project_manifest_project(path: str) -> ExamProject:
         sections=[_load_section(item) for item in payload.get("sections", []) or []],
         selected_subjects=[str(value) for value in payload.get("selected_subjects", []) or []],
         selected_ranges=[_load_question_range(item) for item in payload.get("selected_ranges", []) or []],
+        repair_session_id=str(payload.get("repair_session_id") or ""),
+        repair_log=[_load_repair_log_entry(item) for item in payload.get("repair_log", []) or []],
     )
     has_review_metadata = any(
         bool(question.review_issues)

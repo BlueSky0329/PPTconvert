@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 import re
 from typing import Literal, Optional
 
 from core.project_quality import annotate_project_quality, is_flagged_question, question_review_summary
+from core.repair_action_model import RepairActionPrediction, predict_repair_action_distribution
+from core.repair_trajectory_model import TrajectoryPlan, build_rule_based_trajectory_plan, predict_trajectory_plan
 from core.subject_inference import infer_subject_diagnostics
 from domain.models import ExamProject, MaterialSet, OptionNode, QuestionNode, Section, SUBJECT_DISPLAY_NAMES
 from domain.project_editor import (
@@ -81,6 +84,20 @@ _DATA_ASK_MARKERS = (
     "不能推出的是",
     "以下哪项",
 )
+_REPAIR_ACTION_DISPLAY_NAMES = {
+    "move_data_assets_to_material": "图表回挂材料区",
+    "move_data_intro_back_to_material": "材料说明回挂材料区",
+    "move_spilled_option_back": "串出的选项归位",
+    "reassign_stem_image_to_options": "图片选项归位",
+    "renumber_current_question": "题号回正",
+    "split_embedded_next_question": "拆出嵌入的下一题",
+}
+_REPAIR_ACTION_FAMILY_DISPLAY_NAMES = {
+    "asset_repair": "图片归位",
+    "boundary_repair": "边界修复",
+    "material_repair": "材料修复",
+}
+_TRAJECTORY_ACTION_DISPLAY = _REPAIR_ACTION_DISPLAY_NAMES
 
 
 @dataclass
@@ -121,6 +138,163 @@ class AIRepairBatchSummary:
     structural_repairs: int = 0
     skipped_questions: int = 0
     errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RepairStrategySnapshot:
+    mode: str
+    action_prediction: RepairActionPrediction | None = None
+    family_prediction: RepairActionPrediction | None = None
+    trajectory_plan: TrajectoryPlan | None = None
+    priority_score: float = 0.0
+
+
+def _patch_action_candidates(patch: AIQuestionPatch) -> tuple[set[str], set[str]]:
+    actions: set[str] = set()
+    families: set[str] = set()
+    if (patch.source_number or "").strip():
+        actions.add("renumber_current_question")
+        families.add("boundary_repair")
+    if patch.prepend_material_body:
+        actions.add("move_data_intro_back_to_material")
+        families.add("material_repair")
+    if patch.move_stem_assets_to_material:
+        actions.add("move_data_assets_to_material")
+        families.add("material_repair")
+    if patch.reassign_stem_assets_to_options:
+        actions.add("reassign_stem_image_to_options")
+        families.add("asset_repair")
+    return actions, families
+
+
+def _format_policy_prediction(prediction: RepairActionPrediction | None) -> str:
+    if prediction is None or not prediction.best_label:
+        return ""
+    if prediction.label_field == "action_family":
+        label = _REPAIR_ACTION_FAMILY_DISPLAY_NAMES.get(prediction.best_label, prediction.best_label)
+    else:
+        label = _REPAIR_ACTION_DISPLAY_NAMES.get(prediction.best_label, prediction.best_label)
+    confidence = int(round(max(0.0, min(prediction.best_confidence, 1.0)) * 100))
+    return f"{label} {confidence}%"
+
+
+def _format_trajectory_plan(plan: TrajectoryPlan | None) -> str:
+    if plan is None or plan.is_empty:
+        return ""
+    parts: list[str] = []
+    for step in plan.steps[:3]:
+        label = _TRAJECTORY_ACTION_DISPLAY.get(step.action, step.action)
+        conf = int(round(max(0.0, min(step.confidence, 1.0)) * 100))
+        parts.append(f"{label}({conf}%)")
+    return "→".join(parts)
+
+
+def inspect_repair_strategy(
+    *,
+    section: Section,
+    material: MaterialSet | None,
+    question: QuestionNode,
+    previous_question: QuestionNode | None = None,
+    next_question: QuestionNode | None = None,
+    mode: str = "balanced",
+) -> RepairStrategySnapshot:
+    service = AIRepairService(mode=mode)
+    trajectory_plan = service._trajectory_plan(
+        section=section,
+        material=material,
+        question=question,
+        previous_question=previous_question,
+        next_question=next_question,
+    )
+    if service.mode != "policy":
+        priority_score = 0.0
+        if trajectory_plan is not None and not trajectory_plan.is_empty:
+            priority_score = trajectory_plan.primary_confidence
+        return RepairStrategySnapshot(
+            mode=service.mode,
+            trajectory_plan=trajectory_plan,
+            priority_score=priority_score,
+        )
+
+    action_prediction, family_prediction = service._policy_predictions(
+        section=section,
+        material=material,
+        question=question,
+        previous_question=previous_question,
+        next_question=next_question,
+    )
+    priority_score = service._policy_priority_score(
+        section=section,
+        material=material,
+        question=question,
+        previous_question=previous_question,
+        next_question=next_question,
+    )
+    return RepairStrategySnapshot(
+        mode=service.mode,
+        action_prediction=action_prediction,
+        family_prediction=family_prediction,
+        trajectory_plan=trajectory_plan,
+        priority_score=priority_score,
+    )
+
+
+def build_repair_strategy_summary(snapshot: RepairStrategySnapshot | None) -> str:
+    if snapshot is None:
+        return "修复策略会在这里显示。"
+    mode_label = "策略增强" if snapshot.mode == "policy" else "规则优先"
+    lines = [f"当前模式：{mode_label}"]
+    if snapshot.action_prediction is not None and snapshot.action_prediction.best_label:
+        lines.append(f"动作模型：{_format_policy_prediction(snapshot.action_prediction)}")
+    if snapshot.family_prediction is not None and snapshot.family_prediction.best_label:
+        lines.append(f"修复类型：{_format_policy_prediction(snapshot.family_prediction)}")
+    if snapshot.trajectory_plan is not None and not snapshot.trajectory_plan.is_empty:
+        prefix = "轨迹策略" if snapshot.mode == "policy" else "规则轨迹"
+        lines.append(f"{prefix}：{_format_trajectory_plan(snapshot.trajectory_plan)}")
+    else:
+        prefix = "轨迹策略" if snapshot.mode == "policy" else "规则轨迹"
+        lines.append(f"{prefix}：当前没有明显的多步修复线索")
+    if snapshot.priority_score > 0:
+        lines.append(f"优先级分：{snapshot.priority_score:.2f}")
+    return "\n".join(lines)
+
+
+def _patch_with_policy_hint(
+    patch: AIQuestionPatch,
+    *,
+    action_prediction: RepairActionPrediction | None,
+    family_prediction: RepairActionPrediction | None,
+    trajectory_plan: TrajectoryPlan | None = None,
+) -> AIQuestionPatch:
+    hints: list[str] = []
+    action_candidates, family_candidates = _patch_action_candidates(patch)
+    if action_prediction and action_prediction.best_label in action_candidates:
+        patch.confidence = max(patch.confidence, min(0.98, action_prediction.best_confidence))
+        hints.append(f"策略模型支持 {_format_policy_prediction(action_prediction)}")
+    elif family_prediction and family_prediction.best_label in family_candidates:
+        patch.confidence = max(patch.confidence, min(0.96, family_prediction.best_confidence))
+        hints.append(f"策略模型支持 {_format_policy_prediction(family_prediction)}")
+    elif family_prediction and family_prediction.best_confidence >= 0.7:
+        hints.append(f"策略模型更像 {_format_policy_prediction(family_prediction)}")
+
+    # 轨迹策略模型加成
+    if trajectory_plan is not None and not trajectory_plan.is_empty:
+        primary = trajectory_plan.primary_action
+        if primary and primary in action_candidates:
+            patch.confidence = max(patch.confidence, min(0.97, trajectory_plan.primary_confidence))
+            traj_desc = _format_trajectory_plan(trajectory_plan)
+            hints.append(f"轨迹策略 {traj_desc}")
+        elif primary:
+            traj_desc = _format_trajectory_plan(trajectory_plan)
+            hints.append(f"轨迹建议 {traj_desc}")
+
+    if hints:
+        base_summary = (patch.summary or "").strip()
+        if base_summary:
+            patch.summary = base_summary + "；" + "；".join(hints[:3])
+        else:
+            patch.summary = "；".join(hints[:3])
+    return patch
 
 
 def _find_option(question: QuestionNode, letter: str):
@@ -1152,25 +1326,31 @@ def repair_question_boundary(
     material: MaterialSet | None,
     question: QuestionNode,
 ) -> tuple[int, str]:
-    previous_question, next_question = _neighbor_questions(section, material, question)
     total_changes = 0
     reasons: list[str] = []
-    for changes, reason in (
-        repair_missing_question_before_current(project, previous_question, question),
-        repair_missing_question_from_previous_stem(project, previous_question, question),
-        repair_missing_question_from_previous_option(project, previous_question, question),
-        repair_number_gap_from_stem(previous_question, question),
-        repair_spilled_boundary_between_questions(previous_question, question),
-        repair_missing_question_after_current_from_stem(project, question, next_question),
-        repair_missing_question_after_current_from_option(project, question, next_question),
-        repair_prompt_contamination_between_questions(question, next_question),
-        repair_embedded_next_question_between_questions(question, next_question),
-        repair_embedded_next_question_from_options(question, next_question),
-    ):
+
+    def _apply_step(step):
+        nonlocal total_changes
+        previous_question, next_question = _neighbor_questions(section, material, question)
+        changes, reason = step(previous_question, next_question)
         if changes > 0:
             total_changes += changes
             if reason:
                 reasons.append(reason)
+
+    for step in (
+        lambda previous_question, _next_question: repair_missing_question_before_current(project, previous_question, question),
+        lambda previous_question, _next_question: repair_missing_question_from_previous_stem(project, previous_question, question),
+        lambda previous_question, _next_question: repair_missing_question_from_previous_option(project, previous_question, question),
+        lambda previous_question, _next_question: repair_number_gap_from_stem(previous_question, question),
+        lambda previous_question, _next_question: repair_spilled_boundary_between_questions(previous_question, question),
+        lambda _previous_question, next_question: repair_missing_question_after_current_from_stem(project, question, next_question),
+        lambda _previous_question, next_question: repair_missing_question_after_current_from_option(project, question, next_question),
+        lambda _previous_question, next_question: repair_prompt_contamination_between_questions(question, next_question),
+        lambda _previous_question, next_question: repair_embedded_next_question_between_questions(question, next_question),
+        lambda _previous_question, next_question: repair_embedded_next_question_from_options(question, next_question),
+    ):
+        _apply_step(step)
     return total_changes, "；".join(reasons)
 
 
@@ -1386,7 +1566,120 @@ class AIRepairService:
     """本地低阶 AI 修复器：规则 + 打分 + 结构化补丁。"""
 
     def __init__(self, *, mode: str = "balanced") -> None:
-        self.mode = (mode or "balanced").strip().lower() or "balanced"
+        configured_mode = (mode or os.environ.get("PPTCONVERT_AI_REPAIR_MODE", "balanced")).strip().lower()
+        self.mode = configured_mode or "balanced"
+
+    def _policy_predictions(
+        self,
+        *,
+        section: Section,
+        material: MaterialSet | None,
+        question: QuestionNode,
+        previous_question: QuestionNode | None = None,
+        next_question: QuestionNode | None = None,
+    ) -> tuple[RepairActionPrediction | None, RepairActionPrediction | None]:
+        family_prediction = predict_repair_action_distribution(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+            label_field="action_family",
+        )
+        action_prediction = predict_repair_action_distribution(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+            label_field="action",
+        )
+        return action_prediction, family_prediction
+
+    def _trajectory_plan(
+        self,
+        *,
+        section: Section,
+        material: MaterialSet | None,
+        question: QuestionNode,
+        previous_question: QuestionNode | None = None,
+        next_question: QuestionNode | None = None,
+    ) -> TrajectoryPlan | None:
+        plan = predict_trajectory_plan(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+        if plan is not None:
+            return plan
+        return build_rule_based_trajectory_plan(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+
+    def _policy_priority_score(
+        self,
+        *,
+        section: Section,
+        material: MaterialSet | None,
+        question: QuestionNode,
+        previous_question: QuestionNode | None = None,
+        next_question: QuestionNode | None = None,
+    ) -> float:
+        issues = getattr(question, "review_issues", []) or []
+        score = max(0.0, 1.0 - float(getattr(question, "review_confidence", 1.0) or 1.0))
+        score += 0.28 * sum(1 for issue in issues if issue.severity == "error")
+        score += 0.1 * sum(1 for issue in issues if issue.severity == "warning")
+        action_prediction, family_prediction = self._policy_predictions(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+        if family_prediction is not None and family_prediction.best_label:
+            family_boost = 0.95 if family_prediction.best_label in {"material_repair", "asset_repair"} else 0.7
+            score += family_prediction.best_confidence * family_boost
+        if action_prediction is not None and action_prediction.best_label in _REPAIR_ACTION_DISPLAY_NAMES:
+            score += action_prediction.best_confidence * 0.45
+        # 轨迹策略得分加成
+        traj_plan = self._trajectory_plan(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+        if traj_plan is not None and not traj_plan.is_empty:
+            score += traj_plan.primary_confidence * 0.35
+            score += 0.1 * min(len(traj_plan.steps) - 1, 2)
+        return score
+
+    def prioritize_candidate_rows(
+        self,
+        rows: list[tuple[Section, MaterialSet | None, QuestionNode]],
+    ) -> list[tuple[Section, MaterialSet | None, QuestionNode]]:
+        if self.mode != "policy" or len(rows) < 2:
+            return rows
+        scored_rows: list[tuple[float, tuple[Section, MaterialSet | None, QuestionNode]]] = []
+        for row in rows:
+            section, material, question = row
+            previous_question, next_question = _neighbor_questions(section, material, question)
+            score = self._policy_priority_score(
+                section=section,
+                material=material,
+                question=question,
+                previous_question=previous_question,
+                next_question=next_question,
+            )
+            scored_rows.append((score, row))
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        return [row for _score, row in scored_rows]
 
     def repair_question(
         self,
@@ -1404,6 +1697,27 @@ class AIRepairService:
             previous_question=previous_question,
             next_question=next_question,
         )
+        if self.mode == "policy":
+            action_prediction, family_prediction = self._policy_predictions(
+                section=section,
+                material=material,
+                question=question,
+                previous_question=previous_question,
+                next_question=next_question,
+            )
+            traj_plan = self._trajectory_plan(
+                section=section,
+                material=material,
+                question=question,
+                previous_question=previous_question,
+                next_question=next_question,
+            )
+            patch = _patch_with_policy_hint(
+                patch,
+                action_prediction=action_prediction,
+                family_prediction=family_prediction,
+                trajectory_plan=traj_plan,
+            )
         return AIRepairResult(question_number=question.source_number or "-", patch=patch)
 
 
@@ -1514,8 +1828,7 @@ def repair_project_questions(
         if only_flagged and not is_flagged_question(question):
             continue
         candidate_rows.append((section, material, question))
-        if len(candidate_rows) >= target_limit:
-            break
+    candidate_rows = service.prioritize_candidate_rows(candidate_rows)[:target_limit]
 
     for section, material, question in candidate_rows:
         summary.attempted_questions += 1

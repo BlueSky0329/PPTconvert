@@ -39,7 +39,7 @@ python -m unittest tests.test_pdf_exam_extract tests.test_pdf_exam_parse tests.t
 
 ```powershell
 git status
-git add .
+git add core\some_file.py gui\app.py tests\test_xxx.py
 git commit -m "feat: describe your change"
 git push origin main
 ```
@@ -48,10 +48,19 @@ git push origin main
 
 ```powershell
 git checkout -b feat/your-topic
-git add .
+git add docs\STATUS.md scripts\train_local_subject_model.py
 git commit -m "feat: describe your change"
 git push -u origin feat/your-topic
 ```
+
+更推荐在暂存前先看一次改动范围：
+
+```powershell
+git status --short --ignored
+git diff --stat
+```
+
+如果这次同时动了源码、文档和实验脚本，建议拆成多次提交，避免一次提交混进大量无关文件。
 
 ## 提交信息建议
 
@@ -73,10 +82,11 @@ git push -u origin feat/your-topic
 推送前确认：
 
 1. `git status` 中没有误加入的本地试卷或导出文件
-2. `__pycache__/`、`.pytest_cache/`、`.mypy_cache/` 等本地缓存已清理
-3. README、[docs/STATUS.md](C:/Users/17679/Desktop/PPTconvert/docs/STATUS.md)、[docs/ARCHITECTURE.md](C:/Users/17679/Desktop/PPTconvert/docs/ARCHITECTURE.md) 与当前行为一致
-4. 测试已通过
-5. 大改动有对应测试
+2. `git status --ignored --short` 中没有需要补进 `.gitignore` 的新缓存或临时文件
+3. `__pycache__/`、`.pytest_cache/`、`.mypy_cache/`、`.ruff_cache/` 等本地缓存已清理
+4. README、[docs/STATUS.md](C:/Users/17679/Desktop/PPTconvert/docs/STATUS.md)、[docs/ARCHITECTURE.md](C:/Users/17679/Desktop/PPTconvert/docs/ARCHITECTURE.md) 与当前行为一致
+5. 测试已通过
+6. 大改动有对应测试
 
 ## 建议的整理动作
 

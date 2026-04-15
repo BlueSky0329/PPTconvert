@@ -1,9 +1,18 @@
 import unittest
+from pathlib import Path
+import tempfile
+from unittest.mock import patch
+
+from PIL import Image, ImageDraw
 
 from core.pdf_exam_extract import (
+    _is_background_like_image_block,
     _is_decorative_image_block,
     _is_decorative_text_line,
+    _is_learned_noise_image_block,
     _is_noise_text_line,
+    _is_watermark_like_image_block,
+    _should_drop_text_line_record,
     _merge_page_image_blocks,
     _order_page_blocks,
     segments_to_lines,
@@ -70,6 +79,12 @@ class PdfExamExtractTest(unittest.TestCase):
 
         self.assertTrue(_is_decorative_image_block(page, block))
 
+    def test_large_content_image_is_not_filtered_by_size_only(self):
+        page = _DummyPage(width=600, height=800)
+        block = _image_block("figure", 24, 108, 576, 742)
+
+        self.assertFalse(_is_decorative_image_block(page, block))
+
     def test_centered_footer_page_number_is_filtered(self):
         page = _DummyPage(width=600, height=800)
         line = {
@@ -91,6 +106,50 @@ class PdfExamExtractTest(unittest.TestCase):
 
         self.assertTrue(_is_decorative_text_line(page, line, "扫"))
 
+    def test_learned_noise_model_can_filter_suspicious_top_line(self):
+        record = {
+            "text": "资料领取请加v信资料库",
+            "page_number": 1,
+            "page_width": 600.0,
+            "page_height": 800.0,
+            "x0": 40.0,
+            "y0": 16.0,
+            "x1": 260.0,
+            "y1": 30.0,
+            "line_index_in_block": 0,
+            "line_count_in_block": 1,
+        }
+
+        with patch(
+            "core.pdf_exam_extract.predict_pdf_noise_distribution",
+            return_value=type(
+                "Prediction",
+                (),
+                {"best_label": "noise", "best_confidence": 0.97},
+            )(),
+        ):
+            self.assertTrue(_should_drop_text_line_record(record))
+
+    def test_middle_body_line_is_not_filtered_by_learned_noise_model_candidate_gate(self):
+        record = {
+            "text": "根据上述材料，下列说法正确的是",
+            "page_number": 1,
+            "page_width": 600.0,
+            "page_height": 800.0,
+            "x0": 72.0,
+            "y0": 220.0,
+            "x1": 420.0,
+            "y1": 242.0,
+            "line_index_in_block": 0,
+            "line_count_in_block": 1,
+        }
+
+        with patch(
+            "core.pdf_exam_extract.predict_pdf_noise_distribution",
+            side_effect=AssertionError("正文中段不该触发噪声模型"),
+        ):
+            self.assertFalse(_should_drop_text_line_record(record))
+
     def test_top_banner_and_corner_qr_images_are_filtered(self):
         page = _DummyPage(width=596, height=842)
         top_banner = _image_block("banner", 11.9, 0.0, 583.4, 68.5)
@@ -100,6 +159,87 @@ class PdfExamExtractTest(unittest.TestCase):
         self.assertTrue(_is_decorative_image_block(page, top_banner))
         self.assertTrue(_is_decorative_image_block(page, qr))
         self.assertTrue(_is_decorative_image_block(page, logo))
+
+    def test_learned_noise_model_can_filter_suspicious_top_image(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("candidate", 120.0, 24.0, 430.0, 120.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "candidate.png"
+            Image.new("RGB", (96, 32), color="white").save(image_path)
+            with patch(
+                "core.pdf_exam_extract.predict_pdf_noise_image_distribution",
+                return_value=type(
+                    "Prediction",
+                    (),
+                    {"best_label": "noise", "best_confidence": 0.98},
+                )(),
+            ):
+                self.assertTrue(_is_learned_noise_image_block(page, block, str(image_path), page_number=1))
+
+    def test_blank_full_page_background_image_is_filtered(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("background", 0.0, 90.0, 596.0, 782.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "background.png"
+            Image.new("RGB", (595, 692), color="black").save(image_path)
+            self.assertTrue(_is_background_like_image_block(page, block, str(image_path), page_number=1))
+
+    def test_high_contrast_full_page_figure_is_not_filtered_as_background(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("figure", 12.0, 94.0, 584.0, 770.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "figure.png"
+            image = Image.new("RGB", (256, 256), color="white")
+            for x in range(0, 256, 16):
+                for y in range(0, 256, 16):
+                    if (x // 16 + y // 16) % 2 == 0:
+                        for dx in range(16):
+                            for dy in range(16):
+                                image.putpixel((x + dx, y + dy), (0, 0, 0))
+            image.save(image_path)
+            self.assertFalse(_is_background_like_image_block(page, block, str(image_path), page_number=1))
+
+    def test_faint_full_page_watermark_image_is_filtered(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("watermark", 8.0, 92.0, 588.0, 782.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "watermark.png"
+            image = Image.new("RGB", (256, 256), color=(248, 248, 248))
+            draw = ImageDraw.Draw(image)
+            for offset in range(-80, 280, 28):
+                draw.line((offset, 0, offset + 120, 256), fill=(212, 212, 212), width=6)
+            image.save(image_path)
+            self.assertTrue(_is_watermark_like_image_block(page, block, str(image_path), page_number=1))
+
+    def test_page_scan_like_full_page_image_is_not_filtered_as_watermark(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("scan", 0.0, 90.0, 596.0, 782.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "scan.png"
+            image = Image.new("RGB", (256, 256), color="white")
+            draw = ImageDraw.Draw(image)
+            for y in range(24, 232, 18):
+                draw.rectangle((18, y, 228, y + 3), fill=(0, 0, 0))
+            image.save(image_path)
+            self.assertFalse(_is_watermark_like_image_block(page, block, str(image_path), page_number=1))
+
+    def test_middle_content_image_does_not_trigger_image_noise_model(self):
+        page = _DummyPage(width=596, height=842)
+        block = _image_block("figure", 88.0, 220.0, 512.0, 600.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "figure.png"
+            Image.new("RGB", (160, 160), color="white").save(image_path)
+            with patch(
+                "core.pdf_exam_extract.predict_pdf_noise_image_distribution",
+                side_effect=AssertionError("正文主图不该触发图片噪声模型"),
+            ):
+                self.assertFalse(_is_learned_noise_image_block(page, block, str(image_path), page_number=1))
 
     def test_segments_to_lines_strips_scan_ad_sequence(self):
         segments = [

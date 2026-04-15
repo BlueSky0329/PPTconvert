@@ -7,8 +7,17 @@ __pycache__/
 *.spec.bak
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.ipynb_checkpoints/
+*.egg-info/
+pip-wheel-metadata/
 .coverage
+.coverage.*
 *.log
+*.orig
+*.rej
 
 # IDE / 系统
 .idea/

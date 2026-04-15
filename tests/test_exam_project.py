@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+import tempfile
 import unittest
 
 from core.pdf_exam_extract import ExtractedImageRegion
@@ -15,7 +18,7 @@ from core.pdf_exam_models import (
 from domain.selectors import parse_question_ranges, select_project
 from exporters.pptx_slides import iter_project_question_nodes, project_to_ppt_questions
 from ingest.pdf.layout import PageTextLine
-from ingest.pdf.project_builder import build_project_from_parsed_exam
+from ingest.pdf.project_builder import _copy_asset, build_project_from_parsed_exam
 
 
 def _text_line(text: str) -> RichLine:
@@ -27,6 +30,16 @@ def _image_line(path: str) -> RichLine:
 
 
 class ExamProjectTest(unittest.TestCase):
+    def test_copy_asset_reuses_files_already_in_target_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            asset_path = Path(temp_dir) / "chart.png"
+            asset_path.write_bytes(b"fake-image")
+
+            copied_path = _copy_asset(str(asset_path), temp_dir, {})
+
+            self.assertEqual(copied_path, str(asset_path))
+            self.assertEqual(sorted(os.listdir(temp_dir)), ["chart.png"])
+
     def test_build_project_from_parsed_exam_includes_general_subjects(self):
         exam = ParsedExam(
             politics_sections=[

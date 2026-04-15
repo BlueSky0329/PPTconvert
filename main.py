@@ -15,7 +15,7 @@ def maybe_run_ai_repair(args, project) -> None:
 
     from core.ai_repair import AIRepairService, repair_project_questions
 
-    service = AIRepairService()
+    service = AIRepairService(mode=getattr(args, "ai_mode", "balanced"))
 
     summary = repair_project_questions(
         project,
@@ -41,6 +41,14 @@ def run_gui():
 
     app = PPTConvertApp()
     app.run()
+
+
+def _print_ocr_diagnostic_report(report) -> None:
+    print(f"OCR诊断：{report.summary_text()}")
+    for issue in report.issues[:4]:
+        print(f"  - {issue.title}：{issue.detail}")
+    for suggestion in report.suggestions[:3]:
+        print(f"  * 建议：{suggestion}")
 
 
 def run_cli(args):
@@ -114,10 +122,16 @@ def run_cli(args):
 
 
 def run_pdf_workflow(args):
+    from core.ai_repair import AIRepairService
+    from core.pdf_ocr_diagnostics import (
+        auto_repair_ocr_project,
+        diagnose_project_ocr_risks,
+        write_ocr_diagnostic_report,
+    )
     from core.project_quality import annotate_project_quality
     from core.ppt_generator import PPTConfig
     from pptx.util import Pt
-    from workflows.project_flow import process_pdf_project
+    from workflows.project_flow import build_pdf_project, export_project_outputs
 
     if not os.path.exists(args.pdf_input):
         print(f"错误：文件不存在 - {args.pdf_input}")
@@ -142,21 +156,55 @@ def run_pdf_workflow(args):
 
     document_subject_hint = None if args.document_subject == "auto" else args.document_subject
     print(f"正在导入 PDF：{args.pdf_input}")
-    project, outputs = process_pdf_project(
+    project, asset_dir = build_pdf_project(
         args.pdf_input,
         mode=args.subject,
         question_range_spec=args.question_range or "",
+        document_subject_hint=document_subject_hint,
+    )
+    quality = annotate_project_quality(project)
+
+    ocr_report = None
+    ocr_diagnose = bool(getattr(args, "ocr_diagnose", False))
+    ocr_diagnose_json = getattr(args, "ocr_diagnose_json", None)
+    ocr_auto_repair = bool(getattr(args, "ocr_auto_repair", False))
+
+    if ocr_diagnose or ocr_diagnose_json or ocr_auto_repair:
+        ocr_report = diagnose_project_ocr_risks(project, pdf_path=args.pdf_input)
+        _print_ocr_diagnostic_report(ocr_report)
+        if ocr_diagnose_json:
+            report_path = write_ocr_diagnostic_report(ocr_report, ocr_diagnose_json)
+            print(f"OCR诊断 JSON：{report_path}")
+
+    if ocr_auto_repair:
+        ocr_summary = auto_repair_ocr_project(
+            project,
+            pdf_path=args.pdf_input,
+            service=AIRepairService(mode=args.ai_mode),
+            only_flagged=not getattr(args, "ai_all_questions", False),
+            limit=args.ai_limit,
+        )
+        print(f"OCR自动修补：{ocr_summary.summary_text()}")
+        if ocr_diagnose_json:
+            repair_report_path = write_ocr_diagnostic_report(
+                ocr_summary,
+                os.path.splitext(ocr_diagnose_json)[0] + ".repair.json",
+            )
+            print(f"OCR自动修补 JSON：{repair_report_path}")
+    elif getattr(args, "ai_repair", False):
+        maybe_run_ai_repair(args, project)
+
+    quality = annotate_project_quality(project)
+
+    outputs = export_project_outputs(
+        project,
+        asset_dir=asset_dir,
         docx_output=docx_output,
         ppt_output=ppt_output,
         manifest_output=manifest_output,
         template_path=args.template or None,
         ppt_config=ppt_config,
-        document_subject_hint=document_subject_hint,
     )
-    quality = annotate_project_quality(project)
-
-    maybe_run_ai_repair(args, project)
-    quality = annotate_project_quality(project)
 
     print(f"共整理到 {project.question_count} 道题目")
     print(
@@ -240,6 +288,26 @@ def main():
         "--ai-all-questions",
         action="store_true",
         help="默认只修复 AI 质检标出的待确认题；启用后对当前工程里的所有题尝试 AI 修复",
+    )
+    arg_parser.add_argument(
+        "--ai-mode",
+        choices=["balanced", "policy"],
+        default=os.environ.get("PPTCONVERT_AI_REPAIR_MODE", "balanced"),
+        help="AI 修复策略：balanced 为纯规则优先，policy 会在规则之外叠加 learned repair policy 的排序与提示",
+    )
+    arg_parser.add_argument(
+        "--ocr-diagnose",
+        action="store_true",
+        help="对当前 PDF 工程做扫描/OCR 风险诊断，输出摘要到命令行",
+    )
+    arg_parser.add_argument(
+        "--ocr-diagnose-json",
+        help="把扫描/OCR 诊断结果写成 JSON；若同时启用 --ocr-auto-repair，会额外输出一份 .repair.json",
+    )
+    arg_parser.add_argument(
+        "--ocr-auto-repair",
+        action="store_true",
+        help="先做扫描/OCR 诊断，再执行 OCR 场景下的自动修补（科目纠偏 + AI 修复）",
     )
 
     args = arg_parser.parse_args()

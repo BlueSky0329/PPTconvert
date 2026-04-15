@@ -52,6 +52,7 @@ def _fallback_rows_from_pdf(
             "source_pdf": source_pdf,
             "source_form": source_form,
             "subject": forced_subject,
+            "label_source": "catalog_subject",
             "question_no": question.source_number,
             "stem": stem,
             "options": option_texts,
@@ -67,14 +68,71 @@ def _fallback_rows_from_pdf(
         }
 
 
-def _iter_project_rows(project, source_pdf: str, source_form: str, forced_subject: str | None):
+def _expand_range_specs(range_specs: Iterable[str]) -> dict[str, str]:
+    expanded: dict[str, str] = {}
+    for item in range_specs:
+        spec = str(item or "").strip()
+        if not spec:
+            continue
+        if "-" in spec:
+            start_text, end_text = spec.split("-", 1)
+            try:
+                start = int(start_text.strip())
+                end = int(end_text.strip())
+            except ValueError:
+                continue
+            if end < start:
+                start, end = end, start
+            for number in range(start, end + 1):
+                expanded[str(number)] = ""
+        else:
+            try:
+                expanded[str(int(spec))] = ""
+            except ValueError:
+                continue
+    return expanded
+
+
+def _catalog_subject_map(entry: dict[str, Any]) -> dict[str, str]:
+    subject_by_number: dict[str, str] = {}
+    sections = entry.get("sections") or {}
+    if not isinstance(sections, dict):
+        return {}
+    for subject, range_specs in sections.items():
+        expanded = _expand_range_specs(range_specs or [])
+        for number in expanded:
+            subject_by_number[number] = str(subject)
+    return subject_by_number
+
+
+def _catalog_subject_hint(entry: dict[str, Any]) -> str | None:
+    if str(entry.get("form", "")).strip() != "single_subject_book":
+        return None
+    subject = str(entry.get("subject", "")).strip()
+    return subject or None
+
+
+def _iter_project_rows(
+    project,
+    source_pdf: str,
+    source_form: str,
+    forced_subject: str | None,
+    explicit_subjects: dict[str, str] | None = None,
+):
     for section in project.sections:
         if section.kind == "data":
             for material in section.material_sets:
-                subject = forced_subject or "data"
                 material_text = _material_body_text(material)
                 material_images = len(material.body_assets)
                 for question in material.questions:
+                    if explicit_subjects:
+                        subject = explicit_subjects.get(str(question.source_number or "").strip())
+                        if not subject:
+                            continue
+                        label_source = "catalog_section_ranges"
+                    else:
+                        subject = forced_subject or "data"
+                        label_source = "catalog_subject" if forced_subject else "parsed_section"
                     option_texts = [option.text for option in question.options]
                     image_count = len(question.stem_assets) + material_images + sum(
                         1 for option in question.options if option.image_path
@@ -83,6 +141,7 @@ def _iter_project_rows(project, source_pdf: str, source_form: str, forced_subjec
                         "source_pdf": source_pdf,
                         "source_form": source_form,
                         "subject": subject,
+                        "label_source": label_source,
                         "question_no": question.source_number,
                         "stem": question.stem,
                         "options": option_texts,
@@ -99,16 +158,24 @@ def _iter_project_rows(project, source_pdf: str, source_form: str, forced_subjec
                         ),
                     }
         else:
-            subject = forced_subject or section.kind
-            if subject == "unknown":
-                continue
             for question in section.questions:
+                if explicit_subjects:
+                    subject = explicit_subjects.get(str(question.source_number or "").strip())
+                    if not subject:
+                        continue
+                    label_source = "catalog_section_ranges"
+                else:
+                    subject = forced_subject or section.kind
+                    label_source = "catalog_subject" if forced_subject else "parsed_section"
+                if subject == "unknown":
+                    continue
                 option_texts = [option.text for option in question.options]
                 image_count = len(question.stem_assets) + sum(1 for option in question.options if option.image_path)
                 yield {
                     "source_pdf": source_pdf,
                     "source_form": source_form,
                     "subject": subject,
+                    "label_source": label_source,
                     "question_no": question.source_number,
                     "stem": question.stem,
                     "options": option_texts,
@@ -124,21 +191,34 @@ def _iter_project_rows(project, source_pdf: str, source_form: str, forced_subjec
                 }
 
 
-def build_dataset(catalog_path: Path, output_path: Path) -> dict[str, Any]:
+def build_dataset(catalog_path: Path, output_path: Path, *, forms: set[str] | None = None) -> dict[str, Any]:
     catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     rows: list[dict[str, Any]] = []
     subject_counter: Counter[str] = Counter()
     pdf_counter: Counter[str] = Counter()
 
     for entry in catalog.get("pdfs", []) or []:
+        source_form = str(entry.get("form", "unknown")).strip() or "unknown"
+        if forms and source_form not in forms:
+            continue
         rel_path = Path(str(entry.get("path", "")))
         pdf_path = ROOT / rel_path
         if not pdf_path.exists():
             continue
-        project = build_exam_project_from_pdf(str(pdf_path), mode="all")
+        project = build_exam_project_from_pdf(
+            str(pdf_path),
+            mode="all",
+            document_subject_hint=_catalog_subject_hint(entry),
+        )
         forced_subject = str(entry.get("subject", "")).strip() or None
-        source_form = str(entry.get("form", "unknown")).strip() or "unknown"
-        row_iter = _iter_project_rows(project, rel_path.as_posix(), source_form, forced_subject)
+        explicit_subjects = _catalog_subject_map(entry)
+        row_iter = _iter_project_rows(
+            project,
+            rel_path.as_posix(),
+            source_form,
+            forced_subject,
+            explicit_subjects=explicit_subjects or None,
+        )
         emitted = False
         for row in row_iter:
             rows.append(row)
@@ -178,9 +258,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="从金标准 PDF 语料构建科目分类训练集")
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--forms",
+        nargs="*",
+        default=None,
+        help="仅构建指定来源 form 的样本，例如：single_subject_book set_paper",
+    )
     args = parser.parse_args()
 
-    summary = build_dataset(args.catalog, args.output)
+    forms = {str(item).strip() for item in (args.forms or []) if str(item).strip()} or None
+    summary = build_dataset(args.catalog, args.output, forms=forms)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

@@ -23,6 +23,13 @@ class SubjectInferenceTest(unittest.TestCase):
         self.assertEqual(profile.form, "single_subject_book")
         self.assertEqual(profile.subject_hint, "data")
 
+    def test_infer_pdf_filename_profile_detects_politics_subject_book(self):
+        profile = infer_pdf_filename_profile("政治理论题本.pdf")
+
+        self.assertEqual(profile.form, "single_subject_book")
+        self.assertEqual(profile.subject_hint, "politics")
+        self.assertGreaterEqual(profile.confidence, 0.82)
+
     def test_infer_pdf_filename_profile_detects_set_paper(self):
         profile = infer_pdf_filename_profile("模拟卷十一.pdf")
 

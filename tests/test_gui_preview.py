@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 from core.project_quality import annotate_project_quality
 from domain.models import ExamProject, OptionNode, QuestionNode, Section
@@ -65,6 +66,25 @@ class GuiPreviewBehaviorTest(unittest.TestCase):
         annotate_project_quality(project)
         return project
 
+    def _select_first_question(self, project: ExamProject):
+        self.app._populate_pdf_preview(project)
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        section_item = self.app.pdf_tree.get_children()[0]
+        question_item = next(
+            child
+            for child in self.app.pdf_tree.get_children(section_item)
+            if self.app._pdf_preview_payloads.get(child, {}).get("kind") == "question"
+        )
+
+        self.app.pdf_tree.selection_set(question_item)
+        self.app.pdf_tree.focus(question_item)
+        self.app._on_pdf_preview_select()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+        return project.sections[0].questions[0]
+
     def test_structure_question_selection_keeps_structure_tab_active(self):
         project = self._build_flagged_project()
         self.app._populate_pdf_preview(project)
@@ -87,6 +107,27 @@ class GuiPreviewBehaviorTest(unittest.TestCase):
         self.assertEqual(self._current_left_tab(), "structure")
         self.assertEqual(self.app._selected_pdf_item_id(), question_item)
 
+    def test_structure_question_selection_syncs_slide_selection(self):
+        project = self._build_flagged_project()
+        self.app._populate_pdf_preview(project)
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        section_item = self.app.pdf_tree.get_children()[0]
+        question_item = next(
+            child
+            for child in self.app.pdf_tree.get_children(section_item)
+            if self.app._pdf_preview_payloads.get(child, {}).get("kind") == "question"
+        )
+
+        self.app.pdf_tree.selection_set(question_item)
+        self.app.pdf_tree.focus(question_item)
+        self.app._on_pdf_preview_select()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        self.assertEqual(self.app._selected_pdf_slide_payload_id(), question_item)
+
     def test_ai_suggestion_mentions_explicit_subject_name(self):
         project = self._build_flagged_project()
         self.app._populate_pdf_preview(project)
@@ -102,6 +143,65 @@ class GuiPreviewBehaviorTest(unittest.TestCase):
 
         suggestion = self.app._pdf_ai_suggestion_var.get()
         self.assertIn("判断推理", suggestion)
+
+    def test_ai_strategy_box_shows_rule_mode_summary(self):
+        project = self._build_flagged_project()
+        self.app._populate_pdf_preview(project)
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        review_item = self.app._pdf_review_tree.get_children()[0]
+        self.app._pdf_review_tree.selection_set(review_item)
+        self.app._pdf_review_tree.focus(review_item)
+        self.app._on_pdf_review_select()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        strategy = self.app._pdf_ai_strategy_var.get()
+        self.assertIn("当前模式：规则优先", strategy)
+        self.assertIn("轨迹", strategy)
+
+    def test_ocr_buttons_are_enabled_after_project_load(self):
+        project = self._build_flagged_project()
+        self.app._populate_pdf_preview(project)
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        self.assertEqual(str(self.app._pdf_ocr_diagnose_btn.cget("state")), "normal")
+        self.assertEqual(str(self.app._pdf_ocr_repair_btn.cget("state")), "normal")
+
+    def test_stem_focusout_records_original_text_in_repair_log(self):
+        project = self._build_flagged_project()
+        question = self._select_first_question(project)
+
+        self.app._pdf_question_stem_editor.delete("1.0", "end")
+        self.app._pdf_question_stem_editor.insert("1.0", "新的题干")
+        self.app._on_pdf_question_stem_change()
+        self.app._on_pdf_question_stem_change(SimpleNamespace(type="FocusOut"))
+
+        self.assertEqual(question.stem, "新的题干")
+        self.assertEqual(len(project.repair_log), 1)
+        entry = project.repair_log[0]
+        self.assertEqual(entry.action, "update_question_stem")
+        self.assertIn("题干：根据上述定义，下列符合定义的是", entry.before_state["state_record"]["text"])
+        self.assertIn("题干：新的题干", entry.after_state["state_record"]["text"])
+
+    def test_option_focusout_records_original_option_text_in_repair_log(self):
+        project = self._build_flagged_project()
+        question = self._select_first_question(project)
+
+        option_editor = self.app._pdf_option_editors["A"]
+        option_editor.delete("1.0", "end")
+        option_editor.insert("1.0", "新的甲")
+        self.app._on_pdf_option_text_change("A")
+        self.app._on_pdf_option_text_change("A", SimpleNamespace(type="FocusOut"))
+
+        self.assertEqual(question.options[0].text, "新的甲")
+        self.assertEqual(len(project.repair_log), 1)
+        entry = project.repair_log[0]
+        self.assertEqual(entry.action, "update_option_text")
+        self.assertIn("A. 甲", entry.before_state["state_record"]["text"])
+        self.assertIn("A. 新的甲", entry.after_state["state_record"]["text"])
 
 
 if __name__ == "__main__":

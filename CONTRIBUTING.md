@@ -19,6 +19,8 @@ python main.py
 
 - 本地运行 GUI 或命令行做一次完整转换流程自测。
 - 避免将 **个人试卷、大体积 docx/pptx** 或 **打包产物**（`dist/`、`build/`、`.venv/`）提交进仓库；这些路径已在 `.gitignore` 中忽略。
+- 训练生成的 `data/datasets/`、`data/models/` 也默认视为本地产物；提交前建议用 `git status --short --ignored` 再确认一次。
+- 推荐按路径暂存改动，例如 `git add core\\... tests\\... docs\\...`，尽量避免直接 `git add .`。
 
 ## 代码风格
 

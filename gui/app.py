@@ -1,3 +1,4 @@
+import copy
 import os
 import shutil
 import tempfile
@@ -15,9 +16,13 @@ from core.word_parser import WordParser
 from core.ai_repair import (
     AIRepairService,
     apply_ai_question_patch,
+    build_repair_strategy_summary,
+    inspect_repair_strategy,
     repair_question_boundary,
     repair_project_questions,
 )
+from core.pdf_ocr_diagnostics import auto_repair_ocr_project, diagnose_project_ocr_risks
+from core.repair_log import append_project_repair_log, append_question_repair_log, capture_question_state
 from core.subject_inference import infer_subject_diagnostics
 from domain.models import ALL_SUBJECT_KINDS, SUBJECT_DISPLAY_NAMES
 from domain.project_editor import (
@@ -89,6 +94,11 @@ _DOCUMENT_SUBJECT_CHOICES = (
     ("data", "资料分析"),
 )
 _DOCUMENT_SUBJECT_LABELS = {key: label for key, label in _DOCUMENT_SUBJECT_CHOICES}
+_AI_MODE_CHOICES = (
+    ("balanced", "规则优先"),
+    ("policy", "策略增强"),
+)
+_AI_MODE_LABELS = {key: label for key, label in _AI_MODE_CHOICES}
 
 
 class PPTConvertApp:
@@ -114,6 +124,8 @@ class PPTConvertApp:
         self.pdf_document_subject = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
         self.ai_only_flagged = tk.BooleanVar(value=True)
         self.ai_batch_limit = tk.IntVar(value=12)
+        _default_ai_mode = os.environ.get("PPTCONVERT_AI_REPAIR_MODE", "balanced").strip().lower() or "balanced"
+        self.ai_mode = tk.StringVar(value=_AI_MODE_LABELS.get(_default_ai_mode, _AI_MODE_LABELS["balanced"]))
         self.option_layout = tk.StringVar(value="grid")
         self.font_size_stem = tk.IntVar(value=20)
         self.font_size_option = tk.IntVar(value=18)
@@ -183,7 +195,9 @@ class PPTConvertApp:
         self._pdf_question_layout_var = tk.StringVar(value="")
         self._pdf_question_editor_message = tk.StringVar(value="选择一道题后，可在这里实时修改题干，并为该题单独切换选项布局。")
         self._pdf_ai_suggestion_var = tk.StringVar(value="AI 建议会在这里显示，当前先聚焦待确认题。")
+        self._pdf_ai_strategy_var = tk.StringVar(value="修复策略会在这里显示。")
         self._ai_status_var = tk.StringVar(value="本地 AI 修复会直接写回当前工程，不依赖外部接口。")
+        self._pdf_ocr_status_var = tk.StringVar(value="扫描/OCR 诊断会在这里显示。")
         self._pdf_subject_vars = {
             kind: tk.BooleanVar(value=True)
             for kind in _PDF_SUBJECT_ORDER
@@ -194,6 +208,8 @@ class PPTConvertApp:
         self._pdf_step_buttons: list[ttk.Button] = []
         self._pdf_question_editor_target = None
         self._pdf_editor_updating = False
+        self._pdf_question_editor_baseline_stem = ""
+        self._pdf_option_editor_baseline_texts: dict[str, str] = {}
         self._pdf_section_subject_var = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
         self._pdf_question_layout_buttons: list[ttk.Radiobutton] = []
         self._pdf_option_editors: dict[str, tk.Text] = {}
@@ -210,6 +226,7 @@ class PPTConvertApp:
         self._pdf_slide_status_var = tk.StringVar(value="选择左侧 PPT 页后，可以逐页预览并实时编辑。")
         self._pdf_review_status_var = tk.StringVar(value="AI 质检会在预览生成后自动标出待确认题目。")
         self._ai_repair_busy = False
+        self._ocr_tool_busy = False
 
         self._build_ui()
         self._bind_pdf_wizard_updates()
@@ -218,7 +235,7 @@ class PPTConvertApp:
             self._pdf_question_layout_var.trace_add("write", lambda *_: self._on_pdf_question_layout_change())
         except Exception:
             pass
-        for variable in (self.ai_only_flagged,):
+        for variable in (self.ai_only_flagged, self.ai_mode):
             try:
                 variable.trace_add("write", lambda *_: self._refresh_pdf_ai_suggestion())
             except Exception:
@@ -574,6 +591,14 @@ class PPTConvertApp:
         row1.pack(fill=X, pady=(0, 6))
         ttk.Label(row1, text="批量上限", width=10).pack(side=LEFT)
         ttk.Spinbox(row1, from_=1, to=50, textvariable=self.ai_batch_limit, width=8).pack(side=LEFT)
+        ttk.Label(row1, text="修复模式", width=10).pack(side=LEFT, padx=(12, 0))
+        ttk.Combobox(
+            row1,
+            textvariable=self.ai_mode,
+            values=[label for _key, label in _AI_MODE_CHOICES],
+            state="readonly",
+            width=12,
+        ).pack(side=LEFT)
         ttk.Checkbutton(
             row1,
             text="批量时仅处理待确认题",
@@ -582,7 +607,7 @@ class PPTConvertApp:
         ).pack(side=LEFT, padx=(12, 0))
 
         row2 = ttk.Frame(frame)
-        row2.pack(fill=X)
+        row2.pack(fill=X, pady=(0, 6))
         ttk.Label(
             row2,
             textvariable=self._ai_status_var,
@@ -590,6 +615,34 @@ class PPTConvertApp:
             justify=LEFT,
             bootstyle="secondary",
         ).pack(side=LEFT, padx=(12, 0))
+
+        row3 = ttk.Frame(frame)
+        row3.pack(fill=X, pady=(0, 4))
+        self._pdf_ocr_diagnose_btn = ttk.Button(
+            row3,
+            text="扫描/OCR 诊断",
+            command=self._run_pdf_ocr_diagnostics,
+            bootstyle="info-outline",
+            width=14,
+            state=DISABLED,
+        )
+        self._pdf_ocr_diagnose_btn.pack(side=LEFT)
+        self._pdf_ocr_repair_btn = ttk.Button(
+            row3,
+            text="OCR 自动修补",
+            command=self._auto_repair_pdf_ocr,
+            bootstyle="warning-outline",
+            width=14,
+            state=DISABLED,
+        )
+        self._pdf_ocr_repair_btn.pack(side=LEFT, padx=(8, 0))
+        ttk.Label(
+            frame,
+            textvariable=self._pdf_ocr_status_var,
+            wraplength=860,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(anchor=W, padx=(12, 0))
 
     def _build_pdf_wizard(self, parent):
         step_bar = ttk.Frame(parent, padding=(12, 6, 12, 6))
@@ -1489,6 +1542,13 @@ class PPTConvertApp:
             justify=LEFT,
             bootstyle="secondary",
         ).pack(anchor=W, pady=(0, 6))
+        ttk.Label(
+            ai_box,
+            textvariable=self._pdf_ai_strategy_var,
+            wraplength=430,
+            justify=LEFT,
+            bootstyle="info",
+        ).pack(anchor=W, pady=(0, 6))
         ai_action_row = ttk.Frame(ai_box)
         ai_action_row.pack(fill=X)
         self._pdf_repair_current_ai_btn = ttk.Button(
@@ -2144,9 +2204,9 @@ class PPTConvertApp:
         pdf_file = self.pdf_path.get().strip()
         subject_spec = self._current_pdf_subject_spec()
         source_kind = self._pdf_project_context.get("source_kind", "")
-        is_word_project = source_kind == "word" and self.pdf_project is not None
+        is_cached_source_project = source_kind in {"word", "manifest"} and self.pdf_project is not None
         document_subject_hint = self._document_subject_key(self.pdf_document_subject.get())
-        if not subject_spec and not is_word_project:
+        if not subject_spec and not is_cached_source_project:
             messagebox.showwarning("提示", "请至少选择一个科目")
             return
         range_spec = self.pdf_question_range.get().strip()
@@ -2157,7 +2217,7 @@ class PPTConvertApp:
             and self._pdf_project_context.get("range_spec", "") == range_spec
             and self._pdf_project_context.get("document_subject_hint", "auto") == document_subject_hint
         )
-        if is_word_project:
+        if is_cached_source_project:
             use_cached_project = True
         if not use_cached_project:
             if not pdf_file:
@@ -2236,18 +2296,39 @@ class PPTConvertApp:
         self._pdf_project_dirty = False
         source_kind = self._pdf_project_context.get("source_kind", "")
         manifest_path = self._pdf_project_context.get("manifest_path", "")
+        is_cached_source_project = source_kind in {"word", "manifest"}
         self._pdf_project_context = {
-            "pdf_path": self.pdf_path.get().strip() if source_kind != "word" else "",
-            "docx_path": self.word_path.get().strip() if source_kind == "word" else self._pdf_project_context.get("docx_path", ""),
-            "subject_spec": self._current_pdf_subject_spec() if source_kind != "word" else "all",
-            "range_spec": self.pdf_question_range.get().strip() if source_kind != "word" else "",
+            "pdf_path": (
+                self.pdf_path.get().strip()
+                if not is_cached_source_project
+                else self._pdf_project_context.get("pdf_path", "")
+            ),
+            "docx_path": (
+                self.word_path.get().strip()
+                if source_kind == "word"
+                else self._pdf_project_context.get("docx_path", "")
+            ),
+            "subject_spec": (
+                self._current_pdf_subject_spec()
+                if not is_cached_source_project
+                else self._pdf_project_context.get("subject_spec", "all")
+            ),
+            "range_spec": (
+                self.pdf_question_range.get().strip()
+                if not is_cached_source_project
+                else self._pdf_project_context.get("range_spec", "")
+            ),
             "asset_dir": outputs.asset_dir,
             "source_kind": source_kind or "pdf",
             "manifest_path": self.pdf_manifest_out.get().strip() or manifest_path,
             "document_subject_hint": (
                 self._document_subject_key(self.word_document_subject.get())
                 if source_kind == "word"
-                else self._document_subject_key(self.pdf_document_subject.get())
+                else (
+                    self._pdf_project_context.get("document_subject_hint", "auto")
+                    if source_kind == "manifest"
+                    else self._document_subject_key(self.pdf_document_subject.get())
+                )
             ),
         }
         self._reset_pdf_material_preview_session()
@@ -2390,6 +2471,9 @@ class PPTConvertApp:
     def _release_pdf_review_sync_selection(self):
         self._pdf_review_syncing_selection = False
 
+    def _release_pdf_slide_sync_selection(self):
+        self._pdf_slide_syncing_selection = False
+
     def _subject_hint_percent(self, value: float | None) -> int:
         try:
             numeric = float(value or 0.0)
@@ -2487,6 +2571,20 @@ class PPTConvertApp:
         slide_tree = getattr(self, "_pdf_slide_tree", None)
         if slide_tree is None:
             return
+        slide_item_id = self._pdf_slide_payload_to_item_id.get(payload_id, "")
+        current_selected = slide_tree.selection()
+        current_item_id = current_selected[0] if current_selected else ""
+        if current_item_id != slide_item_id:
+            try:
+                self._pdf_slide_syncing_selection = True
+                if slide_item_id:
+                    slide_tree.selection_set(slide_item_id)
+                    slide_tree.focus(slide_item_id)
+                    slide_tree.see(slide_item_id)
+                else:
+                    slide_tree.selection_remove(slide_tree.selection())
+            finally:
+                self.root.after_idle(self._release_pdf_slide_sync_selection)
         self._refresh_pdf_slide_status(payload_id)
 
     def _sync_pdf_review_selection(self, payload_id: str):
@@ -2631,11 +2729,11 @@ class PPTConvertApp:
             editor.insert("1.0", option.text or "")
             editor.bind(
                 "<KeyRelease>",
-                lambda _event, letter=option.letter: self._on_pdf_option_text_change(letter),
+                lambda event, letter=option.letter: self._on_pdf_option_text_change(letter, event),
             )
             editor.bind(
                 "<FocusOut>",
-                lambda _event, letter=option.letter: self._on_pdf_option_text_change(letter),
+                lambda event, letter=option.letter: self._on_pdf_option_text_change(letter, event),
             )
             self._pdf_option_editors[option.letter] = editor
 
@@ -2820,12 +2918,19 @@ class PPTConvertApp:
 
     def _refresh_pdf_ai_suggestion(self, payload: dict | None = None):
         payload = payload or self._selected_pdf_payload()
+        mode = self._current_ai_mode()
+        if mode == "policy":
+            self._ai_status_var.set("本地 AI 修复当前处于策略增强模式：会叠加 learned repair policy 的排序、轨迹与提示。")
+        else:
+            self._ai_status_var.set("本地 AI 修复当前处于规则优先模式：会优先做安全规则修复。")
+        self._refresh_pdf_ai_strategy(payload)
         button = getattr(self, "_pdf_apply_ai_suggestion_btn", None)
         repair_current_btn = getattr(self, "_pdf_repair_current_ai_btn", None)
         repair_batch_btn = getattr(self, "_pdf_repair_batch_ai_btn", None)
         can_batch = (
             self.pdf_project is not None
             and not self._ai_repair_busy
+            and not self._ocr_tool_busy
             and (
                 bool(self._pdf_review_payload_ids)
                 if self.ai_only_flagged.get()
@@ -2890,10 +2995,10 @@ class PPTConvertApp:
         else:
             self._pdf_ai_suggestion_var.set("当前题目结构稳定，暂时没有 AI 修复建议。")
         if button is not None:
-            button.configure(state=NORMAL if target_kind and not self._ai_repair_busy else DISABLED)
+            button.configure(state=NORMAL if target_kind and not self._ai_repair_busy and not self._ocr_tool_busy else DISABLED)
         if repair_current_btn is not None:
             repair_current_btn.configure(
-                state=NORMAL if not self._ai_repair_busy else DISABLED
+                state=NORMAL if not self._ai_repair_busy and not self._ocr_tool_busy else DISABLED
             )
         if repair_batch_btn is not None:
             repair_batch_btn.configure(state=NORMAL if can_batch else DISABLED)
@@ -3006,6 +3111,8 @@ class PPTConvertApp:
 
     def _clear_pdf_question_editor(self, message: str | None = None):
         self._pdf_question_editor_target = None
+        self._pdf_question_editor_baseline_stem = ""
+        self._pdf_option_editor_baseline_texts = {}
         self._pdf_editor_updating = True
         if getattr(self, "_pdf_question_stem_editor", None):
             self._pdf_question_stem_editor.configure(state=NORMAL)
@@ -3032,6 +3139,11 @@ class PPTConvertApp:
             return
 
         self._pdf_question_editor_target = question
+        self._pdf_question_editor_baseline_stem = question.stem or ""
+        self._pdf_option_editor_baseline_texts = {
+            option.letter: option.text or ""
+            for option in getattr(question, "options", []) or []
+        }
         self._pdf_editor_updating = True
         self._set_pdf_question_editor_state(True)
         self._pdf_question_stem_editor.configure(state=NORMAL)
@@ -3085,20 +3197,43 @@ class PPTConvertApp:
         self._refresh_pdf_ai_suggestion(payload)
         self._render_pdf_question_editor_preview()
 
-    def _on_pdf_question_stem_change(self, _event=None):
+    def _on_pdf_question_stem_change(self, event=None):
         if self._pdf_editor_updating or self._pdf_question_editor_target is None:
             return
+        question = self._pdf_question_editor_target
         content = self._pdf_question_stem_editor.get("1.0", tk.END).rstrip("\n")
-        update_question_stem(self._pdf_question_editor_target, content)
-        self._mark_pdf_project_dirty()
-        self._sync_selected_question_preview_payload()
+        previous_content = question.stem or ""
+        focusout = self._is_focusout_event(event)
+        if content != previous_content:
+            update_question_stem(question, content)
+            self._mark_pdf_project_dirty()
+            self._sync_selected_question_preview_payload()
+        if focusout and content != self._pdf_question_editor_baseline_stem:
+            before_state = self._capture_pdf_question_state_override(
+                question,
+                stem=self._pdf_question_editor_baseline_stem,
+            )
+            self._log_pdf_question_event(
+                action="update_question_stem",
+                question=question,
+                before_state=before_state,
+                metadata={"field": "stem"},
+            )
+            self._pdf_question_editor_baseline_stem = content
 
     def _on_pdf_question_layout_change(self):
         if self._pdf_editor_updating or self._pdf_question_editor_target is None:
             return
+        before_state = self._capture_pdf_question_state(self._pdf_question_editor_target)
         set_question_option_layout(self._pdf_question_editor_target, self._pdf_question_layout_var.get())
         self._mark_pdf_project_dirty()
         self._sync_selected_question_preview_payload()
+        self._log_pdf_question_event(
+            action="set_question_option_layout",
+            question=self._pdf_question_editor_target,
+            before_state=before_state,
+            metadata={"layout": self._pdf_question_layout_var.get() or ""},
+        )
 
     def _refresh_pdf_option_image_status(self, letter: str):
         question = self._pdf_question_editor_target
@@ -3146,18 +3281,36 @@ class PPTConvertApp:
             if remove_btn is not None:
                 remove_btn.configure(state=NORMAL if option_count > 1 else DISABLED)
 
-    def _on_pdf_option_text_change(self, letter: str):
+    def _on_pdf_option_text_change(self, letter: str, event=None):
         if self._pdf_editor_updating or self._pdf_question_editor_target is None:
             return
+        question = self._pdf_question_editor_target
         editor = self._pdf_option_editors.get(letter)
         if editor is None:
             return
+        option = self._find_pdf_question_option(question, letter)
+        if option is None:
+            return
         content = editor.get("1.0", tk.END).rstrip("\n")
-        if update_option_text(self._pdf_question_editor_target, letter, content):
+        previous_content = option.text or ""
+        focusout = self._is_focusout_event(event)
+        if content != previous_content and update_option_text(question, letter, content):
             self._mark_pdf_project_dirty()
             self._sync_selected_question_preview_payload()
+        if focusout and content != self._pdf_option_editor_baseline_texts.get(letter, ""):
+            before_state = self._capture_pdf_question_state_override(
+                question,
+                option_text_overrides={letter: self._pdf_option_editor_baseline_texts.get(letter, "")},
+            )
+            self._log_pdf_question_event(
+                action="update_option_text",
+                question=question,
+                before_state=before_state,
+                metadata={"option_letter": letter},
+            )
+            self._pdf_option_editor_baseline_texts[letter] = content
 
-    def _refresh_pdf_option_editor_after_structure_change(self):
+    def _refresh_pdf_option_editor_after_structure_change(self, *, action: str = "", before_state: dict | None = None, metadata: dict | None = None):
         question = self._pdf_question_editor_target
         if question is None:
             return
@@ -3167,20 +3320,41 @@ class PPTConvertApp:
         self._set_pdf_question_editor_state(True)
         self._mark_pdf_project_dirty()
         self._sync_selected_question_preview_payload()
+        self._pdf_option_editor_baseline_texts = {
+            option.letter: option.text or ""
+            for option in getattr(question, "options", []) or []
+        }
+        if action and before_state:
+            self._log_pdf_question_event(
+                action=action,
+                question=question,
+                before_state=before_state,
+                metadata=metadata,
+            )
 
     def _move_pdf_option(self, letter: str, direction: int):
         question = self._pdf_question_editor_target
         if question is None:
             return
+        before_state = self._capture_pdf_question_state(question)
         if move_option(question, letter, direction):
-            self._refresh_pdf_option_editor_after_structure_change()
+            self._refresh_pdf_option_editor_after_structure_change(
+                action="move_option",
+                before_state=before_state,
+                metadata={"option_letter": letter, "direction": direction},
+            )
 
     def _insert_pdf_option_after(self, letter: str):
         question = self._pdf_question_editor_target
         if question is None:
             return
+        before_state = self._capture_pdf_question_state(question)
         if insert_option_after(question, letter):
-            self._refresh_pdf_option_editor_after_structure_change()
+            self._refresh_pdf_option_editor_after_structure_change(
+                action="insert_option_after",
+                before_state=before_state,
+                metadata={"option_letter": letter},
+            )
 
     def _remove_pdf_option(self, letter: str):
         question = self._pdf_question_editor_target
@@ -3188,8 +3362,13 @@ class PPTConvertApp:
             return
         if not messagebox.askyesno("确认删项", f"确定删除 {letter} 选项吗？", parent=self.root):
             return
+        before_state = self._capture_pdf_question_state(question)
         if remove_option(question, letter):
-            self._refresh_pdf_option_editor_after_structure_change()
+            self._refresh_pdf_option_editor_after_structure_change(
+                action="remove_option",
+                before_state=before_state,
+                metadata={"option_letter": letter},
+            )
 
     def _stage_pdf_option_image(self, selected_path: str) -> str:
         source = os.path.abspath(selected_path)
@@ -3253,10 +3432,17 @@ class PPTConvertApp:
         if not selected_path:
             return
         staged_path = self._stage_pdf_option_image(selected_path)
+        before_state = self._capture_pdf_question_state(question)
         if replace_option_image(question, letter, staged_path):
             self._mark_pdf_project_dirty()
             self._refresh_pdf_option_image_status(letter)
             self._sync_selected_question_preview_payload()
+            self._log_pdf_question_event(
+                action="replace_option_image",
+                question=question,
+                before_state=before_state,
+                metadata={"option_letter": letter},
+            )
 
     def _recrop_pdf_option_image(self, letter: str):
         question = self._pdf_question_editor_target
@@ -3287,10 +3473,17 @@ class PPTConvertApp:
                 messagebox.showinfo("提示", "没有裁出图片，请检查该选项的区域信息。", parent=self.root)
                 return
             staged_path = self._stage_pdf_option_crop(crop_paths[0], letter)
+            before_state = self._capture_pdf_question_state(question)
             if replace_option_image(question, letter, staged_path):
                 self._mark_pdf_project_dirty()
                 self._refresh_pdf_option_image_status(letter)
                 self._sync_selected_question_preview_payload()
+                self._log_pdf_question_event(
+                    action="recrop_option_image",
+                    question=question,
+                    before_state=before_state,
+                    metadata={"option_letter": letter},
+                )
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -3298,10 +3491,17 @@ class PPTConvertApp:
         question = self._pdf_question_editor_target
         if question is None:
             return
+        before_state = self._capture_pdf_question_state(question)
         if clear_option_image(question, letter):
             self._mark_pdf_project_dirty()
             self._refresh_pdf_option_image_status(letter)
             self._sync_selected_question_preview_payload()
+            self._log_pdf_question_event(
+                action="clear_option_image",
+                question=question,
+                before_state=before_state,
+                metadata={"option_letter": letter},
+            )
 
     def _draw_pdf_preview_thumbnail(self, canvas, image_path: str, x0: float, y0: float, width: float, height: float) -> bool:
         if not image_path or not os.path.exists(image_path):
@@ -3876,8 +4076,15 @@ class PPTConvertApp:
         )
         if new_number is None:
             return
+        before_state = self._capture_pdf_question_state(question)
         renumber_question(question, new_number)
         self._mark_pdf_project_dirty()
+        self._log_pdf_question_event(
+            action="renumber_question",
+            question=question,
+            before_state=before_state,
+            metadata={"new_number": new_number},
+        )
         self._refresh_pdf_preview_after_edit("已更新题号。")
 
     def _rename_selected_material(self):
@@ -4077,6 +4284,13 @@ class PPTConvertApp:
         if not reclassify_objective_section(section, new_kind, project=self.pdf_project):
             return
         self._mark_pdf_project_dirty()
+        self._log_pdf_project_event(
+            action="reclassify_section_subject",
+            metadata={
+                "section_title": getattr(section, "title", ""),
+                "new_kind": new_kind,
+            },
+        )
         self._refresh_pdf_preview_after_edit(f"已将当前篇题调整为：{self._document_subject_label(new_kind)}")
 
     def _apply_selected_ai_subject_suggestion(self):
@@ -4096,6 +4310,15 @@ class PPTConvertApp:
             messagebox.showinfo("提示", "AI 建议与当前篇题一致，未发生变化。", parent=self.root)
             return
         self._mark_pdf_project_dirty()
+        self._log_pdf_project_event(
+            action="apply_ai_section_subject_suggestion",
+            source="gui_ai",
+            metadata={
+                "section_title": getattr(section, "title", ""),
+                "target_kind": target_kind,
+                "reason": reason,
+            },
+        )
         self._refresh_pdf_preview_after_edit(
             f"已按 AI 建议将当前篇题调整为：{self._document_subject_label(target_kind)}"
         )
@@ -4108,6 +4331,11 @@ class PPTConvertApp:
             messagebox.showinfo("提示", "当前没有可安全批量应用的 AI 科目建议。", parent=self.root)
             return
         self._mark_pdf_project_dirty()
+        self._log_pdf_project_event(
+            action="apply_all_safe_ai_subject_suggestions",
+            source="gui_ai",
+            metadata={"applied_sections": applied},
+        )
         self._refresh_pdf_preview_after_edit(f"已批量应用 {applied} 条 AI 安全建议。")
 
     def _ai_batch_limit_value(self) -> int:
@@ -4117,9 +4345,21 @@ class PPTConvertApp:
             value = 12
         return max(1, min(50, value))
 
+    def _current_ai_mode(self) -> str:
+        label = (self.ai_mode.get() or "").strip()
+        for key, display in _AI_MODE_CHOICES:
+            if label == display:
+                return key
+        return "balanced"
+
     def _build_ai_service(self) -> AIRepairService:
-        service = AIRepairService()
-        self._ai_status_var.set("本地 AI 修复器已启用：会优先做安全修复，不依赖任何在线模型。")
+        mode = self._current_ai_mode()
+        service = AIRepairService(mode=mode)
+        mode_label = _AI_MODE_LABELS.get(mode, mode)
+        if mode == "policy":
+            self._ai_status_var.set(f"本地 AI 修复器已启用：当前是 {mode_label}，会叠加 learned repair policy 的排序与提示。")
+        else:
+            self._ai_status_var.set(f"本地 AI 修复器已启用：当前是 {mode_label}，会优先做安全规则修复。")
         return service
 
     def _set_ai_repair_busy(self, busy: bool, status_text: str | None = None):
@@ -4127,6 +4367,23 @@ class PPTConvertApp:
         if status_text:
             self._set_status(status_text)
         self._refresh_pdf_ai_suggestion()
+        self._refresh_ocr_tool_buttons()
+
+    def _set_ocr_tool_busy(self, busy: bool, status_text: str | None = None):
+        self._ocr_tool_busy = busy
+        if status_text:
+            self._set_status(status_text)
+        self._refresh_ocr_tool_buttons()
+        self._refresh_pdf_ai_suggestion()
+
+    def _refresh_ocr_tool_buttons(self):
+        can_use = self.pdf_project is not None and not self._ai_repair_busy and not self._ocr_tool_busy
+        for button in (
+            getattr(self, "_pdf_ocr_diagnose_btn", None),
+            getattr(self, "_pdf_ocr_repair_btn", None),
+        ):
+            if button is not None:
+                button.configure(state=NORMAL if can_use else DISABLED)
 
     def _ai_neighbor_questions(self, section, material, question):
         if section is None or question is None:
@@ -4141,6 +4398,204 @@ class PPTConvertApp:
                 next_question = rows[index + 1] if index + 1 < len(rows) else None
                 return previous_question, next_question
         return None, None
+
+    def _find_pdf_question_context(self, question):
+        if self.pdf_project is None or question is None:
+            return None, None
+        for section, material, item in self.pdf_project.iter_questions():
+            if item is question:
+                return section, material
+        return None, None
+
+    def _capture_pdf_question_state(self, question, *, section=None, material=None):
+        if self.pdf_project is None or question is None:
+            return {}
+        if section is None:
+            section, material = self._find_pdf_question_context(question)
+        if section is None:
+            return {}
+        previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+        return capture_question_state(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+
+    def _capture_pdf_question_state_override(
+        self,
+        question,
+        *,
+        section=None,
+        material=None,
+        stem: str | None = None,
+        option_text_overrides: dict[str, str] | None = None,
+    ):
+        if self.pdf_project is None or question is None:
+            return {}
+        if section is None:
+            section, material = self._find_pdf_question_context(question)
+        if section is None:
+            return {}
+        question_copy = copy.deepcopy(question)
+        if stem is not None:
+            question_copy.stem = stem
+        for letter, value in (option_text_overrides or {}).items():
+            option = self._find_pdf_question_option(question_copy, letter)
+            if option is not None:
+                option.text = value
+        previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+        return capture_question_state(
+            section=section,
+            material=material,
+            question=question_copy,
+            previous_question=previous_question,
+            next_question=next_question,
+        )
+
+    def _log_pdf_question_event(
+        self,
+        *,
+        action: str,
+        question,
+        section=None,
+        material=None,
+        before_state: dict | None = None,
+        metadata: dict | None = None,
+        source: str = "gui_manual",
+    ):
+        if self.pdf_project is None or question is None:
+            return
+        if section is None:
+            section, material = self._find_pdf_question_context(question)
+        if section is None:
+            return
+        previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+        append_question_repair_log(
+            self.pdf_project,
+            source=source,
+            action=action,
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+            before_state=before_state,
+            metadata=metadata,
+        )
+
+    def _log_pdf_project_event(self, *, action: str, metadata: dict | None = None, source: str = "gui_manual"):
+        if self.pdf_project is None:
+            return
+        append_project_repair_log(
+            self.pdf_project,
+            source=source,
+            action=action,
+            metadata=metadata,
+        )
+
+    def _is_focusout_event(self, event) -> bool:
+        return str(getattr(event, "type", "")) == "FocusOut"
+
+    def _refresh_pdf_ai_strategy(self, payload: dict | None = None):
+        payload = payload or self._selected_pdf_payload()
+        if payload.get("kind") != "question":
+            self._pdf_ai_strategy_var.set("修复策略会在这里显示。")
+            return
+        question = payload.get("question")
+        section = payload.get("section")
+        material = payload.get("material")
+        if question is None or section is None:
+            self._pdf_ai_strategy_var.set("修复策略会在这里显示。")
+            return
+        previous_question, next_question = self._ai_neighbor_questions(section, material, question)
+        snapshot = inspect_repair_strategy(
+            section=section,
+            material=material,
+            question=question,
+            previous_question=previous_question,
+            next_question=next_question,
+            mode=self._current_ai_mode(),
+        )
+        self._pdf_ai_strategy_var.set(build_repair_strategy_summary(snapshot))
+
+    def _run_pdf_ocr_diagnostics(self):
+        if self.pdf_project is None:
+            messagebox.showinfo("提示", "请先生成或载入工程。", parent=self.root)
+            return
+        self._set_ocr_tool_busy(True, "正在分析扫描/OCR 风险…")
+
+        def work():
+            try:
+                report = diagnose_project_ocr_risks(
+                    self.pdf_project,
+                    pdf_path=self.pdf_path.get() or getattr(getattr(self.pdf_project, "source", None), "pdf_path", None),
+                )
+                self.root.after(0, lambda r=report: self._on_pdf_ocr_diagnostics_done(r))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_pdf_ocr_tool_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pdf_ocr_diagnostics_done(self, report):
+        self._set_ocr_tool_busy(False)
+        summary = report.summary_text()
+        if getattr(report, "suggestions", None):
+            summary += "\n" + report.suggestions[0]
+        self._pdf_ocr_status_var.set(summary)
+        self._set_status("扫描/OCR 诊断完成")
+
+    def _auto_repair_pdf_ocr(self):
+        if self.pdf_project is None:
+            messagebox.showinfo("提示", "请先生成或载入工程。", parent=self.root)
+            return
+        service = self._build_ai_service()
+        self._set_ocr_tool_busy(True, "正在执行 OCR 自动修补…")
+        self.progress["value"] = 0
+        self.progress["maximum"] = self._ai_batch_limit_value()
+
+        def work():
+            try:
+                summary = auto_repair_ocr_project(
+                    self.pdf_project,
+                    pdf_path=self.pdf_path.get() or getattr(getattr(self.pdf_project, "source", None), "pdf_path", None),
+                    service=service,
+                    only_flagged=bool(self.ai_only_flagged.get()),
+                    limit=self._ai_batch_limit_value(),
+                )
+                self.root.after(0, lambda s=summary: self._on_pdf_ocr_auto_repair_done(s))
+            except Exception as exc:
+                self.root.after(0, lambda e=exc: self._on_pdf_ocr_tool_error(str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_pdf_ocr_auto_repair_done(self, summary):
+        self.progress["value"] = self.progress["maximum"]
+        self._set_ocr_tool_busy(False)
+        self._pdf_ocr_status_var.set(summary.summary_text())
+        changed = (
+            summary.section_subject_changes > 0
+            or summary.batch_summary.changed_questions > 0
+            or summary.batch_summary.structural_repairs > 0
+        )
+        if changed:
+            self._mark_pdf_project_dirty()
+            self._log_pdf_project_event(
+                action="ocr_auto_repair",
+                source="gui_ocr",
+                metadata=summary.to_dict(),
+            )
+            self._refresh_pdf_preview_after_edit("OCR 自动修补已完成：" + summary.summary_text())
+            return
+        self._set_status("OCR 自动修补完成，但没有形成可写回的变化。")
+        self._refresh_pdf_ai_suggestion()
+
+    def _on_pdf_ocr_tool_error(self, message: str):
+        self._set_ocr_tool_busy(False)
+        self.progress["value"] = 0
+        self._set_status("扫描/OCR 工具失败")
+        messagebox.showerror("扫描/OCR 工具失败", message, parent=self.root)
 
     def _repair_selected_question_with_ai(self):
         if self.pdf_project is None:
@@ -4164,6 +4619,7 @@ class PPTConvertApp:
 
         def work():
             try:
+                before_state = self._capture_pdf_question_state(question, section=section, material=material)
                 boundary_changes, boundary_reason = repair_question_boundary(
                     self.pdf_project,
                     section,
@@ -4188,13 +4644,14 @@ class PPTConvertApp:
                 annotate_project_quality(self.pdf_project)
                 self.root.after(
                     0,
-                    lambda r=result, c=changes, s=subject_changed, n=original_number, bc=boundary_changes, br=boundary_reason: self._on_ai_single_repair_done(
+                    lambda r=result, c=changes, s=subject_changed, n=original_number, bc=boundary_changes, br=boundary_reason, bs=before_state: self._on_ai_single_repair_done(
                         n,
                         r,
                         c,
                         s,
                         bc,
                         br,
+                        bs,
                     ),
                 )
             except Exception as exc:
@@ -4210,6 +4667,7 @@ class PPTConvertApp:
         subject_changed: bool,
         boundary_changes: int = 0,
         boundary_reason: str = "",
+        before_state: dict | None = None,
     ):
         self.progress["value"] = self.progress["maximum"]
         self._set_ai_repair_busy(False)
@@ -4239,6 +4697,21 @@ class PPTConvertApp:
         summary = (getattr(result.patch, "summary", "") or "AI 已写回当前题的结构修复。").strip()
         if boundary_changes > 0:
             summary = (boundary_reason or "已处理跨题边界串题") + "；" + summary
+        question = self._pdf_question_editor_target
+        if question is not None:
+            self._log_pdf_question_event(
+                action="ai_single_repair",
+                question=question,
+                before_state=before_state,
+                metadata={
+                    "summary": summary,
+                    "field_changes": total_changes,
+                    "subject_changed": bool(subject_changed),
+                    "boundary_changes": int(boundary_changes),
+                    "mode": self._current_ai_mode(),
+                },
+                source="gui_ai",
+            )
         self._refresh_pdf_preview_after_edit(f"AI 已修复原题号 {original_number}：{summary}")
 
     def _repair_flagged_questions_with_ai(self):
@@ -4275,6 +4748,18 @@ class PPTConvertApp:
         self._set_ai_repair_busy(False)
         if summary.changed_questions > 0:
             self._mark_pdf_project_dirty()
+            self._log_pdf_project_event(
+                action="ai_batch_repair",
+                source="gui_ai",
+                metadata={
+                    "attempted_questions": summary.attempted_questions,
+                    "changed_questions": summary.changed_questions,
+                    "total_field_changes": summary.total_field_changes,
+                    "subject_changes": summary.subject_changes,
+                    "structural_repairs": summary.structural_repairs,
+                    "mode": self._current_ai_mode(),
+                },
+            )
             message = (
                 f"AI 批量处理 {summary.attempted_questions} 题，"
                 f"写回 {summary.changed_questions} 题，"
@@ -4330,6 +4815,7 @@ class PPTConvertApp:
         messagebox.showinfo("完成", f"AI 质检报告已导出：\n{path}", parent=self.root)
 
     def _populate_pdf_preview(self, project):
+        self.pdf_project = project
         quality = self._reanalyze_pdf_project()
         self._pdf_preview_payloads.clear()
         self._clear_pdf_question_editor()
@@ -4501,6 +4987,7 @@ class PPTConvertApp:
         self._set_pdf_detail(detail_text)
         self._refresh_pdf_slide_status("")
         self._refresh_pdf_review_status("")
+        self._refresh_ocr_tool_buttons()
         if self._pdf_review_payload_ids:
             self._select_pdf_preview_item(self._pdf_review_payload_ids[0], focus_left_tab="review")
         elif self._pdf_slide_payload_ids:

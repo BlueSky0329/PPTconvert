@@ -14,6 +14,7 @@ from domain.models import (
     ReviewIssue,
     Section,
 )
+from core.repair_log import append_project_repair_log, append_question_repair_log, capture_question_state
 from exporters.manifest_json import export_project_manifest, load_project_manifest_project
 
 
@@ -67,6 +68,7 @@ class ManifestJsonTest(unittest.TestCase):
                                             )
                                         ],
                                         page_numbers=[2],
+                                        question_id="q-demo-111",
                                         option_layout="one_row",
                                         review_confidence=0.62,
                                         review_issues=[
@@ -91,6 +93,29 @@ class ManifestJsonTest(unittest.TestCase):
                 ],
                 selected_subjects=["data"],
                 selected_ranges=[QuestionRange(start=111, end=115)],
+                repair_session_id="session-demo",
+            )
+
+            section = project.sections[0]
+            material = section.material_sets[0]
+            question = material.questions[0]
+            before_state = capture_question_state(section=section, material=material, question=question)
+            question.stem = "题干已人工修正"
+            append_question_repair_log(
+                project,
+                source="gui_manual",
+                action="update_question_stem",
+                section=section,
+                material=material,
+                question=question,
+                before_state=before_state,
+                metadata={"field": "stem"},
+            )
+            append_project_repair_log(
+                project,
+                source="gui_ai",
+                action="ai_batch_repair",
+                metadata={"changed_questions": 1},
             )
 
             export_project_manifest(project, manifest_path)
@@ -111,6 +136,12 @@ class ManifestJsonTest(unittest.TestCase):
             self.assertEqual(question.inferred_subtype, "表格型资料分析")
             self.assertAlmostEqual(question.inferred_subtype_confidence, 0.88, places=2)
             self.assertEqual(question.inferred_signals[:2], ["根据以下资料", "同比"])
+            self.assertEqual(question.question_id, "q-demo-111")
+            self.assertEqual(loaded.repair_session_id, "session-demo")
+            self.assertEqual(len(loaded.repair_log), 2)
+            self.assertEqual(loaded.repair_log[0].action, "update_question_stem")
+            self.assertEqual(loaded.repair_log[0].question_id, "q-demo-111")
+            self.assertEqual(loaded.repair_log[1].action, "ai_batch_repair")
 
 
 if __name__ == "__main__":

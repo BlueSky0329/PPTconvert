@@ -1816,14 +1816,23 @@ def infer_document_subject(
         material_header="材料一" if material_header_count else "",
         allow_data=True,
     )
-    if kind == "unknown":
-        return None, confidence
     sparse_material_headers_in_objective_book = (
         (material_header_count or material_header_like_count >= 1)
         and (material_header_count + material_header_like_count) <= 2
         and objective_question_like_count >= 6
         and objective_option_like_count >= 12
     )
+    if kind == "unknown":
+        if material_hits == 0 and material_header_count == 0 and objective_question_like_count >= 2 and objective_option_like_count >= 4:
+            fallback_kind, fallback_confidence = infer_subject_from_content(
+                stem=_clean_text(lines),
+                options=(),
+                image_count=min(image_count, 1),
+                allow_data=False,
+            )
+            if fallback_kind != "unknown":
+                return fallback_kind, max(fallback_confidence, confidence)
+        return None, confidence
     if (
         (material_header_count or material_header_like_count >= 1)
         and not sparse_material_headers_in_objective_book

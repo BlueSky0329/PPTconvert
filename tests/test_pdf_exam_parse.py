@@ -1011,6 +1011,209 @@ class TestPdfExamParse(unittest.TestCase):
         self.assertEqual(len(exam.data_sections), 1)
         self.assertEqual(exam.data_sections[0].materials[0].questions[0].source_number, "101")
 
+    def test_filename_set_paper_supports_shorter_set_sequence_without_fixed_total(self):
+        items = [
+            ("1.关于推进中国式现代化的相关表述,正确的是:", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+            ("16.根据我国民法典相关规定,下列说法正确的是:", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+            ("26.这段文字主要说明的是:", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+            ("31.某商品按8折出售后利润率为20%,其成本是多少?", None),
+            ("A.80", None),
+            ("B.96", None),
+            ("C.100", None),
+            ("D.120", None),
+            ("36.如果甲成立,那么乙成立。以下哪项最能削弱上述论证?", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+        ]
+
+        exam = parse_line_items(
+            items,
+            mode="all",
+            source_name="模拟卷十一.pdf",
+        )
+
+        self.assertEqual([q.source_number for q in exam.politics_sections[0].questions], ["1"])
+        self.assertEqual([q.source_number for q in exam.common_sense_sections[0].questions], ["16"])
+        self.assertEqual([q.source_number for q in exam.verbal_sections[0].questions], ["26"])
+        self.assertEqual([q.source_number for q in exam.quant_sections[0].questions], ["31"])
+        self.assertEqual([q.source_number for q in exam.reasoning_sections[0].questions], ["36"])
+
+
+    def test_cross_page_material_merges_truncated_intro(self):
+        """材料正文在跨页处被截断（句末为逗号），自动拆组时应合并。"""
+        from core.pdf_exam_parse import _merge_cross_page_material_units
+
+        unit_a = MaterialUnit(
+            header="材料一",
+            intro_lines=[RichLine(parts=[("2024年全国经济运行总体平稳，", None)])],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干A", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="111"),
+            ],
+        )
+        unit_b = MaterialUnit(
+            header="材料二",
+            intro_lines=[RichLine(parts=[("GDP同比增长5.2%。", None)])],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干B", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="112"),
+            ],
+        )
+
+        merged = _merge_cross_page_material_units([unit_a, unit_b])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0].intro_lines), 2)
+        self.assertEqual(len(merged[0].questions), 2)
+
+    def test_cross_page_material_preserves_independent_materials(self):
+        """材料正文以句号结尾时不应合并。"""
+        from core.pdf_exam_parse import _merge_cross_page_material_units
+
+        unit_a = MaterialUnit(
+            header="材料一",
+            intro_lines=[RichLine(parts=[("材料A正文。", None)])],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干A", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="111"),
+            ],
+        )
+        unit_b = MaterialUnit(
+            header="材料二",
+            intro_lines=[RichLine(parts=[("材料B正文。", None)])],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干B", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="116"),
+            ],
+        )
+
+        merged = _merge_cross_page_material_units([unit_a, unit_b])
+        self.assertEqual(len(merged), 2)
+
+    def test_cross_page_table_continuation_merges(self):
+        """跨页表格（含表格续行字符）应合并。"""
+        from core.pdf_exam_parse import _merge_cross_page_material_units
+
+        unit_a = MaterialUnit(
+            header="材料一",
+            intro_lines=[
+                RichLine(parts=[("年份│GDP│增速", None)]),
+                RichLine(parts=[("2023│126│5.2%", None)]),
+            ],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="111"),
+            ],
+        )
+        unit_b = MaterialUnit(
+            header="材料二",
+            intro_lines=[
+                RichLine(parts=[("2024│132│4.8%", None)]),
+            ],
+            questions=[
+                ExamQuestion(stem_lines=[RichLine(parts=[("题干B", None)])], option_lines=[
+                    RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])
+                ], source_number="112"),
+            ],
+        )
+
+        merged = _merge_cross_page_material_units([unit_a, unit_b])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(merged[0].intro_lines), 3)
+
+    def test_cross_page_material_does_not_merge_distinct_question_ranges(self):
+        """明确标了不同答题区间的材料组不应被跨页续接规则误并。"""
+        from core.pdf_exam_parse import _merge_cross_page_material_units
+
+        unit_a = MaterialUnit(
+            header="材料一:根据材料,回答101—105题。",
+            intro_lines=[RichLine(parts=[("2024年上半年工业企业利润同比下降，", None)])],
+            questions=[
+                ExamQuestion(
+                    stem_lines=[RichLine(parts=[("101.题干A", None)])],
+                    option_lines=[RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])],
+                    source_number="101",
+                )
+            ],
+        )
+        unit_b = MaterialUnit(
+            header="材料二:根据材料,回答106—110题。",
+            intro_lines=[RichLine(parts=[("2022年12月国内市场手机出货量2786万部。", None)])],
+            questions=[
+                ExamQuestion(
+                    stem_lines=[RichLine(parts=[("106.题干B", None)])],
+                    option_lines=[RichLine(parts=[("A．1\tB．2\tC．3\tD．4", None)])],
+                    source_number="106",
+                )
+            ],
+        )
+
+        merged = _merge_cross_page_material_units([unit_a, unit_b])
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0].header, unit_a.header)
+        self.assertEqual(merged[1].header, unit_b.header)
+
+    def test_parse_material_body_corrects_mismatched_header_question_range(self):
+        from core.pdf_exam_parse import parse_material_body
+
+        items = [
+            ("111.2023年3月末，5G移动电话用户数约比上年末增长：", None),
+            ("A.10%", None),
+            ("B.18%", None),
+            ("C.25%", None),
+            ("D.30%", None),
+            ("112.根据上述资料，下列说法正确的是：", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+            ("113.以下哪项最符合题意？", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+            ("114.表2中“？”处的数值为：", None),
+            ("A.1", None),
+            ("B.2", None),
+            ("C.3", None),
+            ("D.4", None),
+            ("115.根据上述资料，下列能够推出的是：", None),
+            ("A.甲", None),
+            ("B.乙", None),
+            ("C.丙", None),
+            ("D.丁", None),
+        ]
+
+        unit = parse_material_body(
+            items,
+            0,
+            len(items),
+            "材料三：根据材料，回答110—115 题。",
+        )
+
+        self.assertIsNotNone(unit)
+        assert unit is not None
+        self.assertEqual(unit.header, "材料三：根据材料，回答111—115 题。")
+        self.assertEqual([q.source_number for q in unit.questions], ["111", "112", "113", "114", "115"])
+
 
 if __name__ == "__main__":
     unittest.main()
