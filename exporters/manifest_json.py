@@ -17,6 +17,7 @@ from domain.models import (
     ReviewIssue,
     Section,
 )
+from core.ppt_layout import sanitize_ppt_layout
 
 
 def export_project_manifest(project: ExamProject, out_path: str) -> str:
@@ -77,6 +78,7 @@ def _load_question(data: dict) -> QuestionNode:
         answer=data.get("answer") or None,
         page_numbers=[int(value) for value in data.get("page_numbers", []) or []],
         option_layout=data.get("option_layout") or None,
+        ppt_layout=sanitize_ppt_layout(data.get("ppt_layout") or {}),
         review_confidence=float(data.get("review_confidence") or 1.0),
         review_issues=[
             ReviewIssue(

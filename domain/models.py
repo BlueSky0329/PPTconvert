@@ -89,6 +89,7 @@ class QuestionNode:
     answer: Optional[str] = None
     page_numbers: list[int] = field(default_factory=list)
     option_layout: Optional[str] = None
+    ppt_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     review_confidence: float = 1.0
     review_issues: list[ReviewIssue] = field(default_factory=list)
     suggested_subject: Optional[SubjectKind] = None

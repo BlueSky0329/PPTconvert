@@ -9,6 +9,11 @@ from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
 from core.models import Question
+from core.ppt_layout import (
+    build_effective_question_layout,
+    option_layout_block_key,
+    scale_layout_rect,
+)
 from core.ppt_style import align_from_string
 from core.template_manager import TemplateManager
 from core.template_style import (
@@ -270,33 +275,96 @@ class PPTGenerator:
         return letter_style, body_style
 
     def _layout_default(self, slide, question: Question):
-        config = self.config
-        slide_width = self._prs.slide_width
-        margin_left = Inches(config.margin_left_in)
-        margin_right = Inches(config.margin_right_in)
-        margin_top = Inches(config.margin_top_in)
-        content_width = slide_width - margin_left - margin_right
-        has_image = bool(question.image_paths)
+        effective_layout = build_effective_question_layout(question, self.config)
+        slide_width = int(self._prs.slide_width)
+        slide_height = int(self._prs.slide_height)
 
-        stem_height = Inches(
-            config.stem_height_with_image_in if has_image else config.stem_height_no_image_in
+        stem_rect = effective_layout.get("stem")
+        options_rect = effective_layout.get("options")
+        if not stem_rect or not options_rect:
+            return
+
+        stem_left, stem_top, stem_right, stem_bottom = scale_layout_rect(
+            stem_rect,
+            slide_width,
+            slide_height,
         )
-        self._add_stem_box(slide, question, margin_left, margin_top, content_width, stem_height)
+        self._add_stem_box(
+            slide,
+            question,
+            int(stem_left),
+            int(stem_top),
+            int(stem_right - stem_left),
+            int(stem_bottom - stem_top),
+        )
 
-        top = margin_top + stem_height + Inches(config.gap_after_stem_in)
-        if has_image:
+        image_rect = effective_layout.get("image")
+        if question.image_paths and image_rect:
+            image_left, image_top, image_right, image_bottom = scale_layout_rect(
+                image_rect,
+                slide_width,
+                slide_height,
+            )
+            cursor_top = int(image_top)
             for path in question.image_paths:
                 if os.path.exists(path):
-                    top = self._insert_image(slide, path, margin_left, top, content_width)
+                    cursor_top = self._insert_image_in_rect(
+                        slide,
+                        path,
+                        int(image_left),
+                        int(image_top),
+                        int(image_right - image_left),
+                        int(image_bottom - image_top),
+                        cursor_top,
+                    )
 
-        options_top = top + Inches(config.gap_before_options_in)
-        option_layout = (question.option_layout or config.option_layout or "grid").lower()
-        if option_layout == "list":
-            self._options_list(slide, question, margin_left, options_top, content_width)
-        elif option_layout == "one_row":
-            self._options_one_row(slide, question, margin_left, options_top, content_width)
-        else:
-            self._options_grid(slide, question, margin_left, options_top, content_width)
+        self._layout_options_in_region(slide, question, effective_layout)
+
+    def _layout_options_in_region(
+        self,
+        slide,
+        question: Question,
+        effective_layout: dict[str, dict[str, float]],
+    ):
+        options_rect = effective_layout.get("options")
+        question_overrides = getattr(question, "ppt_layout", {}) or {}
+        slide_width = int(self._prs.slide_width)
+        slide_height = int(self._prs.slide_height)
+        render_options = self._renderable_options(question)
+        has_option_item_override = any(
+            option_layout_block_key(option.letter) in question_overrides
+            for option in render_options
+        )
+        if options_rect and not has_option_item_override:
+            option_left, option_top, option_right, option_bottom = scale_layout_rect(
+                options_rect,
+                slide_width,
+                slide_height,
+            )
+            width = int(option_right - option_left)
+            height = int(option_bottom - option_top)
+            option_layout = (question.option_layout or self.config.option_layout or "grid").lower()
+            if option_layout == "list":
+                self._options_list(slide, question, int(option_left), int(option_top), width, height)
+            elif option_layout == "one_row":
+                self._options_one_row(slide, question, int(option_left), int(option_top), width, height)
+            else:
+                self._options_grid(slide, question, int(option_left), int(option_top), width, height)
+            return
+        for option in render_options:
+            rect = effective_layout.get(option_layout_block_key(option.letter))
+            if not rect:
+                continue
+            left, top, right, bottom = scale_layout_rect(rect, slide_width, slide_height)
+            self._add_option_box(
+                slide,
+                option.letter,
+                option.text,
+                int(left),
+                int(top),
+                max(1, int(right - left)),
+                max(1, int(bottom - top)),
+            )
 
     def _add_stem_box(
         self,
@@ -436,13 +504,20 @@ class PPTGenerator:
             return [(col0, row0), (col0, row1), (col1, row0), (col1, row1)]
         return [(col0, row0), (col1, row0), (col0, row1), (col1, row1)]
 
-    def _options_grid(self, slide, question: Question, left, top, content_width):
+    def _options_grid(self, slide, question: Question, left, top, content_width, available_height=None):
         config = self.config
         gap = Inches(config.grid_col_gap_in)
         col_width = (content_width - gap) // 2
         row_height = Inches(config.grid_row_height_in)
+        if available_height is not None:
+            needed_height = row_height * 2 + gap
+            shrink = min(1.0, available_height / needed_height) if needed_height else 1.0
+            row_height = max(1, int(row_height * shrink))
+            gap = max(1, int(gap * shrink))
+            col_width = max(1, (content_width - gap) // 2)
         positions = self._grid_positions(left, top, col_width, row_height)
-        width, height = col_width - Inches(0.3), row_height - Inches(0.1)
+        width = max(1, int(col_width - Inches(0.3)))
+        height = max(1, int(row_height - Inches(0.1)))
         for idx, option in enumerate(self._renderable_options(question)):
             if idx < len(positions):
                 self._add_option_box(
@@ -455,20 +530,27 @@ class PPTGenerator:
                     height,
                 )
 
-    def _options_list(self, slide, question: Question, left, top, content_width):
+    def _options_list(self, slide, question: Question, left, top, content_width, available_height=None):
         row_height = Inches(self.config.list_row_height_in)
-        for idx, option in enumerate(self._renderable_options(question)):
+        options = self._renderable_options(question)
+        gap = Inches(0.06)
+        if available_height is not None and options:
+            needed_height = row_height * len(options) + gap * max(0, len(options) - 1)
+            shrink = min(1.0, available_height / needed_height) if needed_height else 1.0
+            row_height = max(1, int(row_height * shrink))
+            gap = max(1, int(gap * shrink))
+        for idx, option in enumerate(options):
             self._add_option_box(
                 slide,
                 option.letter,
                 option.text,
                 left,
-                top + idx * row_height,
+                top + idx * (row_height + gap),
                 content_width,
-                row_height - Inches(0.1),
+                max(1, int(row_height - Inches(0.1))),
             )
 
-    def _options_one_row(self, slide, question: Question, left, top, content_width):
+    def _options_one_row(self, slide, question: Question, left, top, content_width, available_height=None):
         config = self.config
         options = self._renderable_options(question)
         if not options:
@@ -477,6 +559,8 @@ class PPTGenerator:
         gap = Inches(config.one_row_gap_in)
         cell_width = (content_width - gap * (option_count - 1)) // option_count if option_count > 1 else content_width
         row_height = Inches(config.one_row_height_in)
+        if available_height is not None:
+            row_height = max(1, min(int(row_height), int(available_height)))
         pad = Inches(0.04)
         for idx, option in enumerate(options):
             x = left + idx * (cell_width + gap)
@@ -486,6 +570,6 @@ class PPTGenerator:
                 option.text,
                 x,
                 top,
-                cell_width - pad,
-                row_height - pad,
+                max(1, int(cell_width - pad)),
+                max(1, int(row_height - pad)),
             )

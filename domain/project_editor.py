@@ -4,6 +4,7 @@ import math
 from typing import Optional
 
 from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, QuestionNode, Section, SUBJECT_DISPLAY_NAMES
+from core.ppt_layout import sanitize_ppt_layout
 
 _QUESTION_OPTION_LAYOUTS = {"grid", "list", "one_row"}
 _OPTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -203,6 +204,26 @@ def remove_option(question: QuestionNode, letter: str) -> bool:
 def set_question_option_layout(question: QuestionNode, layout: str | None) -> None:
     normalized = (layout or "").strip().lower()
     question.option_layout = normalized if normalized in _QUESTION_OPTION_LAYOUTS else None
+
+
+def set_question_ppt_layout_block(
+    question: QuestionNode,
+    block: str,
+    rect: dict[str, float] | None,
+) -> None:
+    layout = dict(getattr(question, "ppt_layout", {}) or {})
+    normalized_block = (block or "").strip().lower()
+    if not rect:
+        layout.pop(normalized_block, None)
+    else:
+        sanitized = sanitize_ppt_layout({normalized_block: rect})
+        if normalized_block in sanitized:
+            layout[normalized_block] = sanitized[normalized_block]
+    question.ppt_layout = layout
+
+
+def clear_question_ppt_layout(question: QuestionNode) -> None:
+    question.ppt_layout = {}
 
 
 def rename_material(material: MaterialSet, new_header: str) -> None:

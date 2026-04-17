@@ -28,6 +28,7 @@ from domain.models import ALL_SUBJECT_KINDS, SUBJECT_DISPLAY_NAMES
 from domain.project_editor import (
     apply_all_safe_subject_suggestions,
     apply_section_subject_suggestion,
+    clear_question_ppt_layout,
     clear_option_image,
     insert_option_after,
     insert_material_after,
@@ -41,9 +42,18 @@ from domain.project_editor import (
     rename_material,
     renumber_question,
     section_subject_suggestion,
+    set_question_ppt_layout_block,
     set_question_option_layout,
     update_option_text,
     update_question_stem,
+)
+from core.ppt_layout import (
+    build_effective_question_layout,
+    is_option_layout_block,
+    normalize_layout_rect,
+    option_layout_block_key,
+    option_layout_block_letter,
+    scale_layout_rect,
 )
 from core.ppt_generator import PPTGenerator, PPTConfig
 from core.ppt_style import parse_hex_color
@@ -55,7 +65,7 @@ from core.project_quality import (
     question_review_summary,
     severity_rank,
 )
-from core.models import Question
+from core.models import Option, Question
 from exporters.manifest_json import load_project_manifest_project
 from exporters.material_crops import crop_material_regions, crop_page_regions
 from exporters.pptx_slides import iter_project_question_nodes, project_to_ppt_questions
@@ -71,6 +81,9 @@ _PDF_WIZARD_STEPS = (
     ("结果预览", "校对题号、材料和题目归属；这一步的人工修正会直接用于导出。"),
     ("导出结果", "从当前题目工程导出 Word / JSON；需要做 PPT 时，再把 Word 交给 Word 工作流继续解析。"),
 )
+_PPT_SLIDE_WIDTH_IN = 13.333
+_PPT_SLIDE_HEIGHT_IN = 7.5
+_PPT_LAYOUT_FIELD_STEP_IN = 0.05
 _PDF_SUBJECT_ORDER = tuple(ALL_SUBJECT_KINDS)
 _PDF_QUESTION_LAYOUT_CHOICES = (
     ("", "跟随全局"),
@@ -194,6 +207,11 @@ class PPTConvertApp:
         self.pdf_question_range = tk.StringVar()
         self._pdf_question_layout_var = tk.StringVar(value="")
         self._pdf_question_editor_message = tk.StringVar(value="选择一道题后，可在这里实时修改题干，并为该题单独切换选项布局。")
+        self._pdf_layout_editor_status_var = tk.StringVar(value="选择一道题后，可像编辑 PPT 一样拖动题干区、图片区和选项区。")
+        self._pdf_layout_x_var = tk.DoubleVar(value=0.0)
+        self._pdf_layout_y_var = tk.DoubleVar(value=0.0)
+        self._pdf_layout_w_var = tk.DoubleVar(value=0.0)
+        self._pdf_layout_h_var = tk.DoubleVar(value=0.0)
         self._pdf_ai_suggestion_var = tk.StringVar(value="AI 建议会在这里显示，当前先聚焦待确认题。")
         self._pdf_ai_strategy_var = tk.StringVar(value="修复策略会在这里显示。")
         self._ai_status_var = tk.StringVar(value="本地 AI 修复会直接写回当前工程，不依赖外部接口。")
@@ -223,6 +241,14 @@ class PPTConvertApp:
         self._pdf_option_insert_buttons: dict[str, ttk.Button] = {}
         self._pdf_option_remove_buttons: dict[str, ttk.Button] = {}
         self._pdf_project_dirty = False
+        self._pdf_preview_rects: dict[str, tuple[float, float, float, float]] = {}
+        self._pdf_preview_slide_bounds: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+        self._pdf_preview_selected_block: str | None = None
+        self._pdf_preview_drag_state: dict[str, object] | None = None
+        self._pdf_preview_action_buttons: list[ttk.Button] = []
+        self._pdf_layout_value_inputs: list[ttk.Spinbox] = []
+        self._pdf_layout_field_buttons: list[ttk.Button] = []
+        self._pdf_layout_fields_updating = False
         self._pdf_slide_status_var = tk.StringVar(value="选择左侧 PPT 页后，可以逐页预览并实时编辑。")
         self._pdf_review_status_var = tk.StringVar(value="AI 质检会在预览生成后自动标出待确认题目。")
         self._ai_repair_busy = False
@@ -1690,11 +1716,101 @@ class PPTConvertApp:
         preview_box.pack(fill=BOTH, expand=YES)
         ttk.Label(
             preview_box,
-            text="基于当前题干、选项和布局即时刷新，用来快速判断一行 / 两行 / 四行效果。",
+            text="现在可以直接在这里拖动、缩放题干区 / 图片区 / 选项区；导出 PPT 时会真正按当前单题版式生成。",
             wraplength=430,
             justify=LEFT,
             bootstyle="secondary",
         ).pack(anchor=W, pady=(0, 6))
+        preview_toolbar = ttk.Frame(preview_box)
+        preview_toolbar.pack(fill=X, pady=(0, 6))
+        ttk.Label(
+            preview_toolbar,
+            textvariable=self._pdf_layout_editor_status_var,
+            bootstyle="secondary",
+        ).pack(side=LEFT, fill=X, expand=YES)
+        self._pdf_reset_question_layout_btn = ttk.Button(
+            preview_toolbar,
+            text="重置当前题版式",
+            command=self._reset_pdf_question_ppt_layout,
+            bootstyle="secondary-outline",
+            width=14,
+            state=DISABLED,
+        )
+        self._pdf_reset_question_layout_btn.pack(side=LEFT)
+        preview_action_row = ttk.Frame(preview_box)
+        preview_action_row.pack(fill=X, pady=(0, 6))
+        ttk.Label(
+            preview_action_row,
+            text="快捷动作：",
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(0, 6))
+        for text, action in (
+            ("贴左", "left"),
+            ("居中", "hcenter"),
+            ("贴右", "right"),
+            ("贴顶", "top"),
+            ("中线", "vcenter"),
+            ("贴底", "bottom"),
+            ("铺宽", "fill_width"),
+            ("铺高", "fill_height"),
+        ):
+            button = ttk.Button(
+                preview_action_row,
+                text=text,
+                command=lambda value=action: self._align_selected_pdf_preview_block(value),
+                bootstyle="light-outline",
+                width=7,
+                state=DISABLED,
+            )
+            button.pack(side=LEFT, padx=(0, 4))
+            self._pdf_preview_action_buttons.append(button)
+        ttk.Label(
+            preview_action_row,
+            text="方向键微调，Shift 加速，Ctrl+方向键缩放",
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(8, 0))
+        preview_metric_row = ttk.Frame(preview_box)
+        preview_metric_row.pack(fill=X, pady=(0, 6))
+        ttk.Label(
+            preview_metric_row,
+            text="精确尺寸（英寸）：",
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(0, 6))
+        for label, variable, upper in (
+            ("X", self._pdf_layout_x_var, _PPT_SLIDE_WIDTH_IN),
+            ("Y", self._pdf_layout_y_var, _PPT_SLIDE_HEIGHT_IN),
+            ("宽", self._pdf_layout_w_var, _PPT_SLIDE_WIDTH_IN),
+            ("高", self._pdf_layout_h_var, _PPT_SLIDE_HEIGHT_IN),
+        ):
+            ttk.Label(preview_metric_row, text=label, bootstyle="secondary").pack(side=LEFT)
+            field = ttk.Spinbox(
+                preview_metric_row,
+                from_=0,
+                to=upper,
+                increment=_PPT_LAYOUT_FIELD_STEP_IN,
+                textvariable=variable,
+                width=7,
+                state=DISABLED,
+            )
+            field.pack(side=LEFT, padx=(2, 8))
+            field.bind("<Return>", self._apply_pdf_preview_numeric_layout)
+            field.bind("<FocusOut>", self._apply_pdf_preview_numeric_layout)
+            self._pdf_layout_value_inputs.append(field)
+        apply_btn = ttk.Button(
+            preview_metric_row,
+            text="应用",
+            command=self._apply_pdf_preview_numeric_layout,
+            bootstyle="info-outline",
+            width=7,
+            state=DISABLED,
+        )
+        apply_btn.pack(side=LEFT, padx=(0, 6))
+        self._pdf_layout_field_buttons.append(apply_btn)
+        ttk.Label(
+            preview_metric_row,
+            text="直接输入位置和尺寸，回车或失焦会自动生效。",
+            bootstyle="secondary",
+        ).pack(side=LEFT, padx=(4, 0))
         self._pdf_question_preview_canvas = tk.Canvas(
             preview_box,
             height=300,
@@ -1706,6 +1822,25 @@ class PPTConvertApp:
             "<Configure>",
             lambda _event: self._render_pdf_question_editor_preview(),
         )
+        self._pdf_question_preview_canvas.bind("<ButtonPress-1>", self._on_pdf_question_preview_press)
+        self._pdf_question_preview_canvas.bind("<B1-Motion>", self._on_pdf_question_preview_drag)
+        self._pdf_question_preview_canvas.bind("<ButtonRelease-1>", self._on_pdf_question_preview_release)
+        self._pdf_question_preview_canvas.bind("<Motion>", self._on_pdf_question_preview_motion)
+        for sequence in (
+            "<Left>",
+            "<Right>",
+            "<Up>",
+            "<Down>",
+            "<Shift-Left>",
+            "<Shift-Right>",
+            "<Shift-Up>",
+            "<Shift-Down>",
+            "<Control-Left>",
+            "<Control-Right>",
+            "<Control-Up>",
+            "<Control-Down>",
+        ):
+            self._pdf_question_preview_canvas.bind(sequence, self._on_pdf_question_preview_nudge)
         self._clear_pdf_question_editor()
 
     def _build_pdf_material_preview_panel(self, parent):
@@ -3009,6 +3144,14 @@ class PPTConvertApp:
             self._pdf_question_stem_editor.configure(state=state)
         for button in getattr(self, "_pdf_question_layout_buttons", []):
             button.configure(state=state)
+        if getattr(self, "_pdf_reset_question_layout_btn", None):
+            self._pdf_reset_question_layout_btn.configure(state=state)
+        for button in getattr(self, "_pdf_preview_action_buttons", []):
+            button.configure(state=state)
+        for field in getattr(self, "_pdf_layout_value_inputs", []):
+            field.configure(state=state)
+        for button in getattr(self, "_pdf_layout_field_buttons", []):
+            button.configure(state=state)
         for editor in getattr(self, "_pdf_option_editors", {}).values():
             editor.configure(state=state)
         for button_map in (
@@ -3121,6 +3264,12 @@ class PPTConvertApp:
         self._set_pdf_stem_preview_message("当前题目没有题干图片。", "暂无题干图片")
         self._rebuild_pdf_option_editors(None)
         self._pdf_question_layout_var.set("")
+        self._pdf_preview_selected_block = None
+        self._pdf_preview_drag_state = None
+        self._pdf_layout_editor_status_var.set(
+            "选择一道题后，可像编辑 PPT 一样拖动题干区、图片区和选项区。"
+        )
+        self._sync_pdf_layout_fields()
         self._set_pdf_question_editor_state(False)
         self._pdf_editor_updating = False
         self._pdf_question_editor_message.set(
@@ -3152,10 +3301,13 @@ class PPTConvertApp:
         self._refresh_pdf_stem_preview_for_question(question)
         self._rebuild_pdf_option_editors(question)
         self._pdf_question_layout_var.set((question.option_layout or "").strip().lower())
+        self._pdf_preview_selected_block = "stem"
+        self._pdf_preview_drag_state = None
         self._pdf_editor_updating = False
         self._set_pdf_question_editor_state(True)
         self._refresh_pdf_question_editor_message(payload)
         self._refresh_pdf_ai_suggestion(payload)
+        self._refresh_pdf_layout_editor_status(question)
         self._render_pdf_question_editor_preview()
 
     def _sync_selected_question_preview_payload(self):
@@ -3506,7 +3658,7 @@ class PPTConvertApp:
     def _draw_pdf_preview_thumbnail(self, canvas, image_path: str, x0: float, y0: float, width: float, height: float) -> bool:
         if not image_path or not os.path.exists(image_path):
             return False
-        if width < 24 or height < 24:
+        if width < 12 or height < 12:
             return False
         try:
             with Image.open(image_path) as source_image:
@@ -3527,6 +3679,54 @@ class PPTConvertApp:
             anchor=CENTER,
         )
         return True
+
+    def _draw_pdf_preview_image_gallery(
+        self,
+        canvas,
+        image_paths: list[str],
+        x0: float,
+        y0: float,
+        width: float,
+        height: float,
+    ) -> int:
+        valid_paths = [path for path in image_paths if path and os.path.exists(path)]
+        if not valid_paths or width < 24 or height < 24:
+            return 0
+        count = len(valid_paths)
+        if count == 1:
+            return 1 if self._draw_pdf_preview_thumbnail(canvas, valid_paths[0], x0, y0, width, height) else 0
+        gap = 6.0
+        best_cols = 1
+        best_score = -1.0
+        max_cols = min(count, 4)
+        for candidate_cols in range(1, max_cols + 1):
+            candidate_rows = max(1, (count + candidate_cols - 1) // candidate_cols)
+            candidate_cell_width = (width - gap * (candidate_cols - 1)) / candidate_cols
+            candidate_cell_height = (height - gap * (candidate_rows - 1)) / candidate_rows
+            candidate_score = min(candidate_cell_width, candidate_cell_height)
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_cols = candidate_cols
+        cols = best_cols
+        rows = max(1, (count + cols - 1) // cols)
+        cell_width = max(18.0, (width - gap * (cols - 1)) / cols)
+        cell_height = max(18.0, (height - gap * (rows - 1)) / rows)
+        drawn = 0
+        for index, path in enumerate(valid_paths):
+            row = index // cols
+            col = index % cols
+            cell_x0 = x0 + col * (cell_width + gap)
+            cell_y0 = y0 + row * (cell_height + gap)
+            if self._draw_pdf_preview_thumbnail(
+                canvas,
+                path,
+                cell_x0,
+                cell_y0,
+                cell_width,
+                cell_height,
+            ):
+                drawn += 1
+        return drawn
 
     def _draw_pdf_question_preview_option(self, canvas, option, x0, y0, width, height, fill, outline):
         canvas.create_rectangle(x0, y0, x0 + width, y0 + height, fill=fill, outline=outline, width=2)
@@ -3673,12 +3873,543 @@ class PPTConvertApp:
         weight = "bold" if bold else "normal"
         return "\n".join(chosen_lines), (self.font_name.get().strip() or "微软雅黑", -chosen_px, weight)
 
+    def _pdf_preview_block_label(self, block: str) -> str:
+        if is_option_layout_block(block):
+            letter = option_layout_block_letter(block)
+            return f"{letter} 选项"
+        return {
+            "stem": "题干区",
+            "image": "图片区",
+            "options": "选项区",
+        }.get((block or "").strip().lower(), "版式区")
+
+    def _refresh_pdf_layout_editor_status(self, question=None):
+        target = question or self._pdf_question_editor_target
+        if target is None:
+            self._pdf_layout_editor_status_var.set(
+                "选择一道题后，可像编辑 PPT 一样拖动区块，或直接输入 X/Y/宽/高。"
+            )
+            return
+        block = self._pdf_preview_selected_block or "stem"
+        block_label = self._pdf_preview_block_label(block)
+        override_count = len(getattr(target, "ppt_layout", {}) or {})
+        if override_count:
+            self._pdf_layout_editor_status_var.set(
+                f"当前选中：{block_label}。已启用 {override_count} 个单题版式覆盖，可拖动、缩放，也可直接输入 X/Y/宽/高。"
+            )
+        else:
+            self._pdf_layout_editor_status_var.set(
+                f"当前选中：{block_label}。当前仍跟随全局版式，开始拖动或输入尺寸后会自动生成单题布局。"
+            )
+
+    def _pdf_preview_rect_to_inches(
+        self,
+        rect: tuple[float, float, float, float] | None,
+    ) -> tuple[float, float, float, float]:
+        if not rect:
+            return (0.0, 0.0, 0.0, 0.0)
+        slide_left, slide_top, slide_right, slide_bottom = self._pdf_preview_slide_bounds
+        slide_width = max(1.0, slide_right - slide_left)
+        slide_height = max(1.0, slide_bottom - slide_top)
+        x0, y0, x1, y1 = rect
+        return (
+            max(0.0, (x0 - slide_left) * _PPT_SLIDE_WIDTH_IN / slide_width),
+            max(0.0, (y0 - slide_top) * _PPT_SLIDE_HEIGHT_IN / slide_height),
+            max(0.0, (x1 - x0) * _PPT_SLIDE_WIDTH_IN / slide_width),
+            max(0.0, (y1 - y0) * _PPT_SLIDE_HEIGHT_IN / slide_height),
+        )
+
+    def _pdf_preview_inches_to_rect(
+        self,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+    ) -> tuple[float, float, float, float]:
+        slide_left, slide_top, slide_right, slide_bottom = self._pdf_preview_slide_bounds
+        slide_width = max(1.0, slide_right - slide_left)
+        slide_height = max(1.0, slide_bottom - slide_top)
+        px_x0 = slide_left + max(0.0, x) * slide_width / _PPT_SLIDE_WIDTH_IN
+        px_y0 = slide_top + max(0.0, y) * slide_height / _PPT_SLIDE_HEIGHT_IN
+        px_width = max(0.0, width) * slide_width / _PPT_SLIDE_WIDTH_IN
+        px_height = max(0.0, height) * slide_height / _PPT_SLIDE_HEIGHT_IN
+        return (px_x0, px_y0, px_x0 + px_width, px_y0 + px_height)
+
+    def _constrain_pdf_preview_rect(
+        self,
+        block: str | None,
+        rect: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        bound_x0, bound_y0, bound_x1, bound_y1 = self._pdf_preview_parent_bounds(block)
+        min_width = 52.0
+        min_height = 34.0
+        max_width = max(min_width, bound_x1 - bound_x0)
+        max_height = max(min_height, bound_y1 - bound_y0)
+        x0, y0, x1, y1 = rect
+        width = min(max_width, max(min_width, x1 - x0))
+        height = min(max_height, max(min_height, y1 - y0))
+        x0 = min(bound_x1 - width, max(bound_x0, x0))
+        y0 = min(bound_y1 - height, max(bound_y0, y0))
+        return (x0, y0, x0 + width, y0 + height)
+
+    def _sync_pdf_layout_fields(self, question=None):
+        block = self._pdf_preview_selected_block or "stem"
+        rect = self._pdf_preview_rects.get(block)
+        x, y, width, height = self._pdf_preview_rect_to_inches(rect)
+        self._pdf_layout_fields_updating = True
+        try:
+            self._pdf_layout_x_var.set(round(x, 2))
+            self._pdf_layout_y_var.set(round(y, 2))
+            self._pdf_layout_w_var.set(round(width, 2))
+            self._pdf_layout_h_var.set(round(height, 2))
+        finally:
+            self._pdf_layout_fields_updating = False
+
+    def _build_pdf_preview_render_question(self, question) -> Question:
+        section, material = self._find_pdf_question_context(question)
+        material_image_paths: list[str] = []
+        question_image_paths = [
+            asset.path
+            for asset in getattr(question, "stem_assets", []) or []
+            if getattr(asset, "path", None) and os.path.exists(asset.path)
+        ]
+        material_header = None
+        material_text = None
+        if section is not None and getattr(section, "kind", "") == "data" and material is not None:
+            preview_source, preview_paths = self._material_preview_entries(material)
+            material_image_paths = [path for path in preview_paths if path and os.path.exists(path)]
+            if preview_source != "PDF 区域预览":
+                material_header = (getattr(material, "header", "") or "").strip() or None
+                material_text = (getattr(material, "body", "") or "").strip() or None
+        image_paths = [*material_image_paths, *question_image_paths]
+        return Question(
+            number=getattr(question, "numeric_source_number", None) or 1,
+            stem=getattr(question, "stem", "") or "",
+            options=[
+                Option(
+                    letter=option.letter,
+                    text=option.text,
+                    image_path=option.image_path,
+                )
+                for option in getattr(question, "options", []) or []
+            ],
+            image_paths=image_paths,
+            question_image_paths=question_image_paths,
+            material_image_paths=material_image_paths,
+            source_question_number=(getattr(question, "source_number", "") or "").strip() or None,
+            material_header=material_header,
+            material_text=material_text,
+            option_layout=getattr(question, "option_layout", None),
+            ppt_layout=copy.deepcopy(getattr(question, "ppt_layout", {}) or {}),
+            section_kind=getattr(section, "kind", None) if section is not None else None,
+            section_title=getattr(section, "title", None) if section is not None else None,
+        )
+
+    def _effective_pdf_question_layout(self, question) -> dict[str, dict[str, float]]:
+        render_question = self._build_pdf_preview_render_question(question)
+        return build_effective_question_layout(render_question, self._make_ppt_config())
+
+    def _pdf_preview_hit_test(self, x: float, y: float) -> tuple[str | None, str | None]:
+        option_blocks = sorted(
+            block
+            for block in self._pdf_preview_rects.keys()
+            if is_option_layout_block(block)
+        )
+        for block in [*option_blocks, "options", "image", "stem"]:
+            rect = self._pdf_preview_rects.get(block)
+            if not rect:
+                continue
+            x0, y0, x1, y1 = rect
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                continue
+            handle_size = 10
+            if x >= x1 - handle_size and y >= y1 - handle_size:
+                return block, "resize"
+            return block, "move"
+        return None, None
+
+    def _move_option_block_overrides_with_options_region(
+        self,
+        question,
+        *,
+        old_rect: tuple[float, float, float, float],
+        new_rect: tuple[float, float, float, float],
+    ):
+        overrides = dict(getattr(question, "ppt_layout", {}) or {})
+        option_override_blocks = [
+            block for block in overrides.keys() if is_option_layout_block(block)
+        ]
+        if not option_override_blocks:
+            return
+        old_x0, old_y0, old_x1, old_y1 = old_rect
+        new_x0, new_y0, new_x1, new_y1 = new_rect
+        old_w = max(1e-6, old_x1 - old_x0)
+        old_h = max(1e-6, old_y1 - old_y0)
+        new_w = max(1e-6, new_x1 - new_x0)
+        new_h = max(1e-6, new_y1 - new_y0)
+        effective_layout = self._effective_pdf_question_layout(question)
+        for block in option_override_blocks:
+            child_rect = effective_layout.get(block)
+            if not child_rect:
+                continue
+            child_x0, child_y0, child_x1, child_y1 = scale_layout_rect(
+                child_rect,
+                max(1.0, self._pdf_preview_slide_bounds[2] - self._pdf_preview_slide_bounds[0]),
+                max(1.0, self._pdf_preview_slide_bounds[3] - self._pdf_preview_slide_bounds[1]),
+                offset_x=self._pdf_preview_slide_bounds[0],
+                offset_y=self._pdf_preview_slide_bounds[1],
+            )
+            rel_x = (child_x0 - old_x0) / old_w
+            rel_y = (child_y0 - old_y0) / old_h
+            rel_w = (child_x1 - child_x0) / old_w
+            rel_h = (child_y1 - child_y0) / old_h
+            moved_rect = (
+                new_x0 + rel_x * new_w,
+                new_y0 + rel_y * new_h,
+                new_x0 + (rel_x + rel_w) * new_w,
+                new_y0 + (rel_y + rel_h) * new_h,
+            )
+            self._apply_pdf_preview_layout_rect(question, block, moved_rect)
+
+    def _pdf_preview_parent_bounds(self, block: str | None) -> tuple[float, float, float, float]:
+        if is_option_layout_block(block):
+            return self._pdf_preview_rects.get("options") or self._pdf_preview_slide_bounds
+        return self._pdf_preview_slide_bounds
+
+    def _commit_pdf_preview_block_rect(
+        self,
+        question,
+        block: str,
+        rect: tuple[float, float, float, float],
+        *,
+        action: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        current_rect = self._pdf_preview_rects.get(block)
+        if current_rect is None:
+            return False
+        before_state = self._capture_pdf_question_state(question)
+        if block == "options":
+            self._move_option_block_overrides_with_options_region(
+                question,
+                old_rect=current_rect,
+                new_rect=rect,
+            )
+        self._apply_pdf_preview_layout_rect(question, block, rect)
+        after_layout = (getattr(question, "ppt_layout", {}) or {}).get(block)
+        before_layout = (before_state.get("ppt_layout") or {}).get(block)
+        if before_layout == after_layout:
+            return False
+        self._mark_pdf_project_dirty()
+        self._sync_selected_question_preview_payload()
+        payload = dict(metadata or {})
+        payload.setdefault("block", block)
+        payload.setdefault("rect", after_layout or {})
+        self._log_pdf_question_event(
+            action=action,
+            question=question,
+            before_state=before_state,
+            metadata=payload,
+        )
+        self._refresh_pdf_layout_editor_status(question)
+        self._render_pdf_question_editor_preview()
+        return True
+
+    def _align_selected_pdf_preview_block(self, action: str):
+        question = self._pdf_question_editor_target
+        block = self._pdf_preview_selected_block
+        if question is None or not block:
+            return
+        rect = self._pdf_preview_rects.get(block)
+        if not rect:
+            return
+        x0, y0, x1, y1 = rect
+        width = x1 - x0
+        height = y1 - y0
+        bound_x0, bound_y0, bound_x1, bound_y1 = self._pdf_preview_parent_bounds(block)
+        if action == "left":
+            new_rect = (bound_x0, y0, bound_x0 + width, y1)
+        elif action == "hcenter":
+            new_x0 = bound_x0 + max(0.0, (bound_x1 - bound_x0 - width) / 2.0)
+            new_rect = (new_x0, y0, new_x0 + width, y1)
+        elif action == "right":
+            new_x1 = bound_x1
+            new_rect = (new_x1 - width, y0, new_x1, y1)
+        elif action == "top":
+            new_rect = (x0, bound_y0, x1, bound_y0 + height)
+        elif action == "vcenter":
+            new_y0 = bound_y0 + max(0.0, (bound_y1 - bound_y0 - height) / 2.0)
+            new_rect = (x0, new_y0, x1, new_y0 + height)
+        elif action == "bottom":
+            new_y1 = bound_y1
+            new_rect = (x0, new_y1 - height, x1, new_y1)
+        elif action == "fill_width":
+            new_rect = (bound_x0, y0, bound_x1, y1)
+        elif action == "fill_height":
+            new_rect = (x0, bound_y0, x1, bound_y1)
+        else:
+            return
+        new_rect = self._constrain_pdf_preview_rect(block, new_rect)
+        self._commit_pdf_preview_block_rect(
+            question,
+            block,
+            new_rect,
+            action="align_question_ppt_layout",
+            metadata={"align": action},
+        )
+
+    def _apply_pdf_preview_numeric_layout(self, event=None):
+        if self._pdf_layout_fields_updating:
+            return "break" if event is not None else None
+        question = self._pdf_question_editor_target
+        block = self._pdf_preview_selected_block
+        if question is None or not block:
+            return "break" if event is not None else None
+        try:
+            x = float(self._pdf_layout_x_var.get())
+            y = float(self._pdf_layout_y_var.get())
+            width = float(self._pdf_layout_w_var.get())
+            height = float(self._pdf_layout_h_var.get())
+        except (tk.TclError, ValueError):
+            self._sync_pdf_layout_fields(question)
+            return "break" if event is not None else None
+        rect = self._pdf_preview_inches_to_rect(x, y, width, height)
+        rect = self._constrain_pdf_preview_rect(block, rect)
+        self._commit_pdf_preview_block_rect(
+            question,
+            block,
+            rect,
+            action="set_question_ppt_layout_fields",
+            metadata={
+                "units": "in",
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "width": round(width, 2),
+                "height": round(height, 2),
+            },
+        )
+        return "break" if event is not None else None
+
+    def _on_pdf_question_preview_nudge(self, event):
+        question = self._pdf_question_editor_target
+        block = self._pdf_preview_selected_block
+        if question is None or not block:
+            return "break"
+        rect = self._pdf_preview_rects.get(block)
+        if not rect:
+            return "break"
+        step = 8.0 if (event.state & 0x0001) else 2.0
+        resize = bool(event.state & 0x0004)
+        x0, y0, x1, y1 = rect
+        bound_x0, bound_y0, bound_x1, bound_y1 = self._pdf_preview_parent_bounds(block)
+        delta_x = 0.0
+        delta_y = 0.0
+        keysym = str(getattr(event, "keysym", "") or "")
+        if keysym == "Left":
+            delta_x = -step
+        elif keysym == "Right":
+            delta_x = step
+        elif keysym == "Up":
+            delta_y = -step
+        elif keysym == "Down":
+            delta_y = step
+        else:
+            return "break"
+        if resize:
+            min_width = 52.0
+            min_height = 34.0
+            new_x1 = min(bound_x1, max(x0 + min_width, x1 + delta_x))
+            new_y1 = min(bound_y1, max(y0 + min_height, y1 + delta_y))
+            new_rect = (x0, y0, new_x1, new_y1)
+        else:
+            width = x1 - x0
+            height = y1 - y0
+            new_x0 = min(bound_x1 - width, max(bound_x0, x0 + delta_x))
+            new_y0 = min(bound_y1 - height, max(bound_y0, y0 + delta_y))
+            new_rect = (new_x0, new_y0, new_x0 + width, new_y0 + height)
+        new_rect = self._constrain_pdf_preview_rect(block, new_rect)
+        self._commit_pdf_preview_block_rect(
+            question,
+            block,
+            new_rect,
+            action="nudge_question_ppt_layout",
+            metadata={
+                "keysym": keysym,
+                "resize": resize,
+                "step": step,
+            },
+        )
+        return "break"
+
+    def _update_pdf_preview_cursor(self, event=None):
+        canvas = getattr(self, "_pdf_question_preview_canvas", None)
+        if canvas is None:
+            return
+        if self._pdf_preview_drag_state:
+            mode = str(self._pdf_preview_drag_state.get("mode") or "move")
+            canvas.configure(cursor="size_nw_se" if mode == "resize" else "fleur")
+            return
+        if event is None:
+            canvas.configure(cursor="")
+            return
+        block, mode = self._pdf_preview_hit_test(event.x, event.y)
+        if not block:
+            canvas.configure(cursor="")
+        elif mode == "resize":
+            canvas.configure(cursor="size_nw_se")
+        else:
+            canvas.configure(cursor="fleur")
+
+    def _apply_pdf_preview_layout_rect(
+        self,
+        question,
+        block: str,
+        rect: tuple[float, float, float, float],
+    ):
+        slide_left, slide_top, slide_right, slide_bottom = self._pdf_preview_slide_bounds
+        slide_width = max(1.0, slide_right - slide_left)
+        slide_height = max(1.0, slide_bottom - slide_top)
+        normalized = normalize_layout_rect(
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
+            origin_x=slide_left,
+            origin_y=slide_top,
+            width=slide_width,
+            height=slide_height,
+        )
+        set_question_ppt_layout_block(question, block, normalized)
+        self._refresh_pdf_layout_editor_status(question)
+
+    def _reset_pdf_question_ppt_layout(self):
+        question = self._pdf_question_editor_target
+        if question is None or not getattr(question, "ppt_layout", None):
+            return
+        before_state = self._capture_pdf_question_state(question)
+        clear_question_ppt_layout(question)
+        self._pdf_preview_selected_block = "stem"
+        self._mark_pdf_project_dirty()
+        self._sync_selected_question_preview_payload()
+        self._refresh_pdf_layout_editor_status(question)
+        self._log_pdf_question_event(
+            action="reset_question_ppt_layout",
+            question=question,
+            before_state=before_state,
+        )
+
+    def _on_pdf_question_preview_press(self, event):
+        question = self._pdf_question_editor_target
+        if question is None:
+            return
+        canvas = getattr(self, "_pdf_question_preview_canvas", None)
+        if canvas is not None:
+            canvas.focus_set()
+        block, mode = self._pdf_preview_hit_test(event.x, event.y)
+        if not block:
+            self._pdf_preview_selected_block = None
+            self._refresh_pdf_layout_editor_status(question)
+            self._render_pdf_question_editor_preview()
+            self._update_pdf_preview_cursor(event)
+            return
+        rect = self._pdf_preview_rects.get(block)
+        if not rect:
+            return
+        self._pdf_preview_selected_block = block
+        self._pdf_preview_drag_state = {
+            "block": block,
+            "mode": mode,
+            "start_x": float(event.x),
+            "start_y": float(event.y),
+            "origin_rect": rect,
+            "before_state": self._capture_pdf_question_state(question),
+        }
+        self._refresh_pdf_layout_editor_status(question)
+        self._render_pdf_question_editor_preview()
+        self._update_pdf_preview_cursor(event)
+
+    def _on_pdf_question_preview_drag(self, event):
+        question = self._pdf_question_editor_target
+        drag_state = self._pdf_preview_drag_state
+        if question is None or not drag_state:
+            return
+        block = str(drag_state.get("block") or "")
+        mode = str(drag_state.get("mode") or "move")
+        x0, y0, x1, y1 = drag_state.get("origin_rect") or (0.0, 0.0, 0.0, 0.0)
+        start_x = float(drag_state.get("start_x") or 0.0)
+        start_y = float(drag_state.get("start_y") or 0.0)
+        dx = float(event.x) - start_x
+        dy = float(event.y) - start_y
+        slide_left, slide_top, slide_right, slide_bottom = self._pdf_preview_slide_bounds
+        if is_option_layout_block(block):
+            option_bounds = self._pdf_preview_rects.get("options")
+            if option_bounds:
+                slide_left, slide_top, slide_right, slide_bottom = option_bounds
+        min_width = 52.0
+        min_height = 34.0
+        if mode == "resize":
+            new_x0, new_y0 = x0, y0
+            new_x1 = min(slide_right, max(x0 + min_width, x1 + dx))
+            new_y1 = min(slide_bottom, max(y0 + min_height, y1 + dy))
+        else:
+            rect_width = x1 - x0
+            rect_height = y1 - y0
+            new_x0 = min(slide_right - rect_width, max(slide_left, x0 + dx))
+            new_y0 = min(slide_bottom - rect_height, max(slide_top, y0 + dy))
+            new_x1 = new_x0 + rect_width
+            new_y1 = new_y0 + rect_height
+        new_x0, new_y0, new_x1, new_y1 = self._constrain_pdf_preview_rect(
+            block,
+            (new_x0, new_y0, new_x1, new_y1),
+        )
+        if block == "options":
+            self._move_option_block_overrides_with_options_region(
+                question,
+                old_rect=(x0, y0, x1, y1),
+                new_rect=(new_x0, new_y0, new_x1, new_y1),
+            )
+        self._apply_pdf_preview_layout_rect(question, block, (new_x0, new_y0, new_x1, new_y1))
+        self._render_pdf_question_editor_preview()
+        self._update_pdf_preview_cursor(event)
+
+    def _on_pdf_question_preview_release(self, event):
+        question = self._pdf_question_editor_target
+        drag_state = self._pdf_preview_drag_state
+        self._pdf_preview_drag_state = None
+        if question is None or not drag_state:
+            self._update_pdf_preview_cursor(event)
+            return
+        block = str(drag_state.get("block") or "")
+        before_state = drag_state.get("before_state") or {}
+        before_layout = (before_state.get("ppt_layout") or {}).get(block)
+        after_layout = (getattr(question, "ppt_layout", {}) or {}).get(block)
+        if before_layout != after_layout:
+            self._mark_pdf_project_dirty()
+            self._sync_selected_question_preview_payload()
+            self._log_pdf_question_event(
+                action="set_question_ppt_layout",
+                question=question,
+                before_state=before_state,
+                metadata={
+                    "block": block,
+                    "mode": drag_state.get("mode") or "move",
+                    "rect": after_layout or {},
+                },
+            )
+        self._refresh_pdf_layout_editor_status(question)
+        self._render_pdf_question_editor_preview()
+        self._update_pdf_preview_cursor(event)
+
+    def _on_pdf_question_preview_motion(self, event):
+        self._update_pdf_preview_cursor(event)
+
     def _render_pdf_question_editor_preview(self):
         canvas = getattr(self, "_pdf_question_preview_canvas", None)
         if canvas is None:
             return
 
         self._pdf_question_preview_photos = []
+        self._pdf_preview_rects = {}
         canvas.delete("all")
         width = max(460, canvas.winfo_width() or 520)
         height = max(300, canvas.winfo_height() or 320)
@@ -3695,6 +4426,7 @@ class PPTConvertApp:
                 fill="#6b7280",
                 font=("", 11),
             )
+            self._sync_pdf_layout_fields(None)
             return
 
         outer_margin = 14
@@ -3712,15 +4444,10 @@ class PPTConvertApp:
         slide_top = (height - slide_height) / 2
         slide_right = slide_left + slide_width
         slide_bottom = slide_top + slide_height
+        self._pdf_preview_slide_bounds = (slide_left, slide_top, slide_right, slide_bottom)
 
         scale = slide_width / 13.333
         self._pdf_preview_scale_px_per_in = scale
-        margin_left = self.margin_left.get() * scale
-        margin_right = self.margin_right.get() * scale
-        margin_top = self.margin_top.get() * scale
-        content_left = slide_left + margin_left
-        content_top = slide_top + margin_top
-        content_width = max(120, slide_width - margin_left - margin_right)
 
         canvas.create_rectangle(
             slide_left,
@@ -3732,167 +4459,240 @@ class PPTConvertApp:
             width=2,
         )
 
-        stem_text = f"{question.source_number or '-'}".strip(".")
-        stem_prefix = f"{stem_text}. " if stem_text else ""
-        stem_value = f"{stem_prefix}{question.stem or '未填写题干'}".strip()
-        has_image = bool(question.stem_assets)
-        stem_height = (
-            self.stem_h_img.get() if has_image else self.stem_h_no.get()
-        ) * scale
-        cursor_y = content_top
-        wrapped_stem, stem_font = self._fit_preview_text(
-            stem_value,
-            width=max(48, content_width - 16),
-            height=max(40, stem_height - 12),
-            target_points=float(self.font_size_stem.get()),
-            scale_px_per_in=scale,
-            bold=self.stem_bold.get(),
-        )
-        canvas.create_rectangle(
-            content_left,
-            cursor_y,
-            content_left + content_width,
-            cursor_y + stem_height,
-            fill="#eef6ff",
-            outline="#4a90d9",
-            width=2,
-        )
-        stem_align = (self.stem_align.get() or "left").lower()
-        if stem_align == "center":
-            stem_anchor = tk.N
-            stem_justify = CENTER
-            stem_x = content_left + content_width / 2
-        elif stem_align == "right":
-            stem_anchor = tk.NE
-            stem_justify = RIGHT
-            stem_x = content_left + content_width - 8
-        else:
-            stem_anchor = tk.NW
-            stem_justify = LEFT
-            stem_x = content_left + 8
-        canvas.create_text(
-            stem_x,
-            cursor_y + 8,
-            anchor=stem_anchor,
-            width=max(40, content_width - 16),
-            text=wrapped_stem,
-            justify=stem_justify,
-            fill=self.color_stem.get().strip() or "#1A1A2E",
-            font=stem_font,
-        )
-
-        cursor_y += stem_height + self.gap_stem.get() * scale
-        if has_image:
-            image_band_height = min(self.image_max_h.get() * scale, slide_height * 0.22)
-            image_band_width = min(self.image_max_w.get() * scale, content_width)
-            image_align = (self.image_align.get() or "center").lower()
-            if image_align == "right":
-                image_left = content_left + content_width - image_band_width
-            elif image_align == "left":
-                image_left = content_left
-            else:
-                image_left = content_left + (content_width - image_band_width) / 2
+        render_question = self._build_pdf_preview_render_question(question)
+        layout = build_effective_question_layout(render_question, self._make_ppt_config())
+        selected_block = self._pdf_preview_selected_block or "stem"
+        if selected_block not in layout:
+            selected_block = next(iter(layout.keys()), "stem")
+            self._pdf_preview_selected_block = selected_block
+        override_blocks = set((getattr(question, "ppt_layout", {}) or {}).keys())
+        stem_value = PPTGenerator._stem_text_for_question(render_question).strip() or "未填写题干"
+        stem_rect = layout.get("stem")
+        if stem_rect:
+            stem_x0, stem_y0, stem_x1, stem_y1 = scale_layout_rect(
+                stem_rect,
+                slide_width,
+                slide_height,
+                offset_x=slide_left,
+                offset_y=slide_top,
+            )
+            self._pdf_preview_rects["stem"] = (stem_x0, stem_y0, stem_x1, stem_y1)
+            stem_outline = "#4a90d9" if selected_block == "stem" else "#7ba7da"
             canvas.create_rectangle(
-                image_left,
-                cursor_y,
-                image_left + image_band_width,
-                cursor_y + image_band_height,
+                stem_x0,
+                stem_y0,
+                stem_x1,
+                stem_y1,
+                fill="#eef6ff",
+                outline=stem_outline,
+                width=3 if selected_block == "stem" else 2,
+            )
+            canvas.create_text(
+                stem_x0 + 8,
+                stem_y0 + 6,
+                anchor=tk.NW,
+                text=f"题干区{' · 单题' if 'stem' in override_blocks else ''}",
+                fill=stem_outline,
+                font=("", 9, "bold"),
+            )
+            wrapped_stem, stem_font = self._fit_preview_text(
+                stem_value,
+                width=max(48, (stem_x1 - stem_x0) - 16),
+                height=max(40, (stem_y1 - stem_y0) - 24),
+                target_points=float(self.font_size_stem.get()),
+                scale_px_per_in=scale,
+                bold=self.stem_bold.get(),
+            )
+            stem_align = (self.stem_align.get() or "left").lower()
+            if stem_align == "center":
+                stem_anchor = tk.N
+                stem_justify = CENTER
+                stem_x = stem_x0 + (stem_x1 - stem_x0) / 2
+            elif stem_align == "right":
+                stem_anchor = tk.NE
+                stem_justify = RIGHT
+                stem_x = stem_x1 - 8
+            else:
+                stem_anchor = tk.NW
+                stem_justify = LEFT
+                stem_x = stem_x0 + 8
+            canvas.create_text(
+                stem_x,
+                stem_y0 + 24,
+                anchor=stem_anchor,
+                width=max(40, (stem_x1 - stem_x0) - 16),
+                text=wrapped_stem,
+                justify=stem_justify,
+                fill=self.color_stem.get().strip() or "#1A1A2E",
+                font=stem_font,
+            )
+
+        preview_images = list(render_question.image_paths)
+        image_rect = layout.get("image")
+        if image_rect:
+            image_x0, image_y0, image_x1, image_y1 = scale_layout_rect(
+                image_rect,
+                slide_width,
+                slide_height,
+                offset_x=slide_left,
+                offset_y=slide_top,
+            )
+            self._pdf_preview_rects["image"] = (image_x0, image_y0, image_x1, image_y1)
+            image_outline = "#d9a84a" if selected_block == "image" else "#e0b96a"
+            canvas.create_rectangle(
+                image_x0,
+                image_y0,
+                image_x1,
+                image_y1,
                 fill="#fff8e6",
-                outline="#d9a84a",
-                width=2,
+                outline=image_outline,
+                width=3 if selected_block == "image" else 2,
                 dash=(5, 3),
             )
             canvas.create_text(
-                image_left + image_band_width / 2,
-                cursor_y + image_band_height / 2,
-                text=f"题干图片 × {len(question.stem_assets)}",
+                image_x0 + 8,
+                image_y0 + 6,
+                anchor=tk.NW,
+                text=f"图片区{' · 单题' if 'image' in override_blocks else ''}",
                 fill="#996600",
-                font=("", 10, "bold"),
+                font=("", 9, "bold"),
             )
-            cursor_y += image_band_height + self.gap_img.get() * scale
+            if preview_images:
+                drawn = self._draw_pdf_preview_image_gallery(
+                    canvas,
+                    preview_images,
+                    image_x0 + 8,
+                    image_y0 + 24,
+                    max(24, (image_x1 - image_x0) - 16),
+                    max(24, (image_y1 - image_y0) - 34),
+                )
+                if drawn and len(preview_images) > 1:
+                    canvas.create_text(
+                        image_x1 - 8,
+                        image_y0 + 8,
+                        anchor=tk.NE,
+                        text=f"{len(preview_images)} 张",
+                        fill="#996600",
+                        font=("", 9, "bold"),
+                    )
+                elif not drawn:
+                    canvas.create_text(
+                        (image_x0 + image_x1) / 2,
+                        (image_y0 + image_y1) / 2,
+                        text=f"图片素材 × {len(preview_images)}",
+                        fill="#996600",
+                        font=("", 10, "bold"),
+                    )
+            else:
+                canvas.create_text(
+                    (image_x0 + image_x1) / 2,
+                    (image_y0 + image_y1) / 2,
+                    text="当前题目没有图片素材",
+                    fill="#996600",
+                    font=("", 10, "bold"),
+                )
 
-        options_top = cursor_y + self.gap_opts.get() * scale
-        options_height = max(56, slide_bottom - options_top - 12)
-        layout = self._effective_question_option_layout(question)
-        options = list(question.options[:4])
+        options_rect = layout.get("options")
+        layout_kind = self._effective_question_option_layout(question)
+        options = list(render_question.options[:4])
         fills = ["#e3f2fd", "#e8f5e9", "#fce4ec", "#fff3e0"]
         outlines = ["#1976d2", "#43a047", "#c62828", "#e65100"]
-
-        if not options:
-            canvas.create_text(
-                width / 2,
-                options_top + options_height / 2,
-                text="当前题目没有可预览的选项。",
-                fill="#6b7280",
-                font=("", 10),
+        if options_rect:
+            options_x0, options_y0, options_x1, options_y1 = scale_layout_rect(
+                options_rect,
+                slide_width,
+                slide_height,
+                offset_x=slide_left,
+                offset_y=slide_top,
             )
-        elif layout == "one_row":
-            gap = max(4, self.one_row_gap.get() * scale)
-            cell_width = (content_width - gap * (len(options) - 1)) / max(1, len(options))
-            row_height = min(options_height, max(40, self.one_row_h.get() * scale))
-            row_top = options_top + max(0, (options_height - row_height) / 2)
-            for index, option in enumerate(options):
-                x0 = content_left + index * (cell_width + gap)
-                self._draw_pdf_question_preview_option(
-                    canvas,
-                    option,
-                    x0,
-                    row_top,
-                    cell_width,
-                    row_height,
-                    fills[index],
-                    outlines[index],
+            self._pdf_preview_rects["options"] = (options_x0, options_y0, options_x1, options_y1)
+            option_outline = "#6d7f94" if selected_block == "options" else "#aab6c4"
+            canvas.create_rectangle(
+                options_x0,
+                options_y0,
+                options_x1,
+                options_y1,
+                fill="#f7fafc",
+                outline=option_outline,
+                width=3 if selected_block == "options" else 2,
+            )
+            canvas.create_text(
+                options_x0 + 8,
+                options_y0 + 6,
+                anchor=tk.NW,
+                text=f"选项区{' · 单题' if 'options' in override_blocks else ''}",
+                fill=option_outline,
+                font=("", 9, "bold"),
+            )
+            if not options:
+                canvas.create_text(
+                    (options_x0 + options_x1) / 2,
+                    (options_y0 + options_y1) / 2,
+                    text="当前题目没有可预览的选项。",
+                    fill="#6b7280",
+                    font=("", 10),
                 )
-        elif layout == "list":
-            gap = max(4, scale * 0.06)
-            row_height = max(40, self.list_row_h.get() * scale)
-            needed_height = row_height * len(options) + gap * max(0, len(options) - 1)
-            shrink = min(1.0, options_height / needed_height) if needed_height else 1.0
-            row_height *= shrink
-            gap *= shrink
-            for index, option in enumerate(options):
-                self._draw_pdf_question_preview_option(
-                    canvas,
-                    option,
-                    content_left,
-                    options_top + index * (row_height + gap),
-                    content_width,
-                    row_height,
-                    fills[index],
-                    outlines[index],
-                )
-        else:
-            gap = max(6, self.grid_col_gap.get() * scale)
-            col_width = (content_width - gap) / 2
-            row_height = max(42, self.grid_row_h.get() * scale)
-            needed_height = row_height * 2 + gap
-            shrink = min(1.0, options_height / needed_height) if needed_height else 1.0
-            row_height *= shrink
-            gap *= shrink
-            for index, option in enumerate(options):
-                row = index // 2
-                col = index % 2
-                self._draw_pdf_question_preview_option(
-                    canvas,
-                    option,
-                    content_left + col * (col_width + gap),
-                    options_top + row * (row_height + gap),
-                    col_width,
-                    row_height,
-                    fills[index],
-                    outlines[index],
-                )
+            else:
+                for index, option in enumerate(options):
+                    block = option_layout_block_key(option.letter)
+                    option_rect = layout.get(block)
+                    if not option_rect:
+                        continue
+                    item_x0, item_y0, item_x1, item_y1 = scale_layout_rect(
+                        option_rect,
+                        slide_width,
+                        slide_height,
+                        offset_x=slide_left,
+                        offset_y=slide_top,
+                    )
+                    self._pdf_preview_rects[block] = (item_x0, item_y0, item_x1, item_y1)
+                    outline = outlines[index]
+                    fill = fills[index]
+                    if selected_block == block:
+                        outline = "#111827"
+                    self._draw_pdf_question_preview_option(
+                        canvas,
+                        option,
+                        item_x0,
+                        item_y0,
+                        max(28, item_x1 - item_x0),
+                        max(28, item_y1 - item_y0),
+                        fill,
+                        outline,
+                    )
+                    canvas.create_text(
+                        item_x0 + 8,
+                        item_y0 + 6,
+                        anchor=tk.NW,
+                        text=f"{option.letter}{' · 单题' if block in override_blocks else ''}",
+                        fill=outline,
+                        font=("", 8, "bold"),
+                    )
 
-        layout_label = self._option_layout_label(question.option_layout or layout)
+        for block, rect in self._pdf_preview_rects.items():
+            handle_fill = "#2563eb" if block == selected_block else "#94a3b8"
+            x0, y0, x1, y1 = rect
+            canvas.create_rectangle(
+                x1 - 8,
+                y1 - 8,
+                x1 + 2,
+                y1 + 2,
+                fill=handle_fill,
+                outline="#ffffff",
+                width=1,
+            )
+
+        layout_label = self._option_layout_label(question.option_layout or layout_kind)
         layout_source = "单题覆盖" if question.option_layout else "跟随全局"
         canvas.create_text(
             width - 18,
             height - 16,
             anchor=tk.SE,
-            text=f"{layout_source} · {layout_label}",
+            text=f"{layout_source} · {layout_label} · 拖动块内移动，拖右下角缩放",
             fill="#6b7280",
             font=("", 9),
         )
+        self._sync_pdf_layout_fields(question)
 
     def _selected_pdf_payload(self) -> dict:
         if not getattr(self, "pdf_tree", None):

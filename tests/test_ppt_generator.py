@@ -92,3 +92,101 @@ class PPTGeneratorTest(unittest.TestCase):
         generator._layout_default(slide, question)
 
         self.assertEqual(called, ["one_row"])
+
+    def test_layout_default_honors_question_ppt_layout_override(self):
+        question = Question(
+            number=1,
+            stem="stem",
+            options=[
+                Option("A", "1"),
+                Option("B", "2"),
+                Option("C", "3"),
+                Option("D", "4"),
+            ],
+            ppt_layout={
+                "stem": {"x": 0.12, "y": 0.10, "w": 0.70, "h": 0.20},
+                "options": {"x": 0.10, "y": 0.52, "w": 0.78, "h": 0.24},
+            },
+        )
+        generator = PPTGenerator()
+        generator._prs = generator.tm.create_default()
+        slide = generator._prs.slides.add_slide(generator.tm.get_blank_layout())
+        calls: dict[str, tuple[int, int, int, int]] = {}
+
+        def capture_stem(_slide, _question, left, top, width, height, style_override=None):
+            calls["stem"] = (left, top, width, height)
+
+        def capture_options(_slide, _question, effective_layout):
+            rect = effective_layout["options"]
+            slide_width = generator._prs.slide_width
+            slide_height = generator._prs.slide_height
+            calls["options"] = (
+                int(slide_width * rect["x"]),
+                int(slide_height * rect["y"]),
+                int(slide_width * rect["w"]),
+                int(slide_height * rect["h"]),
+            )
+
+        generator._add_stem_box = capture_stem  # type: ignore[method-assign]
+        generator._layout_options_in_region = capture_options  # type: ignore[method-assign]
+
+        generator._layout_default(slide, question)
+
+        slide_width = generator._prs.slide_width
+        slide_height = generator._prs.slide_height
+        self.assertEqual(
+            calls["stem"],
+            (
+                int(slide_width * 0.12),
+                int(slide_height * 0.10),
+                int(slide_width * 0.70),
+                int(slide_height * 0.20),
+            ),
+        )
+        self.assertEqual(
+            calls["options"],
+            (
+                int(slide_width * 0.10),
+                int(slide_height * 0.52),
+                int(slide_width * 0.78),
+                int(slide_height * 0.24),
+            ),
+        )
+
+    def test_layout_default_honors_per_option_ppt_layout_override(self):
+        question = Question(
+            number=1,
+            stem="stem",
+            options=[
+                Option("A", "1"),
+                Option("B", "2"),
+                Option("C", "3"),
+                Option("D", "4"),
+            ],
+            ppt_layout={
+                "options": {"x": 0.10, "y": 0.50, "w": 0.80, "h": 0.28},
+                "option_a": {"x": 0.14, "y": 0.54, "w": 0.24, "h": 0.10},
+            },
+        )
+        generator = PPTGenerator()
+        generator._prs = generator.tm.create_default()
+        slide = generator._prs.slides.add_slide(generator.tm.get_blank_layout())
+        calls: dict[str, tuple[int, int, int, int]] = {}
+
+        def capture_option(_slide, letter, _text, left, top, width, height, letter_tpl=None, body_tpl=None):
+            calls[letter] = (left, top, width, height)
+
+        generator._add_option_box = capture_option  # type: ignore[method-assign]
+
+        generator._layout_default(slide, question)
+
+        slide_width = generator._prs.slide_width
+        slide_height = generator._prs.slide_height
+        expected = (
+            int(slide_width * 0.14),
+            int(slide_height * 0.54),
+            int(slide_width * 0.24),
+            int(slide_height * 0.10),
+        )
+        for actual_value, expected_value in zip(calls["A"], expected):
+            self.assertLessEqual(abs(actual_value - expected_value), 1)

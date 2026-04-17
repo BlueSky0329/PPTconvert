@@ -23,6 +23,7 @@ class Question:
     material_header: Optional[str] = None
     material_text: Optional[str] = None
     option_layout: Optional[str] = None
+    ppt_layout: dict[str, dict[str, float]] = field(default_factory=dict)
     section_kind: Optional[str] = None
     section_title: Optional[str] = None
 

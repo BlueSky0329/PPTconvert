@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from core.ppt_layout import sanitize_ppt_layout
 from core.repair_action_features import build_repair_state_record
 from domain.models import ExamProject, MaterialSet, QuestionNode, RepairLogEntry, Section
 
@@ -45,6 +46,7 @@ def capture_question_state(
         "question_no": question.source_number or "",
         "section_kind": section.kind,
         "material_id": material.material_id if material is not None else "",
+        "ppt_layout": sanitize_ppt_layout(getattr(question, "ppt_layout", {}) or {}),
         "review_confidence": float(getattr(question, "review_confidence", 1.0) or 1.0),
         "review_issue_codes": [issue.code for issue in (getattr(question, "review_issues", None) or [])],
         "state_record": state_record,

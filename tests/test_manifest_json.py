@@ -70,6 +70,11 @@ class ManifestJsonTest(unittest.TestCase):
                                         page_numbers=[2],
                                         question_id="q-demo-111",
                                         option_layout="one_row",
+                                        ppt_layout={
+                                            "stem": {"x": 0.08, "y": 0.07, "w": 0.84, "h": 0.24},
+                                            "options": {"x": 0.08, "y": 0.56, "w": 0.84, "h": 0.28},
+                                            "option_a": {"x": 0.10, "y": 0.60, "w": 0.40, "h": 0.09},
+                                        },
                                         review_confidence=0.62,
                                         review_issues=[
                                             ReviewIssue(
@@ -133,6 +138,9 @@ class ManifestJsonTest(unittest.TestCase):
             self.assertEqual(question.review_issues[0].code, "option_count")
             self.assertAlmostEqual(question.review_confidence, 0.62, places=2)
             self.assertEqual(question.suggested_subject, "data")
+            self.assertAlmostEqual(question.ppt_layout["stem"]["x"], 0.08, places=3)
+            self.assertAlmostEqual(question.ppt_layout["options"]["h"], 0.28, places=3)
+            self.assertAlmostEqual(question.ppt_layout["option_a"]["w"], 0.40, places=3)
             self.assertEqual(question.inferred_subtype, "表格型资料分析")
             self.assertAlmostEqual(question.inferred_subtype_confidence, 0.88, places=2)
             self.assertEqual(question.inferred_signals[:2], ["根据以下资料", "同比"])
