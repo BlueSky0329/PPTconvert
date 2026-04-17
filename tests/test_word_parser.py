@@ -33,6 +33,10 @@ class WordParserHelpersTest(unittest.TestCase):
             _match_question_start("\u7b2c3\u9898 \u4e2d\u6587\u9898\u5e72"),
             (None, "\u4e2d\u6587\u9898\u5e72"),
         )
+        self.assertEqual(
+            _match_question_start("11. \u591a\u884c\u9898\u5e72\n1\u7532\n2\u4e59"),
+            (None, "\u591a\u884c\u9898\u5e72\n1\u7532\n2\u4e59"),
+        )
         self.assertIsNone(_match_question_start("2024. not a supported plain question prefix"))
 
     def test_parse_options_from_line_supports_multiple_markers(self):
@@ -228,6 +232,39 @@ class WordParserIntegrationTest(unittest.TestCase):
             self.assertEqual(len(questions), 2)
             self.assertEqual(questions[0].section_kind, "quant")
             self.assertEqual(questions[1].section_kind, "reasoning")
+        finally:
+            parser.cleanup()
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def test_parse_docx_multiline_question_starts_do_not_get_absorbed_into_previous_option(self):
+        document = Document()
+        document.add_paragraph("一. 政治理论")
+        document.add_paragraph("1. 第一题题干\n1甲\n2乙\n3丙\n4丁")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+        document.add_paragraph("C. 丙")
+        document.add_paragraph("D. 丁")
+        document.add_paragraph("2. 第二题题干\n1甲\n2乙\n3丙\n4丁")
+        document.add_paragraph("A. 甲")
+        document.add_paragraph("B. 乙")
+        document.add_paragraph("C. 丙")
+        document.add_paragraph("D. 丁")
+
+        tmp_path = None
+        parser = WordParser()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+                tmp_path = tmp.name
+            document.save(tmp_path)
+
+            questions = parser.parse(tmp_path)
+            self.assertEqual(len(questions), 2)
+            self.assertEqual(questions[0].source_question_number, "1")
+            self.assertEqual(questions[1].source_question_number, "2")
+            self.assertEqual(len(questions[0].options), 4)
+            self.assertEqual(len(questions[1].options), 4)
+            self.assertNotIn("2. 第二题题干", questions[0].options[-1].text)
         finally:
             parser.cleanup()
             if tmp_path and os.path.exists(tmp_path):

@@ -1,3 +1,4 @@
+import io
 import os
 from typing import Optional
 
@@ -18,13 +19,26 @@ class TemplateManager:
     def __init__(self):
         self._template_path: Optional[str] = None
         self._prs: Optional[Presentation] = None
+        self._template_signature: Optional[tuple[str, int, int]] = None
+        self._template_bytes: Optional[bytes] = None
+
+    @staticmethod
+    def _build_template_signature(template_path: str) -> tuple[str, int, int]:
+        absolute_path = os.path.abspath(template_path)
+        stat = os.stat(absolute_path)
+        return absolute_path, int(stat.st_size), int(stat.st_mtime_ns)
 
     def load_template(self, template_path: str) -> Presentation:
         """加载用户指定的 PPT 模板"""
         if not os.path.exists(template_path):
             raise FileNotFoundError(f"模板文件不存在: {template_path}")
-        self._template_path = template_path
-        self._prs = Presentation(template_path)
+        signature = self._build_template_signature(template_path)
+        if self._template_bytes is None or self._template_signature != signature:
+            with open(signature[0], "rb") as file_obj:
+                self._template_bytes = file_obj.read()
+            self._template_signature = signature
+        self._template_path = signature[0]
+        self._prs = Presentation(io.BytesIO(self._template_bytes))
         return self._prs
 
     def create_default(self) -> Presentation:

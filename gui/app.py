@@ -57,6 +57,12 @@ from core.ppt_layout import (
 )
 from core.ppt_generator import PPTGenerator, PPTConfig
 from core.ppt_style import parse_hex_color
+from core.template_manager import TemplateManager
+from core.template_style import (
+    describe_template_style,
+    extract_best_style_from_presentation,
+    template_style_has_full_layout,
+)
 from core.project_quality import (
     annotate_project_quality,
     is_flagged_question,
@@ -112,6 +118,14 @@ _AI_MODE_CHOICES = (
     ("policy", "策略增强"),
 )
 _AI_MODE_LABELS = {key: label for key, label in _AI_MODE_CHOICES}
+_UI_PRIMARY = "#103f91"
+_UI_PRIMARY_DARK = "#0b2b63"
+_UI_INFO = "#0f766e"
+_UI_WARNING = "#c96a09"
+_UI_DANGER = "#b9382f"
+_UI_SURFACE = "#f4f8ff"
+_UI_TEXT_LIGHT = "#f8fbff"
+_UI_MUTED = "#6b7280"
 
 
 class PPTConvertApp:
@@ -133,6 +147,9 @@ class PPTConvertApp:
         self.template_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.use_template = tk.BooleanVar(value=False)
+        self._template_status_var = tk.StringVar(value="未启用模板。")
+        self._word_flow_status_var = tk.StringVar(value="先选题本，再解析检查；正常情况下下一步就是生成 PPT。")
+        self._word_results_hint_var = tk.StringVar(value="还没有解析结果。先在左侧选择题本。")
         self.word_document_subject = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
         self.pdf_document_subject = tk.StringVar(value=_DOCUMENT_SUBJECT_LABELS["auto"])
         self.ai_only_flagged = tk.BooleanVar(value=True)
@@ -175,6 +192,9 @@ class PPTConvertApp:
         self._preview_after: Optional[str] = None
         self.questions: list[Question] = []
         self.parser: WordParser | None = None
+        self._template_manager = TemplateManager()
+        self._template_style_preview = None
+        self._template_mode = "off"
         self.pdf_project = None
         self._pdf_project_context: dict[str, str] = {}
         self._pdf_preview_payloads: dict[str, dict] = {}
@@ -251,6 +271,9 @@ class PPTConvertApp:
         self._pdf_layout_fields_updating = False
         self._pdf_slide_status_var = tk.StringVar(value="选择左侧 PPT 页后，可以逐页预览并实时编辑。")
         self._pdf_review_status_var = tk.StringVar(value="AI 质检会在预览生成后自动标出待确认题目。")
+        self._pdf_workspace_source_var = tk.StringVar(value="未选择来源")
+        self._pdf_workspace_scope_var = tk.StringVar(value="未设置筛选")
+        self._pdf_workspace_state_var = tk.StringVar(value="尚未生成预览。")
         self._ai_repair_busy = False
         self._ocr_tool_busy = False
 
@@ -266,6 +289,12 @@ class PPTConvertApp:
                 variable.trace_add("write", lambda *_: self._refresh_pdf_ai_suggestion())
             except Exception:
                 pass
+        for variable in (self.word_path, self.output_path, self.word_document_subject):
+            try:
+                variable.trace_add("write", lambda *_: self._refresh_word_flow_ui())
+            except Exception:
+                pass
+        self._refresh_word_flow_ui()
         self._schedule_preview_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -289,19 +318,16 @@ class PPTConvertApp:
 
         pdf_tab, pdf_body = self._make_scrollable_tab(notebook)
         word_tab, word_body = self._make_scrollable_tab(notebook)
-        settings_tab, settings_body = self._make_scrollable_tab(notebook)
         self._pdf_workspace_tab = pdf_tab
         self._word_workspace_tab = word_tab
-        self._settings_workspace_tab = settings_tab
-        self._ppt_settings_tab = settings_tab
+        self._settings_workspace_tab = None
+        self._ppt_settings_tab = word_tab
 
         notebook.add(pdf_tab, text=" PDF 试卷整理 ")
         notebook.add(word_tab, text=" Word 生成 PPT ")
-        notebook.add(settings_tab, text=" PPT 导出设置 ")
 
         self._build_pdf_tab(pdf_body)
         self._build_word_tab(word_body)
-        self._build_ppt_settings_tab(settings_body)
 
     def _make_scrollable_tab(self, parent):
         host = ttk.Frame(parent)
@@ -347,40 +373,99 @@ class PPTConvertApp:
         except Exception:
             self.root.place_window_center()
 
+    def _build_color_banner(self, parent, title: str, subtitle: str = "", *, bg: str, chips: tuple[tuple[str, str], ...] = ()):
+        card = tk.Frame(parent, bg=bg, bd=0, highlightthickness=0)
+        card.pack(fill=X, pady=(0, 10))
+
+        top = tk.Frame(card, bg=bg)
+        top.pack(fill=X, padx=18, pady=(16, 0))
+        tk.Label(
+            top,
+            text=title,
+            bg=bg,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 16, "bold"),
+            anchor="w",
+        ).pack(side=LEFT)
+        if chips:
+            chip_row = tk.Frame(top, bg=bg)
+            chip_row.pack(side=RIGHT)
+            for text, color in chips:
+                tk.Label(
+                    chip_row,
+                    text=text,
+                    bg=color,
+                    fg=_UI_TEXT_LIGHT,
+                    font=("", 9, "bold"),
+                    padx=10,
+                    pady=4,
+                ).pack(side=LEFT, padx=(8, 0))
+        if subtitle:
+            tk.Label(
+                card,
+                text=subtitle,
+                bg=bg,
+                fg="#dbeafe",
+                font=("", 10),
+                wraplength=980,
+                justify=LEFT,
+                anchor="w",
+            ).pack(fill=X, padx=18, pady=(8, 16))
+        else:
+            tk.Frame(card, bg=bg, height=10).pack(fill=X)
+        return card
+
+    def _build_metric_tile(self, parent, title: str, textvariable: tk.StringVar, *, bg: str):
+        card = tk.Frame(parent, bg=bg, bd=0, highlightthickness=0)
+        tk.Label(
+            card,
+            text=title,
+            bg=bg,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 9, "bold"),
+            anchor="w",
+        ).pack(fill=X, padx=12, pady=(10, 4))
+        tk.Label(
+            card,
+            textvariable=textvariable,
+            bg=bg,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 10),
+            justify=LEFT,
+            anchor="w",
+            wraplength=260,
+        ).pack(fill=X, padx=12, pady=(0, 10))
+        return card
+
     # Header
 
     def _build_header(self, parent):
-        hdr = ttk.Frame(parent, padding=(20, 16, 20, 12))
+        hdr = ttk.Frame(parent, padding=(4, 8, 4, 8))
         hdr.pack(fill=X, pady=(0, 6))
-
-        top_row = ttk.Frame(hdr)
-        top_row.pack(fill=X)
-        ttk.Label(top_row, text=U.APP_TITLE, font=("", 17, "bold")).pack(side=LEFT)
-        ttk.Label(
-            top_row, text=U.STEP_HINT,
-            font=("", 9), bootstyle="secondary",
-        ).pack(side=RIGHT)
-
-        ttk.Label(
-            hdr, text=U.HERO_SUB,
-            wraplength=880, font=("", 10), bootstyle="secondary",
-        ).pack(anchor=W, pady=(4, 0))
-
-        ttk.Separator(hdr, orient=HORIZONTAL).pack(fill=X, pady=(10, 0))
+        self._build_color_banner(
+            hdr,
+            U.APP_TITLE,
+            bg=_UI_PRIMARY,
+            chips=(
+                ("PDF 整理", _UI_WARNING),
+                ("Word 转 PPT", _UI_INFO),
+                ("实时所见即所得", "#2563eb"),
+            ),
+        )
 
     # 1. Files
 
     def _build_file_section(self, parent):
-        frame = ttk.Labelframe(parent, text=" ① 选择文件 ", bootstyle="primary", padding=_PAD)
+        frame = ttk.Labelframe(parent, text=" ① 题本与输出 ", bootstyle="primary", padding=_PAD)
         frame.pack(fill=X, pady=(0, 10))
 
-        self._file_row(frame, "Word 文件", self.word_path,
+        self._file_row(frame, "题本 Word", self.word_path,
                        self._browse_word, "浏览...", pady=(0, 0))
-        self._file_row(frame, "输出 PPT", self.output_path,
+        self._file_row(frame, "导出 PPT", self.output_path,
                        self._browse_output, "另存为...", pady=(6, 0))
         row = ttk.Frame(frame)
         row.pack(fill=X, pady=(8, 0))
-        ttk.Label(row, text="整份科目", width=10).pack(side=LEFT)
+        ttk.Label(row, text="整本科目", width=10).pack(side=LEFT)
         ttk.Combobox(
             row,
             textvariable=self.word_document_subject,
@@ -389,10 +474,10 @@ class PPTConvertApp:
             width=18,
         ).pack(side=LEFT)
         ttk.Label(
-            row,
-            text="适合单科题库或没有大标题的资料；自动识别不稳时可直接固定整份 Word 的科目。",
+            frame,
+            text="单科题库或没有大标题时再固定；多数情况下保持“自动识别”即可。",
             bootstyle="secondary",
-        ).pack(side=LEFT, padx=(8, 0))
+        ).pack(anchor=W, padx=(82, 0), pady=(6, 0))
 
     def _file_row(self, parent, label, var, cmd, btn_text, pady=(0, 0)):
         row = ttk.Frame(parent)
@@ -416,29 +501,26 @@ class PPTConvertApp:
         ).pack(side=LEFT)
         self.template_entry = ttk.Entry(row, textvariable=self.template_path, state=DISABLED)
         self.template_entry.pack(side=LEFT, fill=X, expand=YES, padx=(12, 8))
+        self.template_entry.bind("<FocusOut>", self._on_template_entry_changed)
+        self.template_entry.bind("<Return>", self._on_template_entry_changed)
         self.template_btn = ttk.Button(
             row, text="选择...", command=self._browse_template,
             state=DISABLED, bootstyle="info-outline", width=8,
         )
         self.template_btn.pack(side=RIGHT)
 
-        self._tpl_hint = ttk.Label(
+        self._tpl_status = ttk.Label(
             frame,
-            text=(
-                "启用模板后，字体、颜色和对齐以模板第一页为准，下方版式设置不再参与生成。\n"
-                "推荐在模板第一页放置 [题干]、[图片]、[选项A] 到 [选项D] 文本框；\n"
-                "或者按顺序放置 1 个题干框和 4 个选项框。单个文本框里写 A. 到 D. 时会自动拆成 2x2。"
-            ),
+            textvariable=self._template_status_var,
             bootstyle="secondary", font=("", 9), wraplength=860, justify=LEFT,
         )
-        self._tpl_hint.pack(anchor=W, pady=(8, 0))
-        self._tpl_hint.pack_forget()
+        self._tpl_status.pack(anchor=W, pady=(8, 0))
 
     # 3. Config
 
     def _build_config_section(self, parent):
         self._config_frame = ttk.Labelframe(
-            parent, text=" PPT 版式与样式（非模板模式） ", bootstyle="primary", padding=(2, 8),
+            parent, text=" 版式与样式 ", bootstyle="primary", padding=(2, 8),
         )
         self._config_frame.pack(fill=X, pady=(0, 10))
 
@@ -471,7 +553,7 @@ class PPTConvertApp:
     def _build_question_table(self, parent):
         frame = ttk.Labelframe(
             parent,
-            text=" ④ 解析结果 ",
+            text=" ④ 当前题目 ",
             bootstyle="primary", padding=(2, 8),
         )
         frame.pack(fill=BOTH, expand=YES, pady=(0, 6))
@@ -496,118 +578,146 @@ class PPTConvertApp:
         sb.pack(side=RIGHT, fill=Y)
 
         ttk.Label(
-            frame, text=U.TIP_SECONDARY, font=("", 9), bootstyle="secondary",
+            frame, textvariable=self._word_results_hint_var, font=("", 9), bootstyle="secondary",
         ).pack(anchor=W, padx=10, pady=(2, 4))
 
     # PPT tab buttons + shared footer
 
-    def _build_ppt_tab_buttons(self, parent):
-        bar = ttk.Frame(parent, padding=(16, 8))
-        bar.pack(side=BOTTOM, fill=X)
+    def _build_word_action_panel(self, parent):
+        panel = ttk.Labelframe(parent, text=" ③ 生成流程 ", bootstyle="success", padding=(12, 10))
+        panel.pack(fill=X, pady=(0, 10))
 
-        row = ttk.Frame(bar)
-        row.pack(fill=X)
+        ttk.Label(
+            panel,
+            textvariable=self._word_flow_status_var,
+            wraplength=420,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 8))
+
+        primary_row = ttk.Frame(panel)
+        primary_row.pack(fill=X)
+
+        self._word_parse_btn = ttk.Button(
+            primary_row,
+            text="解析并检查",
+            command=self._parse_preview,
+            bootstyle="info-outline",
+            width=12,
+        )
+        self._word_parse_btn.pack(side=LEFT)
+        self._word_generate_btn = ttk.Button(
+            primary_row,
+            text="生成 PPT",
+            command=self._generate_ppt,
+            bootstyle="success",
+            width=10,
+        )
+        self._word_generate_btn.pack(side=LEFT, padx=(8, 0))
+        self._word_convert_btn = ttk.Button(
+            primary_row,
+            text="一键生成 PPT",
+            command=self._convert_all,
+            bootstyle="success-outline",
+            width=14,
+        )
+        self._word_convert_btn.pack(side=LEFT, padx=(8, 0))
 
         ttk.Button(
-            row,
-            text="PPT 设置",
-            command=self._open_ppt_settings_tab,
-            bootstyle="info-outline",
-            width=10,
-        ).pack(side=LEFT)
+            primary_row,
+            text="清空",
+            command=self._clear_all,
+            bootstyle="secondary-outline",
+            width=7,
+        ).pack(side=RIGHT)
 
-        ttk.Button(row, text="清空", command=self._clear_all,
-                   bootstyle="secondary-outline", width=7).pack(side=RIGHT, padx=3)
-        ttk.Button(row, text="生成 PPT", command=self._generate_ppt,
-                   bootstyle="success-outline", width=10).pack(side=RIGHT, padx=3)
-        ttk.Button(row, text="解析并预览", command=self._parse_preview,
-                   bootstyle="info-outline", width=10).pack(side=RIGHT, padx=3)
-        ttk.Button(row, text="一键生成", command=self._convert_all,
-                   bootstyle="success", width=10).pack(side=RIGHT, padx=3)
+        secondary_row = ttk.Frame(panel)
+        secondary_row.pack(fill=X, pady=(8, 0))
+        ttk.Label(
+            secondary_row,
+            text="只有要逐题改文字、配图或版式时，再进入编辑工作台：",
+            bootstyle="secondary",
+        ).pack(side=LEFT)
+        self._word_editor_btn = ttk.Button(
+            secondary_row,
+            text="进入编辑工作台",
+            command=self._open_word_editor_workspace,
+            bootstyle="secondary-outline",
+            width=14,
+        )
+        self._word_editor_btn.pack(side=LEFT, padx=(8, 0))
 
     def _build_pdf_tab(self, parent):
         frame = ttk.Frame(parent, padding=_PAD)
         frame.pack(fill=BOTH, expand=YES)
-
-        hdr = ttk.Frame(frame, padding=(12, 12, 12, 6))
-        hdr.pack(fill=X)
-        ttk.Label(hdr, text="PDF 试卷工作流", font=("", 15, "bold")).pack(anchor=W)
-        ttk.Label(
-            hdr, text=U.PDF_TAB_HINT, wraplength=860, font=("", 9), bootstyle="secondary",
-        ).pack(anchor=W, pady=(6, 0))
+        self._build_color_banner(
+            frame,
+            "PDF 试卷工作流",
+            bg=_UI_PRIMARY_DARK,
+            chips=(
+                ("先整理结构", _UI_WARNING),
+                ("再进入预览", _UI_INFO),
+            ),
+        )
 
         self._build_pdf_wizard(frame)
 
     def _build_word_tab(self, parent):
         frame = ttk.Frame(parent, padding=_PAD)
         frame.pack(fill=BOTH, expand=YES)
-
-        hdr = ttk.Frame(frame, padding=(12, 12, 12, 6))
-        hdr.pack(fill=X)
-        ttk.Label(hdr, text="Word 生成 PPT", font=("", 15, "bold")).pack(anchor=W)
-        ttk.Label(
-            hdr,
-            text=U.WORD_TAB_HINT,
-            wraplength=860,
-            font=("", 9),
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(6, 0))
-
-        helper = ttk.Labelframe(frame, text=" 使用说明 ", bootstyle="info", padding=_PAD)
-        helper.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            helper,
-            text=(
-                "直接选择你自己的 Word 题库即可解析。PPT 模板、字体、颜色和选项布局"
-                "统一在“PPT 导出设置”标签页里调整。"
+        self._build_color_banner(
+            frame,
+            "Word 生成 PPT",
+            bg="#155e75",
+            chips=(
+                ("先解析", "#2563eb"),
+                ("直接生成", _UI_WARNING),
+                ("可选精修", "#475569"),
             ),
-            wraplength=860,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(side=LEFT, fill=X, expand=YES)
-        ttk.Button(
-            helper,
-            text="打开 PPT 设置",
-            command=self._open_ppt_settings_tab,
-            bootstyle="info-outline",
-            width=14,
-        ).pack(side=RIGHT, padx=(10, 0))
+        )
 
-        content = ttk.Frame(frame)
-        content.pack(fill=BOTH, expand=YES)
-        self._build_file_section(content)
-        self._build_question_table(content)
-        self._build_ppt_tab_buttons(content)
+        shell = ttk.Panedwindow(frame, orient=HORIZONTAL)
+        shell.pack(fill=BOTH, expand=YES)
 
-    def _build_ppt_settings_tab(self, parent):
-        frame = ttk.Frame(parent, padding=_PAD)
-        frame.pack(fill=BOTH, expand=YES)
+        left = ttk.Frame(shell, padding=(0, 0, 12, 0))
+        right = ttk.Frame(shell)
+        shell.add(left, weight=3)
+        shell.add(right, weight=5)
 
-        hdr = ttk.Frame(frame, padding=(12, 12, 12, 6))
-        hdr.pack(fill=X)
-        ttk.Label(hdr, text="PPT 导出设置", font=("", 15, "bold")).pack(anchor=W)
-        ttk.Label(
-            hdr,
-            text=U.PPT_SETTINGS_HINT,
-            wraplength=860,
-            font=("", 9),
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(6, 0))
+        self._build_file_section(left)
+        self._build_word_settings_workspace(left)
+        self._build_word_action_panel(left)
+        self._build_question_table(right)
 
-        self._build_ai_settings_section(frame)
-        self._build_template_section(frame)
-        self._build_config_section(frame)
+    def _build_word_settings_workspace(self, parent):
+        frame = ttk.Labelframe(parent, text=" ② 生成设置 ", bootstyle="warning", padding=(2, 8))
+        frame.pack(fill=BOTH, expand=YES, pady=(0, 10))
+
+        notebook = ttk.Notebook(frame, bootstyle="warning")
+        notebook.pack(fill=BOTH, expand=YES, padx=8, pady=(4, 8))
+        self._word_settings_notebook = notebook
+
+        template_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        layout_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        ai_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        notebook.add(template_tab, text=" 模板 ")
+        notebook.add(layout_tab, text=" 版式与样式 ")
+        notebook.add(ai_tab, text=" AI 修复 ")
+        self._word_settings_template_tab = template_tab
+        self._word_settings_layout_tab = layout_tab
+        self._word_settings_ai_tab = ai_tab
+
+        self._build_template_section(template_tab)
+        self._build_config_section(layout_tab)
+        self._build_ai_settings_section(ai_tab)
 
     def _build_ai_settings_section(self, parent):
-        frame = ttk.Labelframe(parent, text=" 本地 AI 修复 ", bootstyle="warning", padding=_PAD)
+        frame = ttk.Labelframe(parent, text=" AI 修复 ", bootstyle="warning", padding=_PAD)
         frame.pack(fill=X, pady=(0, 10))
 
         ttk.Label(
             frame,
-            text=(
-                "这里是内置的本地低阶 AI 修复器，本质上是规则 + 打分 + 自动修复。"
-                "它会结合题干、选项、材料、相邻题和待确认项，直接把安全修复写回当前工程。"
-            ),
+            text="规则优先，必要时再用策略增强；修复会直接写回当前工程。",
             wraplength=860,
             justify=LEFT,
             bootstyle="secondary",
@@ -671,21 +781,60 @@ class PPTConvertApp:
         ).pack(anchor=W, padx=(12, 0))
 
     def _build_pdf_wizard(self, parent):
-        step_bar = ttk.Frame(parent, padding=(12, 6, 12, 6))
-        step_bar.pack(fill=X, pady=(2, 6))
+        shell = ttk.Frame(parent)
+        shell.pack(fill=BOTH, expand=YES)
+
+        rail = ttk.Frame(shell, padding=(0, 0, 12, 0))
+        rail.pack(side=LEFT, fill=Y)
+        main = ttk.Frame(shell)
+        main.pack(side=LEFT, fill=BOTH, expand=YES)
+
+        step_card = ttk.Labelframe(rail, text=" 工作流 ", bootstyle="secondary", padding=(10, 10))
+        step_card.pack(fill=X, pady=(2, 10))
         self._pdf_step_buttons = []
         for index, (title, _hint) in enumerate(_PDF_WIZARD_STEPS):
             button = ttk.Button(
-                step_bar,
+                step_card,
                 text=f"{index + 1}. {title}",
                 command=lambda i=index: self._request_pdf_wizard_step(i),
-                width=16,
+                width=18,
                 bootstyle="secondary-outline",
             )
-            button.pack(side=LEFT, padx=(0, 8))
+            button.pack(fill=X, pady=(0, 8))
             self._pdf_step_buttons.append(button)
 
-        intro = ttk.Frame(parent, padding=(12, 0, 12, 6))
+        workspace_card = ttk.Labelframe(rail, text=" 当前工程 ", bootstyle="info", padding=(10, 10))
+        workspace_card.pack(fill=X, pady=(0, 10))
+        source_tile = self._build_metric_tile(workspace_card, "来源", self._pdf_workspace_source_var, bg=_UI_PRIMARY)
+        source_tile.pack(fill=X, pady=(0, 8))
+        scope_tile = self._build_metric_tile(workspace_card, "范围", self._pdf_workspace_scope_var, bg=_UI_INFO)
+        scope_tile.pack(fill=X, pady=(0, 8))
+        state_tile = self._build_metric_tile(workspace_card, "状态", self._pdf_workspace_state_var, bg=_UI_WARNING)
+        state_tile.pack(fill=X)
+
+        quick_card = ttk.Labelframe(rail, text=" 快捷入口 ", bootstyle="secondary", padding=(10, 10))
+        quick_card.pack(fill=X)
+        ttk.Button(
+            quick_card,
+            text="重新生成预览",
+            command=self._preview_pdf_project,
+            bootstyle="secondary-outline",
+        ).pack(fill=X, pady=(0, 6))
+        ttk.Button(
+            quick_card,
+            text="打开导出设置",
+            command=self._open_ppt_settings_tab,
+            bootstyle="info-outline",
+        ).pack(fill=X, pady=(0, 6))
+        self._pdf_handoff_btn = ttk.Button(
+            quick_card,
+            text="去 Word 生成 PPT",
+            command=self._open_word_workspace_tab,
+            bootstyle="info-outline",
+        )
+        self._pdf_handoff_btn.pack(fill=X)
+
+        intro = ttk.Frame(main, padding=(12, 0, 12, 6))
         intro.pack(fill=X)
         self._pdf_step_title_label = ttk.Label(intro, font=("", 12, "bold"))
         self._pdf_step_title_label.pack(anchor=W)
@@ -698,7 +847,7 @@ class PPTConvertApp:
         )
         self._pdf_step_hint_label.pack(anchor=W, pady=(4, 0))
 
-        self._pdf_step_host = ttk.Frame(parent)
+        self._pdf_step_host = ttk.Frame(main)
         self._pdf_step_host.pack(fill=BOTH, expand=YES)
 
         self._pdf_step_frames = []
@@ -712,7 +861,7 @@ class PPTConvertApp:
             builder(step_frame)
             self._pdf_step_frames.append(step_frame)
 
-        nav = ttk.Frame(parent, padding=(12, 8, 12, 0))
+        nav = ttk.Frame(main, padding=(12, 8, 12, 0))
         nav.pack(fill=X)
         self._pdf_nav_status_label = ttk.Label(nav, bootstyle="secondary")
         self._pdf_nav_status_label.pack(side=LEFT, fill=X, expand=YES)
@@ -773,18 +922,6 @@ class PPTConvertApp:
             bootstyle="secondary",
         )
         self._pdf_import_summary.pack(anchor=W, pady=(10, 0))
-
-        tips = ttk.Labelframe(parent, text=" 工作流说明 ", bootstyle="secondary", padding=_PAD)
-        tips.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            tips,
-            text=(
-                "向导会按“导入 PDF -> 识别设置 -> 结果预览 -> 导出结果”推进。\n"
-                "资料分析 PPT 会优先复用从 PDF 页面裁切出来的材料图，不再走 Word 二次解析。"
-            ),
-            wraplength=840,
-            justify=LEFT,
-        ).pack(anchor=W)
 
     def _build_pdf_step_settings(self, parent):
         box = ttk.Labelframe(parent, text=" 第二步：识别设置 ", bootstyle="info", padding=_PAD)
@@ -876,21 +1013,6 @@ class PPTConvertApp:
         ).pack(side=RIGHT)
 
     def _build_pdf_step_preview(self, parent):
-        ttk.Label(
-            parent,
-            text="第三步会把当前筛选结果整理成题目工程。你可以直接修改题号、材料标题、题目归属，导出时会复用当前工程。",
-            wraplength=860,
-            justify=LEFT,
-            font=("", 9),
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 8), padx=12)
-        self._pdf_preview_summary = ttk.Label(
-            parent,
-            wraplength=860,
-            justify=LEFT,
-            bootstyle="secondary",
-        )
-        self._pdf_preview_summary.pack(anchor=W, pady=(0, 8), padx=12)
         self._build_pdf_preview(parent)
 
     def _build_pdf_step_export(self, parent):
@@ -913,18 +1035,20 @@ class PPTConvertApp:
         handoff_row = ttk.Frame(box)
         handoff_row.pack(fill=X, pady=(10, 0))
         ttk.Label(handoff_row, text="下一步", width=10).pack(side=LEFT)
-        ttk.Label(
+        self._pdf_export_handoff_label = ttk.Label(
             handoff_row,
             text="需要做 PPT 时，请把 Word 交给“Word 生成 PPT”；解析后会进入同一套共享预览。",
             bootstyle="secondary",
-        ).pack(side=LEFT, fill=X, expand=YES)
-        ttk.Button(
+        )
+        self._pdf_export_handoff_label.pack(side=LEFT, fill=X, expand=YES)
+        self._pdf_export_handoff_btn = ttk.Button(
             handoff_row,
-            text="打开 Word 工作流",
+            text="去 Word 生成 PPT",
             command=self._open_word_workspace_tab,
             bootstyle="info-outline",
             width=14,
-        ).pack(side=RIGHT)
+        )
+        self._pdf_export_handoff_btn.pack(side=RIGHT)
 
         action_row = ttk.Frame(parent, padding=(0, 4))
         action_row.pack(fill=X)
@@ -963,16 +1087,25 @@ class PPTConvertApp:
         self.status_label.pack(side=LEFT, fill=X, expand=YES)
 
     def _open_ppt_settings_tab(self):
-        notebook = getattr(self, "_workspace_notebook", None)
-        settings_tab = getattr(self, "_ppt_settings_tab", None)
-        if notebook is not None and settings_tab is not None:
-            notebook.select(settings_tab)
+        self._open_word_workspace_tab()
+        notebook = getattr(self, "_word_settings_notebook", None)
+        layout_tab = getattr(self, "_word_settings_layout_tab", None)
+        if notebook is not None and layout_tab is not None:
+            notebook.select(layout_tab)
 
     def _open_word_workspace_tab(self):
         notebook = getattr(self, "_workspace_notebook", None)
         word_tab = getattr(self, "_word_workspace_tab", None)
         if notebook is not None and word_tab is not None:
             notebook.select(word_tab)
+
+    def _open_word_editor_workspace(self):
+        if not self._word_project_matches_current_file():
+            if not self._start_word_preview_flow(open_editor=False):
+                return
+        self._open_pdf_preview_workspace()
+        self._word_flow_status_var.set("当前已进入逐题编辑工作台；修改完成后回到 Word 工作流直接生成 PPT。")
+        self._word_results_hint_var.set("你正在逐题精修；改完后回到 Word 工作流直接生成 PPT。")
 
     def _open_pdf_preview_workspace(self):
         notebook = getattr(self, "_workspace_notebook", None)
@@ -1194,7 +1327,8 @@ class PPTConvertApp:
             self._pdf_next_btn.configure(text="生成预览", state=NORMAL, bootstyle="primary")
         elif self._pdf_wizard_step == 2:
             state = NORMAL if self._pdf_project_matches_current_selection() else DISABLED
-            self._pdf_next_btn.configure(text="下一步：导出 Word / 继续 PPT", state=state, bootstyle="success")
+            next_text = "下一步：保存工程 / 返回生成" if self._pdf_project_context.get("source_kind", "") == "word" else "下一步：导出 Word / 继续 PPT"
+            self._pdf_next_btn.configure(text=next_text, state=state, bootstyle="success")
         else:
             self._pdf_next_btn.configure(text="已到最后一步", state=DISABLED, bootstyle="secondary")
 
@@ -1212,6 +1346,7 @@ class PPTConvertApp:
         else:
             base_name = "未选择来源文件"
         subject_text = self._selected_pdf_subject_labels()
+        selected_subject_count = sum(1 for kind in _PDF_SUBJECT_ORDER if self._pdf_subject_vars[kind].get())
         effective_document_subject = (
             self._pdf_project_context.get("document_subject_hint", self.pdf_document_subject.get())
             if source_kind in {"word", "manifest"}
@@ -1255,6 +1390,8 @@ class PPTConvertApp:
             self._pdf_import_summary.configure(text=import_summary)
 
         source_label = "当前试卷"
+        compact_subject_text = subject_text
+        compact_range_text = "全部题目" if not self.pdf_question_range.get().strip() else range_text
         if source_kind == "word" and docx_file:
             source_label = "当前 Word"
             project_subjects = [
@@ -1264,6 +1401,12 @@ class PPTConvertApp:
             ]
             subject_text = "、".join(project_subjects) if project_subjects else "未识别科目"
             range_text = "Word 全部题目"
+            compact_subject_text = subject_text
+            compact_range_text = "全部题目"
+        elif selected_subject_count == len(_PDF_SUBJECT_ORDER):
+            compact_subject_text = "全部科目"
+        elif selected_subject_count >= 3:
+            compact_subject_text = f"{selected_subject_count} 个科目"
         settings_summary = (
             f"{source_label}：{base_name}\n"
             f"整份科目：{document_subject_text}\n"
@@ -1274,40 +1417,74 @@ class PPTConvertApp:
         if getattr(self, "_pdf_settings_summary", None):
             self._pdf_settings_summary.configure(text=settings_summary)
 
-        preview_summary = (
-            f"{source_label}：{base_name}\n"
-            f"整份科目：{document_subject_text}\n"
-            f"筛选：{subject_text}；题号范围 {range_text}\n"
-            f"{preview_state}"
-        )
-        if getattr(self, "_pdf_preview_summary", None):
-            self._pdf_preview_summary.configure(text=preview_summary)
-
         if preview_ready:
             asset_dir = self._pdf_project_context.get("asset_dir", "-")
-            export_summary = (
-                f"当前工程共 {self.pdf_project.question_count} 道题，素材目录：{asset_dir}\n"
-                "这里会导出 Word / JSON；如果要做 PPT，请把导出的 Word 交给 Word 工作流继续解析。"
-            )
+            if source_kind == "word":
+                export_summary = (
+                    f"当前工程共 {self.pdf_project.question_count} 道题，素材目录：{asset_dir}\n"
+                    "这一步更适合保存工程 JSON；PPT 请回到 Word 工作流直接生成。"
+                )
+            else:
+                export_summary = (
+                    f"当前工程共 {self.pdf_project.question_count} 道题，素材目录：{asset_dir}\n"
+                    "这里会导出 Word / JSON；如果要做 PPT，请把导出的 Word 交给 Word 工作流继续解析。"
+                )
         else:
             export_summary = "请先在上一步生成当前设置对应的预览工程。"
         if getattr(self, "_pdf_export_summary", None):
             self._pdf_export_summary.configure(text=export_summary)
 
+        handoff_text = "去 Word 生成 PPT"
+        handoff_hint = "需要做 PPT 时，请把 Word 交给“Word 生成 PPT”；解析后会进入同一套共享预览。"
+        if source_kind == "word":
+            handoff_text = "返回 Word 生成 PPT"
+            handoff_hint = "当前工程来自 Word；改完文字、结构或版式后，回到 Word 工作流直接生成 PPT。"
+        if getattr(self, "_pdf_handoff_btn", None):
+            self._pdf_handoff_btn.configure(text=handoff_text)
+        if getattr(self, "_pdf_export_handoff_btn", None):
+            self._pdf_export_handoff_btn.configure(text=handoff_text)
+        if getattr(self, "_pdf_export_handoff_label", None):
+            self._pdf_export_handoff_label.configure(text=handoff_hint)
+
         if getattr(self, "_pdf_nav_status_label", None):
             self._pdf_nav_status_label.configure(text=preview_state)
+        if getattr(self, "_pdf_workspace_source_var", None):
+            self._pdf_workspace_source_var.set(base_name)
+        if getattr(self, "_pdf_workspace_scope_var", None):
+            self._pdf_workspace_scope_var.set(f"{compact_subject_text} · {compact_range_text}")
+        if getattr(self, "_pdf_workspace_state_var", None):
+            self._pdf_workspace_state_var.set(
+                f"已就绪 · {self.pdf_project.question_count} 题"
+                if preview_ready and self.pdf_project is not None
+                else preview_state
+            )
 
     def _build_pdf_preview(self, parent):
-        frame = ttk.Labelframe(parent, text=" 结果预览 ", bootstyle="primary", padding=(10, 8))
-        frame.pack(fill=BOTH, expand=YES, pady=(6, 0))
+        frame = ttk.Frame(parent)
+        frame.pack(fill=BOTH, expand=YES, pady=(0, 0))
+
+        self._pdf_preview_summary = None
 
         split = ttk.Panedwindow(frame, orient=HORIZONTAL)
         split.pack(fill=BOTH, expand=YES)
 
-        left = ttk.Frame(split)
-        right = ttk.Frame(split)
+        left = ttk.Labelframe(split, text=" 导航与定位 ", bootstyle="secondary", padding=(8, 8))
+        stage = ttk.Frame(split)
+        inspector = ttk.Frame(split)
         split.add(left, weight=2)
-        split.add(right, weight=5)
+        split.add(stage, weight=5)
+        split.add(inspector, weight=4)
+
+        nav_banner = tk.Frame(left, bg=_UI_PRIMARY_DARK)
+        nav_banner.pack(fill=X, pady=(0, 4))
+        tk.Label(
+            nav_banner,
+            text="导航区",
+            bg=_UI_PRIMARY_DARK,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 11, "bold"),
+            anchor="w",
+        ).pack(fill=X, padx=10, pady=6)
 
         left_tabs = ttk.Notebook(left, bootstyle="info")
         left_tabs.pack(fill=BOTH, expand=YES)
@@ -1391,10 +1568,21 @@ class PPTConvertApp:
         slide_sb.pack(side=RIGHT, fill=Y)
         self._pdf_slide_tree.bind("<<TreeviewSelect>>", self._on_pdf_slide_select)
 
-        action_box = ttk.Frame(right)
-        action_box.pack(fill=X, pady=(0, 6))
-        slide_row = ttk.Frame(action_box)
-        slide_row.pack(fill=X, pady=(0, 6))
+        stage_header = tk.Frame(stage, bg=_UI_PRIMARY)
+        stage_header.pack(fill=X, pady=(0, 4))
+        tk.Label(
+            stage_header,
+            text="幻灯片工作台",
+            bg=_UI_PRIMARY,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 12, "bold"),
+            anchor="w",
+        ).pack(side=LEFT, padx=12, pady=7)
+
+        stage_toolbar = ttk.Frame(stage)
+        stage_toolbar.pack(fill=X, pady=(0, 4))
+        slide_row = ttk.Frame(stage_toolbar)
+        slide_row.pack(fill=X, pady=(0, 4))
         self._pdf_slide_status_label = ttk.Label(
             slide_row,
             textvariable=self._pdf_slide_status_var,
@@ -1431,6 +1619,46 @@ class PPTConvertApp:
             bootstyle="warning-outline",
             width=12,
         ).pack(side=LEFT, padx=(8, 0))
+
+        stage_split = ttk.Panedwindow(stage, orient=VERTICAL)
+        stage_split.pack(fill=BOTH, expand=YES)
+
+        preview_card = ttk.Labelframe(stage_split, text=" 所见即所得预览 ", bootstyle="primary", padding=(10, 8))
+        stage_split.add(preview_card, weight=5)
+        self._build_pdf_live_preview_panel(preview_card)
+
+        stage_lower = ttk.Labelframe(stage_split, text=" 原始材料与结构详情 ", bootstyle="secondary", padding=(10, 8))
+        stage_split.add(stage_lower, weight=3)
+        lower_tabs = ttk.Notebook(stage_lower, bootstyle="info")
+        lower_tabs.pack(fill=BOTH, expand=YES)
+        material_tab = ttk.Frame(lower_tabs, padding=(0, 0, 0, 0))
+        detail_tab = ttk.Frame(lower_tabs, padding=(0, 0, 0, 0))
+        lower_tabs.add(material_tab, text=" 材料原貌 ")
+        lower_tabs.add(detail_tab, text=" 结构详情 ")
+        self._build_pdf_material_preview_panel(material_tab)
+
+        detail_host = ttk.Frame(detail_tab)
+        detail_host.pack(fill=BOTH, expand=YES)
+        self.pdf_detail = tk.Text(detail_host, wrap="word", height=16)
+        self.pdf_detail.pack(side=LEFT, fill=BOTH, expand=YES)
+        detail_scroll = ttk.Scrollbar(detail_host, orient=VERTICAL, command=self.pdf_detail.yview)
+        detail_scroll.pack(side=RIGHT, fill=Y)
+        self.pdf_detail.configure(yscrollcommand=detail_scroll.set)
+        self.pdf_detail.configure(state="disabled")
+
+        inspector_header = tk.Frame(inspector, bg=_UI_WARNING)
+        inspector_header.pack(fill=X, pady=(0, 4))
+        tk.Label(
+            inspector_header,
+            text="检查器",
+            bg=_UI_WARNING,
+            fg=_UI_TEXT_LIGHT,
+            font=("", 12, "bold"),
+            anchor="w",
+        ).pack(fill=X, padx=12, pady=7)
+
+        action_box = ttk.Labelframe(inspector, text=" 工程动作 ", bootstyle="secondary", padding=(8, 6))
+        action_box.pack(fill=X, pady=(0, 6))
         action_row = ttk.Frame(action_box)
         action_row.pack(fill=X)
         ttk.Button(
@@ -1527,38 +1755,41 @@ class PPTConvertApp:
             bootstyle="secondary-outline",
             width=12,
         ).pack(side=LEFT, padx=4)
+        self._build_pdf_question_editor(inspector)
 
-        detail_tabs = ttk.Notebook(right, bootstyle="info")
-        detail_tabs.pack(fill=BOTH, expand=YES)
-
-        editor_tab = ttk.Frame(detail_tabs, padding=(0, 0, 0, 0))
-        material_tab = ttk.Frame(detail_tabs, padding=(0, 0, 0, 0))
-        detail_tab = ttk.Frame(detail_tabs, padding=(0, 0, 0, 0))
-        detail_tabs.add(editor_tab, text=" 题目编辑 ")
-        detail_tabs.add(material_tab, text=" 材料原貌 ")
-        detail_tabs.add(detail_tab, text=" 结构详情 ")
-
-        self._build_pdf_question_editor(editor_tab)
-        self._build_pdf_material_preview_panel(material_tab)
-
-        detail_host = ttk.Frame(detail_tab)
-        detail_host.pack(fill=BOTH, expand=YES)
-        self.pdf_detail = tk.Text(detail_host, wrap="word", height=16)
-        self.pdf_detail.pack(side=LEFT, fill=BOTH, expand=YES)
-        detail_scroll = ttk.Scrollbar(detail_host, orient=VERTICAL, command=self.pdf_detail.yview)
-        detail_scroll.pack(side=RIGHT, fill=Y)
-        self.pdf_detail.configure(yscrollcommand=detail_scroll.set)
-        self.pdf_detail.configure(state="disabled")
-
-    def _build_pdf_question_editor(self, parent):
-        ttk.Label(
+    def _build_pdf_live_preview_panel(self, parent):
+        self._pdf_question_preview_canvas = tk.Canvas(
             parent,
-            textvariable=self._pdf_question_editor_message,
-            wraplength=440,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 8))
+            height=360,
+            bg="#edf2f7",
+            highlightthickness=0,
+        )
+        self._pdf_question_preview_canvas.pack(fill=BOTH, expand=YES)
+        self._pdf_question_preview_canvas.bind(
+            "<Configure>",
+            lambda _event: self._render_pdf_question_editor_preview(),
+        )
+        self._pdf_question_preview_canvas.bind("<ButtonPress-1>", self._on_pdf_question_preview_press)
+        self._pdf_question_preview_canvas.bind("<B1-Motion>", self._on_pdf_question_preview_drag)
+        self._pdf_question_preview_canvas.bind("<ButtonRelease-1>", self._on_pdf_question_preview_release)
+        self._pdf_question_preview_canvas.bind("<Motion>", self._on_pdf_question_preview_motion)
+        for sequence in (
+            "<Left>",
+            "<Right>",
+            "<Up>",
+            "<Down>",
+            "<Shift-Left>",
+            "<Shift-Right>",
+            "<Shift-Up>",
+            "<Shift-Down>",
+            "<Control-Left>",
+            "<Control-Right>",
+            "<Control-Up>",
+            "<Control-Down>",
+        ):
+            self._pdf_question_preview_canvas.bind(sequence, self._on_pdf_question_preview_nudge)
 
+    def _build_pdf_question_ai_panel(self, parent):
         ai_box = ttk.Labelframe(parent, text=" AI 修复建议 ", bootstyle="warning", padding=(8, 6))
         ai_box.pack(fill=X, pady=(0, 8))
         ttk.Label(
@@ -1612,36 +1843,9 @@ class PPTConvertApp:
             width=14,
         ).pack(side=LEFT)
 
-        layout_box = ttk.Labelframe(parent, text=" 单题选项布局 ", bootstyle="secondary", padding=(8, 6))
-        layout_box.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            layout_box,
-            text="保持“跟随全局”时，会继续使用第四步里的全局排版；单独切换后，只影响当前这道题。",
-            wraplength=430,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 6))
-        button_row = ttk.Frame(layout_box)
-        button_row.pack(fill=X)
-        for value, label in _PDF_QUESTION_LAYOUT_CHOICES:
-            button = ttk.Radiobutton(
-                button_row,
-                text=label,
-                value=value,
-                variable=self._pdf_question_layout_var,
-            )
-            button.pack(side=LEFT, padx=(0, 8))
-            self._pdf_question_layout_buttons.append(button)
-
+    def _build_pdf_question_content_panel(self, parent):
         stem_box = ttk.Labelframe(parent, text=" 题干编辑 ", bootstyle="info", padding=(8, 6))
         stem_box.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            stem_box,
-            text="这里的修改会直接进入当前工程，后续导出 Word / PPT 会复用当前版本。",
-            wraplength=430,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 6))
         stem_editor_host = ttk.Frame(stem_box)
         stem_editor_host.pack(fill=X, expand=YES)
         self._pdf_question_stem_editor = tk.Text(stem_editor_host, wrap="word", height=7)
@@ -1702,25 +1906,50 @@ class PPTConvertApp:
 
         option_box = ttk.Labelframe(parent, text=" 选项编辑 ", bootstyle="info", padding=(8, 6))
         option_box.pack(fill=X, pady=(0, 8))
-        ttk.Label(
-            option_box,
-            text="可逐项修改 A/B/C/D 文本；如果选项里带图，也可以查看、替换或清除当前图片。",
-            wraplength=430,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 6))
         self._pdf_option_editor_host = ttk.Frame(option_box)
         self._pdf_option_editor_host.pack(fill=X, expand=YES)
 
-        preview_box = ttk.Labelframe(parent, text=" 实时排版预览 ", bootstyle="primary", padding=(8, 6))
+    def _build_pdf_question_layout_panel(self, parent):
+        layout_box = ttk.Labelframe(parent, text=" 单题选项布局 ", bootstyle="secondary", padding=(8, 6))
+        layout_box.pack(fill=X, pady=(0, 8))
+        button_row = ttk.Frame(layout_box)
+        button_row.pack(fill=X)
+        for value, label in _PDF_QUESTION_LAYOUT_CHOICES:
+            button = ttk.Radiobutton(
+                button_row,
+                text=label,
+                value=value,
+                variable=self._pdf_question_layout_var,
+            )
+            button.pack(side=LEFT, padx=(0, 8))
+            self._pdf_question_layout_buttons.append(button)
+
+        quick_box = ttk.Labelframe(parent, text=" 全局 PPT 快设 ", bootstyle="info", padding=(8, 6))
+        quick_box.pack(fill=X, pady=(0, 8))
+        quick_row = ttk.Frame(quick_box)
+        quick_row.pack(fill=X)
+        ttk.Label(quick_row, text="全局选项布局", bootstyle="secondary").pack(side=LEFT)
+        ttk.Combobox(
+            quick_row,
+            textvariable=self.option_layout,
+            values=["grid", "list", "one_row"],
+            state="readonly",
+            width=12,
+        ).pack(side=LEFT, padx=(6, 10))
+        ttk.Label(quick_row, text="题干字号", bootstyle="secondary").pack(side=LEFT)
+        ttk.Spinbox(quick_row, from_=10, to=48, textvariable=self.font_size_stem, width=6).pack(side=LEFT, padx=(6, 10))
+        ttk.Label(quick_row, text="选项字号", bootstyle="secondary").pack(side=LEFT)
+        ttk.Spinbox(quick_row, from_=8, to=40, textvariable=self.font_size_option, width=6).pack(side=LEFT, padx=(6, 10))
+        ttk.Button(
+            quick_row,
+            text="打开导出设置",
+            command=self._open_ppt_settings_tab,
+            bootstyle="info-outline",
+            width=12,
+        ).pack(side=RIGHT)
+
+        preview_box = ttk.Labelframe(parent, text=" 版式工具 ", bootstyle="primary", padding=(8, 6))
         preview_box.pack(fill=BOTH, expand=YES)
-        ttk.Label(
-            preview_box,
-            text="现在可以直接在这里拖动、缩放题干区 / 图片区 / 选项区；导出 PPT 时会真正按当前单题版式生成。",
-            wraplength=430,
-            justify=LEFT,
-            bootstyle="secondary",
-        ).pack(anchor=W, pady=(0, 6))
         preview_toolbar = ttk.Frame(preview_box)
         preview_toolbar.pack(fill=X, pady=(0, 6))
         ttk.Label(
@@ -1811,36 +2040,29 @@ class PPTConvertApp:
             text="直接输入位置和尺寸，回车或失焦会自动生效。",
             bootstyle="secondary",
         ).pack(side=LEFT, padx=(4, 0))
-        self._pdf_question_preview_canvas = tk.Canvas(
-            preview_box,
-            height=300,
-            bg="#edf2f7",
-            highlightthickness=0,
-        )
-        self._pdf_question_preview_canvas.pack(fill=BOTH, expand=YES)
-        self._pdf_question_preview_canvas.bind(
-            "<Configure>",
-            lambda _event: self._render_pdf_question_editor_preview(),
-        )
-        self._pdf_question_preview_canvas.bind("<ButtonPress-1>", self._on_pdf_question_preview_press)
-        self._pdf_question_preview_canvas.bind("<B1-Motion>", self._on_pdf_question_preview_drag)
-        self._pdf_question_preview_canvas.bind("<ButtonRelease-1>", self._on_pdf_question_preview_release)
-        self._pdf_question_preview_canvas.bind("<Motion>", self._on_pdf_question_preview_motion)
-        for sequence in (
-            "<Left>",
-            "<Right>",
-            "<Up>",
-            "<Down>",
-            "<Shift-Left>",
-            "<Shift-Right>",
-            "<Shift-Up>",
-            "<Shift-Down>",
-            "<Control-Left>",
-            "<Control-Right>",
-            "<Control-Up>",
-            "<Control-Down>",
-        ):
-            self._pdf_question_preview_canvas.bind(sequence, self._on_pdf_question_preview_nudge)
+
+    def _build_pdf_question_editor(self, parent):
+        ttk.Label(
+            parent,
+            textvariable=self._pdf_question_editor_message,
+            wraplength=440,
+            justify=LEFT,
+            bootstyle="secondary",
+        ).pack(anchor=W, pady=(0, 8))
+
+        notebook = ttk.Notebook(parent, bootstyle="info")
+        notebook.pack(fill=BOTH, expand=YES)
+
+        content_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        layout_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        ai_tab = ttk.Frame(notebook, padding=(0, 0, 0, 0))
+        notebook.add(content_tab, text=" 内容 ")
+        notebook.add(layout_tab, text=" 版式 ")
+        notebook.add(ai_tab, text=" AI / 审核 ")
+
+        self._build_pdf_question_content_panel(content_tab)
+        self._build_pdf_question_layout_panel(layout_tab)
+        self._build_pdf_question_ai_panel(ai_tab)
         self._clear_pdf_question_editor()
 
     def _build_pdf_material_preview_panel(self, parent):
@@ -2188,20 +2410,101 @@ class PPTConvertApp:
 
     # Template toggle
 
+    def _set_template_status(self, text: str, bootstyle: str = "secondary"):
+        self._template_status_var.set(text)
+        if getattr(self, "_tpl_status", None):
+            self._tpl_status.configure(bootstyle=bootstyle)
+
+    def _show_template_config_notebook(self):
+        if getattr(self, "_config_notebook", None) and self._config_notebook.winfo_manager() != "pack":
+            self._config_notebook.pack(fill=X, padx=8, pady=(4, 8))
+
+    def _refresh_template_mode_ui(self):
+        on = self.use_template.get()
+        if not on:
+            self._template_mode = "off"
+            self._tpl_overlay_label.pack_forget()
+            self._show_template_config_notebook()
+            self._set_template_status("未启用模板。", "secondary")
+            return
+
+        if self._template_mode == "full":
+            self._config_notebook.pack_forget()
+            self._tpl_overlay_label.configure(text="已识别完整模板版式：导出时将直接沿用模板布局。")
+            self._tpl_overlay_label.pack(fill=X, padx=8, pady=10)
+            return
+
+        self._tpl_overlay_label.pack_forget()
+        self._show_template_config_notebook()
+
+    def _inspect_selected_template(self, *, show_error: bool) -> bool:
+        if not self.use_template.get():
+            self._template_style_preview = None
+            self._template_mode = "off"
+            self._refresh_template_mode_ui()
+            return False
+
+        template = self.template_path.get().strip()
+        if not template:
+            self._template_style_preview = None
+            self._template_mode = "pending"
+            self._set_template_status("请选择模板文件。", "secondary")
+            self._refresh_template_mode_ui()
+            return False
+        if not os.path.exists(template):
+            self._template_style_preview = None
+            self._template_mode = "error"
+            self._set_template_status("模板文件不存在。", "danger")
+            self._refresh_template_mode_ui()
+            if show_error:
+                messagebox.showerror("错误", f"模板文件不存在：{template}")
+            return False
+
+        try:
+            prs = self._template_manager.load_template(template)
+            style = extract_best_style_from_presentation(prs)
+        except Exception as exc:
+            self._template_style_preview = None
+            self._template_mode = "error"
+            self._set_template_status(f"模板读取失败：{exc}", "danger")
+            self._refresh_template_mode_ui()
+            if show_error:
+                messagebox.showerror("错误", f"读取模板失败：{exc}")
+            return False
+
+        self._template_style_preview = style
+        slide_text = f"第 {style.source_slide_index + 1} 页"
+        summary = describe_template_style(style)
+        if template_style_has_full_layout(style):
+            self._template_mode = "full"
+            self._set_template_status(
+                f"已识别 {slide_text}：{summary}。导出时将直接沿用模板版式。",
+                "success",
+            )
+        else:
+            self._template_mode = "partial"
+            self._set_template_status(
+                f"已读取 {slide_text}：{summary}。会复用模板样式，布局继续使用当前设置。",
+                "warning",
+            )
+        self._refresh_template_mode_ui()
+        return True
+
+    def _on_template_entry_changed(self, _event=None):
+        if self.use_template.get():
+            self._inspect_selected_template(show_error=False)
+
     def _toggle_template(self):
         on = self.use_template.get()
         st = NORMAL if on else DISABLED
         self.template_entry.configure(state=st)
         self.template_btn.configure(state=st)
-
         if on:
-            self._tpl_hint.pack(anchor=W, pady=(8, 0))
-            self._config_notebook.pack_forget()
-            self._tpl_overlay_label.pack(fill=X, padx=8, pady=10)
+            self._inspect_selected_template(show_error=False)
         else:
-            self._tpl_hint.pack_forget()
-            self._tpl_overlay_label.pack_forget()
-            self._config_notebook.pack(fill=X, padx=8, pady=(4, 8))
+            self._template_style_preview = None
+            self._template_mode = "off"
+            self._refresh_template_mode_ui()
 
     # Defaults reset
 
@@ -2233,6 +2536,8 @@ class PPTConvertApp:
             self.word_path.set(path)
             if not self.output_path.get():
                 self.output_path.set(os.path.splitext(path)[0] + ".pptx")
+            self._open_word_workspace_tab()
+            self._set_status(f"已选择 Word：{os.path.basename(path)}")
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(title="保存 PPT",
@@ -2240,12 +2545,14 @@ class PPTConvertApp:
                                             filetypes=[("PowerPoint", "*.pptx")])
         if path:
             self.output_path.set(path)
+            self._set_status(f"输出位置已更新：{os.path.basename(path)}")
 
     def _browse_template(self):
         path = filedialog.askopenfilename(title="选择 PPT 模板",
                                           filetypes=[("PowerPoint", "*.pptx"), ("All", "*.*")])
         if path:
             self.template_path.set(path)
+            self._inspect_selected_template(show_error=True)
 
     def _browse_pdf(self):
         path = filedialog.askopenfilename(
@@ -2526,6 +2833,42 @@ class PPTConvertApp:
                     f"{image_count} 张" if image_count else "-",
                 ),
             )
+        self._refresh_word_flow_ui()
+
+    def _refresh_word_flow_ui(self):
+        has_word = bool(self.word_path.get().strip())
+        has_output = bool(self.output_path.get().strip())
+        parsed_current = self._word_project_matches_current_file() and bool(self.questions)
+
+        if getattr(self, "_word_parse_btn", None):
+            self._word_parse_btn.configure(state=(NORMAL if has_word else DISABLED))
+        if getattr(self, "_word_convert_btn", None):
+            self._word_convert_btn.configure(state=(NORMAL if has_word else DISABLED))
+        if getattr(self, "_word_generate_btn", None):
+            self._word_generate_btn.configure(state=(NORMAL if parsed_current and has_output else DISABLED))
+        if getattr(self, "_word_editor_btn", None):
+            self._word_editor_btn.configure(state=(NORMAL if parsed_current else DISABLED))
+
+        if parsed_current:
+            count = len(self.questions)
+            self._word_flow_status_var.set(
+                f"已解析 {count} 道题。常规下一步直接生成 PPT；只有版式要逐题调整时再进入编辑工作台。"
+            )
+            self._word_results_hint_var.set(
+                f"当前显示 {count} 道题；快速检查无误后可直接生成 PPT。"
+            )
+            return
+
+        if has_word:
+            if has_output:
+                self._word_flow_status_var.set("先点“解析并检查”；正常情况下，检查通过后下一步就是“生成 PPT”。")
+            else:
+                self._word_flow_status_var.set("先点“解析并检查”；如果赶时间，也可以直接用“一键生成 PPT”。")
+            self._word_results_hint_var.set("当前还没有解析结果；完成解析后，这里会显示本次识别到的题目。")
+            return
+
+        self._word_flow_status_var.set("先选择 Word 题本。常规流程：选择文件 → 解析并检查 → 生成 PPT。")
+        self._word_results_hint_var.set("还没有解析结果。先在左侧选择题本。")
 
     def _clear_pdf_preview(self):
         self.pdf_project = None
@@ -5852,6 +6195,7 @@ class PPTConvertApp:
         self._open_word_workspace_tab()
         if not auto_preview:
             self._set_status(f"已准备好 Word 工作流：{os.path.basename(resolved)}")
+            self._refresh_word_flow_ui()
             return True
         return self._start_word_preview_flow(skip_confirm=skip_confirm)
 
@@ -5877,6 +6221,7 @@ class PPTConvertApp:
         self._populate_pdf_preview(project)
         if getattr(self, "_pdf_preview_left_tabs", None):
             self._pdf_preview_left_tabs.select(self._pdf_preview_slide_tab)
+        self._refresh_word_flow_ui()
 
     def _make_ppt_config(self) -> PPTConfig:
         from pptx.util import Inches, Pt
@@ -5945,16 +6290,22 @@ class PPTConvertApp:
             self._refresh_question_tree()
             self._load_word_project_into_preview(project, docx_path=word_file, asset_dir=asset_dir)
             self._set_status(f"解析完成，共 {project.question_count} 道题")
+            self._refresh_word_flow_ui()
             return True
         except Exception as exc:
             self._set_status("解析失败")
+            self._word_flow_status_var.set("解析失败，请检查 Word 格式或文件内容。")
             messagebox.showerror("解析错误", str(exc))
             return False
 
-    def _start_word_preview_flow(self, *, skip_confirm: bool = False) -> bool:
+    def _start_word_preview_flow(self, *, skip_confirm: bool = False, open_editor: bool = False) -> bool:
+        self._open_word_workspace_tab()
         if not self._parse_word_file(skip_confirm=skip_confirm):
             return False
-        self._open_pdf_preview_workspace()
+        if open_editor:
+            self._open_pdf_preview_workspace()
+            self._word_flow_status_var.set("当前已进入逐题编辑工作台；修改完成后回到 Word 工作流直接生成 PPT。")
+            self._word_results_hint_var.set("你正在逐题精修；改完后回到 Word 工作流直接生成 PPT。")
         if not self.questions:
             messagebox.showinfo("提示", "未解析到任何题目，请检查 Word 格式")
         return True
@@ -6055,13 +6406,13 @@ class PPTConvertApp:
         self.use_template.set(False)
         self._toggle_template()
         self.questions.clear()
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        self._refresh_question_tree()
         self._clear_pdf_preview()
         self._show_pdf_wizard_step(0)
         self.progress["value"] = 0
         self._set_status("已清空")
         self._close_parser()
+        self._refresh_word_flow_ui()
 
     def _set_status(self, text: str):
         self.status_label.configure(text=text)

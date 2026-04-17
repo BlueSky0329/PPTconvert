@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
+import re
 
-from core.subject_inference import infer_subject_diagnostics
+try:
+    import fitz
+except Exception:  # pragma: no cover - optional dependency
+    fitz = None
+
+from core.subject_inference import infer_pdf_filename_profile, infer_subject_diagnostics
 from domain.models import ExamProject, QuestionNode, ReviewIssue, SUBJECT_DISPLAY_NAMES, SubjectKind
 
 _SEVERITY_WEIGHTS = {
@@ -22,6 +29,16 @@ _DATA_STEM_ASK_MARKERS = (
     "下列说法错误的是",
     "以下哪项",
 )
+_VISUAL_CHOICE_MARKERS = (
+    "坐标图",
+    "图形",
+    "示意图",
+    "图中",
+    "如下图",
+    "下列图",
+    "哪个图",
+)
+_INLINE_OPTION_MARKER = re.compile(r"(?<![A-Za-z0-9])([A-D])[\.．、:：]")
 
 
 @dataclass
@@ -29,6 +46,7 @@ class ProjectQualitySummary:
     question_count: int = 0
     flagged_questions: int = 0
     severe_questions: int = 0
+    source_defect_questions: int = 0
     total_issue_count: int = 0
 
 
@@ -66,6 +84,201 @@ def _add_issue(
 
 def _normalized_option_text(value: str) -> str:
     return "".join((value or "").split()).strip(".,，。:：;；")
+
+
+def _question_expects_visual_choice(question: QuestionNode) -> bool:
+    stem = (question.stem or "").strip()
+    if not stem:
+        return False
+    return any(marker in stem for marker in _VISUAL_CHOICE_MARKERS)
+
+
+def _question_number_token(number: int) -> re.Pattern[str]:
+    return re.compile(rf"(?<!\d){number}\s*[、.．](?!\d)")
+
+
+def _question_page_numbers(question: QuestionNode) -> list[int]:
+    return [
+        page_number
+        for page_number in (getattr(question, "page_numbers", []) or [])
+        if isinstance(page_number, int) and page_number > 0
+    ]
+
+
+def _page_text_map(pdf_path: str | Path | None, page_numbers: set[int]) -> dict[int, str]:
+    if fitz is None or not pdf_path or not page_numbers:
+        return {}
+    path = Path(pdf_path)
+    if not path.exists():
+        return {}
+    try:
+        document = fitz.open(path)
+    except Exception:
+        return {}
+    try:
+        result: dict[int, str] = {}
+        for page_number in sorted(page_numbers):
+            if 1 <= page_number <= len(document):
+                result[page_number] = document[page_number - 1].get_text("text")
+        return result
+    finally:
+        document.close()
+
+
+def _gap_numbers_come_from_source(
+    pdf_path: str | Path | None,
+    previous_question: QuestionNode,
+    current_question: QuestionNode,
+) -> bool:
+    previous_numeric = previous_question.numeric_source_number
+    current_numeric = current_question.numeric_source_number
+    if previous_numeric is None or current_numeric is None or current_numeric <= previous_numeric + 1:
+        return False
+
+    missing_numbers = list(range(previous_numeric + 1, current_numeric))
+    candidate_pages = set(_question_page_numbers(previous_question)) | set(_question_page_numbers(current_question))
+    if not candidate_pages:
+        return False
+
+    page_texts = _page_text_map(pdf_path, candidate_pages)
+    combined_text = "\n".join(page_texts.get(page_number, "") for page_number in sorted(candidate_pages))
+    if not combined_text:
+        return False
+
+    if not _question_number_token(previous_numeric).search(combined_text):
+        return False
+    if not _question_number_token(current_numeric).search(combined_text):
+        return False
+    return all(not _question_number_token(number).search(combined_text) for number in missing_numbers)
+
+
+def _looks_like_chapter_reset(section_kind: SubjectKind, previous_numeric: int, question: QuestionNode) -> bool:
+    if section_kind not in {"politics", "common_sense"}:
+        return False
+    numeric = question.numeric_source_number
+    if numeric is None or numeric >= previous_numeric or previous_numeric < 2:
+        return False
+    stem = (question.stem or "").strip()
+    if len(stem) < 12:
+        return False
+    looks_like_fresh_question = stem.startswith("(") or stem.startswith("（") or "·" in stem[:24]
+    if numeric == 1:
+        return True
+    if previous_numeric - numeric >= 5 and numeric <= 10:
+        return True
+    return looks_like_fresh_question
+
+
+def _looks_like_empty_source_placeholder(
+    section_kind: SubjectKind,
+    sequential_questions: list[QuestionNode],
+    index: int,
+) -> bool:
+    if section_kind == "data":
+        return False
+    question = sequential_questions[index]
+    if (question.stem or "").strip():
+        return False
+    if question.stem_assets or question.options:
+        return False
+    current = question.numeric_source_number
+    if current is None:
+        return False
+    previous = sequential_questions[index - 1] if index > 0 else None
+    nxt = sequential_questions[index + 1] if index + 1 < len(sequential_questions) else None
+    if previous is None or nxt is None:
+        return False
+    previous_numeric = previous.numeric_source_number
+    next_numeric = nxt.numeric_source_number
+    if previous_numeric != current - 1 or next_numeric != current + 1:
+        return False
+    return any(
+        (
+            (candidate.stem or "").strip()
+            or candidate.stem_assets
+            or candidate.options
+        )
+        for candidate in (previous, nxt)
+    )
+
+
+def _looks_like_partial_inline_option_loss(
+    section_kind: SubjectKind,
+    sequential_questions: list[QuestionNode],
+    index: int,
+) -> bool:
+    if section_kind == "data":
+        return False
+    question = sequential_questions[index]
+    stem = (question.stem or "").strip()
+    if len(stem) < 40 or question.stem_assets or question.options:
+        return False
+
+    current = question.numeric_source_number
+    nxt = sequential_questions[index + 1] if index + 1 < len(sequential_questions) else None
+    if current is None or nxt is None or nxt.numeric_source_number != current + 1:
+        return False
+    if not ((nxt.stem or "").strip() or nxt.stem_assets or nxt.options):
+        return False
+
+    marker_matches = list(_INLINE_OPTION_MARKER.finditer(stem))
+    inline_letters: list[str] = []
+    for match in marker_matches:
+        letter = match.group(1)
+        if not inline_letters or inline_letters[-1] != letter:
+            inline_letters.append(letter)
+
+    if len(inline_letters) < 2 or len(inline_letters) >= 4:
+        return False
+    expected_prefix = list("ABCD")[: len(inline_letters)]
+    if inline_letters != expected_prefix:
+        return False
+
+    if marker_matches:
+        first_marker_pos = marker_matches[0].start()
+        prompt_window = stem[max(0, first_marker_pos - 12):first_marker_pos]
+        has_prompt_boundary = any(token in prompt_window for token in ("()", "）", ")"))
+        if not has_prompt_boundary and first_marker_pos < max(16, len(stem) // 3):
+            return False
+
+    return True
+
+
+def _pages_have_visual_candidates(pdf_path: str | None, page_numbers: list[int]) -> bool | None:
+    if fitz is None or not pdf_path or not page_numbers:
+        return None
+    path = Path(pdf_path)
+    if not path.exists():
+        return None
+    try:
+        document = fitz.open(path)
+    except Exception:
+        return None
+    try:
+        for page_number in page_numbers:
+            if page_number < 1 or page_number > len(document):
+                continue
+            page = document[page_number - 1]
+            for image in page.get_images(full=True):
+                for rect in page.get_image_rects(image[0], transform=False):
+                    if rect.y1 <= 80 or rect.get_area() < 1200:
+                        continue
+                    return True
+            for drawing in page.get_drawings():
+                rect = drawing.get("rect")
+                if rect is None or rect.y1 <= 80:
+                    continue
+                if rect.get_area() < 600:
+                    continue
+                fill = drawing.get("fill")
+                color = drawing.get("color")
+                width = drawing.get("width")
+                if fill == (1.0, 1.0, 1.0) and color in (None, (1.0, 1.0, 1.0)) and not width:
+                    continue
+                return True
+    finally:
+        document.close()
+    return False
 
 
 def _looks_like_embedded_data_intro(material: MaterialSet | None, question: QuestionNode) -> bool:
@@ -141,6 +354,22 @@ def _subject_suggestion_threshold(current_kind: SubjectKind, inferred_kind: Subj
     return 0.7
 
 
+def _subject_mismatch_enabled(project: ExamProject, section_kind: SubjectKind) -> bool:
+    if section_kind in {"unknown", "data"}:
+        return True
+    pdf_path = getattr(project.source, "pdf_path", None)
+    if not pdf_path:
+        return True
+    profile = infer_pdf_filename_profile(pdf_path)
+    if (
+        profile.form == "single_subject_book"
+        and profile.subject_hint == section_kind
+        and profile.confidence >= 0.82
+    ):
+        return False
+    return True
+
+
 def is_flagged_question(question: QuestionNode) -> bool:
     if question.review_issues:
         return True
@@ -165,6 +394,7 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
     question_rows = list(project.iter_questions())
     summary.question_count = len(question_rows)
     scheduled_issues: dict[int, list[tuple[str, str, str, str]]] = {}
+    pdf_path = getattr(project.source, "pdf_path", None)
 
     duplicate_numbers = Counter()
     all_number_questions: dict[str, list[QuestionNode]] = {}
@@ -182,6 +412,17 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
                 sequential_questions.extend(material.questions)
         else:
             sequential_questions.extend(section.questions)
+
+        empty_source_placeholders = {
+            id(question)
+            for index, question in enumerate(sequential_questions)
+            if _looks_like_empty_source_placeholder(section.kind, sequential_questions, index)
+        }
+        partial_inline_source_losses = {
+            id(question)
+            for index, question in enumerate(sequential_questions)
+            if _looks_like_partial_inline_option_loss(section.kind, sequential_questions, index)
+        }
 
         previous_numeric: int | None = None
         previous_question: QuestionNode | None = None
@@ -209,6 +450,10 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
                             )
                         )
                 elif numeric < previous_numeric:
+                    if _looks_like_chapter_reset(section.kind, previous_numeric, question):
+                        previous_numeric = numeric
+                        previous_question = question
+                        continue
                     scheduled_issues.setdefault(id(question), []).append(
                         (
                             "number_order",
@@ -218,6 +463,10 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
                         )
                     )
                 elif numeric > previous_numeric + 1:
+                    if previous_question is not None and _gap_numbers_come_from_source(pdf_path, previous_question, question):
+                        previous_numeric = numeric
+                        previous_question = question
+                        continue
                     scheduled_issues.setdefault(id(question), []).append(
                         (
                             "number_gap",
@@ -228,6 +477,26 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
                     )
             previous_numeric = numeric
             previous_question = question
+
+        for question in sequential_questions:
+            if id(question) in empty_source_placeholders:
+                scheduled_issues.setdefault(id(question), []).append(
+                    (
+                        "source_text_missing",
+                        "源 PDF 题目文本缺失",
+                        "当前题只保留了题号，占位内容为空；结合前后连续题号判断，更像源文件当前页原题内容缺失。",
+                        "error",
+                    )
+                )
+            if id(question) in partial_inline_source_losses:
+                scheduled_issues.setdefault(id(question), []).append(
+                    (
+                        "source_text_missing",
+                        "源 PDF 题目文本缺失",
+                        "当前题干尾部只残留了前半组选项，随后已直接切到下一题；更像源 PDF 当前页后半题干或选项缺失。",
+                        "error",
+                    )
+                )
 
     for section, material, question in question_rows:
         issues: list[ReviewIssue] = []
@@ -245,8 +514,11 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
         stem = (question.stem or "").strip()
         image_option_count = sum(1 for option in question.options if option.image_path)
         option_texts = [option.text or "" for option in question.options]
+        normalized_option_texts = [_normalized_option_text(text) for text in option_texts if _normalized_option_text(text)]
 
-        if not stem and not question.stem_assets:
+        if "source_text_missing" in seen_codes:
+            pass
+        elif not stem and not question.stem_assets:
             _add_issue(
                 issues,
                 seen_codes,
@@ -255,8 +527,53 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
                 "当前题没有可用题干文本，也没有题干图片。",
                 severity="error",
             )
+        elif stem in {"缺失", "题目缺失"}:
+            _add_issue(
+                issues,
+                seen_codes,
+                "source_text_missing",
+                "源 PDF 题目文本缺失",
+                "源文件当前页只保留了“缺失”占位文本，疑似题目原文在 PDF 中已缺失或 OCR 完全损坏。",
+                severity="error",
+                )
 
-        if section.kind != "unknown" and len(question.options) not in {4}:
+        if (
+            section.kind != "data"
+            and not question.stem_assets
+            and not any(option.image_path for option in question.options)
+            and len(question.options) <= 1
+            and _question_expects_visual_choice(question)
+        ):
+            visual_candidates = _pages_have_visual_candidates(
+                getattr(project.source, "pdf_path", None),
+                list(getattr(question, "page_numbers", []) or []),
+            )
+            if visual_candidates is False:
+                _add_issue(
+                    issues,
+                    seen_codes,
+                    "source_visual_missing",
+                    "源 PDF 疑似缺少图形选项",
+                    "当前题干明确要求根据图形或坐标图判断，但对应 PDF 页没有可用图形对象，疑似源文件本身缺图。",
+                    severity="error",
+                )
+
+        source_missing_option_texts = [
+            option.letter
+            for option in question.options
+            if _normalized_option_text(option.text) in {"缺失", "题目缺失"}
+        ]
+        if source_missing_option_texts:
+            _add_issue(
+                issues,
+                seen_codes,
+                "source_text_missing",
+                "源 PDF 题目文本缺失",
+                "、".join(source_missing_option_texts) + " 选项在源文件中只保留了“缺失”占位文本，更像原题文字缺失而非切题错误。",
+                severity="error",
+            )
+
+        if "source_text_missing" not in seen_codes and "source_visual_missing" not in seen_codes and section.kind != "unknown" and len(question.options) not in {4}:
             _add_issue(
                 issues,
                 seen_codes,
@@ -272,23 +589,45 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
             if not (option.text or "").strip() and not option.image_path
         ]
         if blank_letters:
+            filled_option_count = sum(
+                1
+                for option in question.options
+                if (option.text or "").strip() or option.image_path
+            )
+            if (
+                "source_text_missing" not in seen_codes
+                and len(blank_letters) == 1
+                and filled_option_count >= 3
+                and (image_option_count >= 2 or (not stem and bool(question.stem_assets)))
+            ):
+                _add_issue(
+                    issues,
+                    seen_codes,
+                    "source_text_missing",
+                    "源 PDF 题目文本缺失",
+                    "当前仅有一个选项完全空白，其余选项已恢复为图像或文本，更像源文件当前页该选项原文缺失。",
+                    severity="error",
+                )
+            if "source_text_missing" in seen_codes:
+                blank_letters = []
+        if blank_letters:
+            filled_option_count = sum(
+                1
+                for option in question.options
+                if (option.text or "").strip() or option.image_path
+            )
             _add_issue(
                 issues,
                 seen_codes,
                 "blank_option",
                 "存在空白选项",
                 "、".join(blank_letters) + " 选项没有文字，也没有图片。",
-                severity="error",
+                severity="warning" if len(blank_letters) == 1 and filled_option_count >= 3 else "error",
             )
 
-        normalized_options = [
-            _normalized_option_text(option.text)
-            for option in question.options
-            if _normalized_option_text(option.text)
-        ]
-        option_counter = Counter(normalized_options)
+        option_counter = Counter(normalized_option_texts)
         repeated_options = [value for value, count in option_counter.items() if count > 1]
-        if repeated_options:
+        if repeated_options and "source_text_missing" not in seen_codes:
             _add_issue(
                 issues,
                 seen_codes,
@@ -419,6 +758,8 @@ def annotate_project_quality(project: ExamProject) -> ProjectQualitySummary:
             summary.flagged_questions += 1
         if any(issue.severity == "error" for issue in issues):
             summary.severe_questions += 1
+        if any(issue.code.startswith("source_") for issue in issues):
+            summary.source_defect_questions += 1
         summary.total_issue_count += len(issues)
 
     return summary

@@ -20,7 +20,7 @@ from core.template_style import (
     ExtractedRunStyle,
     TemplateSlideStyle,
     delete_all_slides,
-    extract_style_from_slide,
+    extract_best_style_from_presentation,
     merge_template_style_into_config,
     neutralize_option_colors_if_no_template_rgb,
 )
@@ -142,8 +142,7 @@ class PPTGenerator:
         if template_path:
             self._prs = self.tm.load_template(template_path)
             if len(self._prs.slides) > 0:
-                first = next(iter(self._prs.slides))
-                self._tpl_style = extract_style_from_slide(first)
+                self._tpl_style = extract_best_style_from_presentation(self._prs)
             self.config = replace(self.config)
             if self._tpl_style:
                 merge_template_style_into_config(self.config, self._tpl_style)

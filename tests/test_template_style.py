@@ -3,7 +3,7 @@ import unittest
 from pptx import Presentation
 from pptx.util import Inches
 
-from core.template_style import extract_style_from_slide
+from core.template_style import extract_best_style_from_presentation, extract_style_from_slide, template_style_has_full_layout
 
 
 class TemplateStyleTest(unittest.TestCase):
@@ -22,3 +22,20 @@ class TemplateStyleTest(unittest.TestCase):
         self.assertIsNotNone(style.stem_rect)
         self.assertEqual(len(style.option_rects), 4)
         self.assertEqual(len(style.option_box_styles), 4)
+
+    def test_extract_best_style_from_presentation_prefers_later_question_slide(self):
+        presentation = Presentation()
+        cover = presentation.slides.add_slide(presentation.slide_layouts[6])
+        cover.shapes.add_textbox(Inches(1), Inches(0.8), Inches(8), Inches(1)).text = "封面"
+
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+        slide.shapes.add_textbox(Inches(1), Inches(0.5), Inches(8), Inches(1)).text = "[stem]"
+        slide.shapes.add_textbox(Inches(1), Inches(2), Inches(3), Inches(0.7)).text = "A. option"
+        slide.shapes.add_textbox(Inches(5), Inches(2), Inches(3), Inches(0.7)).text = "B. option"
+        slide.shapes.add_textbox(Inches(1), Inches(3), Inches(3), Inches(0.7)).text = "C. option"
+        slide.shapes.add_textbox(Inches(5), Inches(3), Inches(3), Inches(0.7)).text = "D. option"
+
+        style = extract_best_style_from_presentation(presentation)
+
+        self.assertEqual(style.source_slide_index, 1)
+        self.assertTrue(template_style_has_full_layout(style))

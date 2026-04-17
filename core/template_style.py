@@ -376,6 +376,56 @@ def extract_style_from_slide(slide: "Slide") -> TemplateSlideStyle:
     return style
 
 
+def template_style_has_full_layout(style: TemplateSlideStyle) -> bool:
+    return style.stem_rect is not None and len(style.option_rects) >= 4
+
+
+def describe_template_style(style: TemplateSlideStyle) -> str:
+    parts: list[str] = []
+    if style.stem_rect is not None:
+        parts.append("题干")
+    elif style.stem is not None:
+        parts.append("题干样式")
+
+    option_count = len(style.option_rects)
+    if option_count >= 4:
+        parts.append("4 个选项")
+    elif option_count > 0:
+        parts.append(f"{option_count} 个选项")
+    elif style.option is not None:
+        parts.append("选项样式")
+
+    if style.image_rect is not None:
+        parts.append("图片区")
+
+    return "、".join(parts) if parts else "未识别到题目布局"
+
+
+def _template_style_score(style: TemplateSlideStyle) -> tuple[int, int, int, int, int]:
+    return (
+        1 if template_style_has_full_layout(style) else 0,
+        len(style.option_rects),
+        1 if style.stem_rect is not None else 0,
+        1 if style.image_rect is not None else 0,
+        1 if style.option is not None else 0,
+    )
+
+
+def extract_best_style_from_presentation(prs) -> TemplateSlideStyle:
+    best_style = TemplateSlideStyle()
+    best_score = (-1, -1, -1, -1, -1)
+
+    for index, slide in enumerate(getattr(prs, "slides", [])):
+        style = extract_style_from_slide(slide)
+        style.source_slide_index = index
+        score = _template_style_score(style)
+        if score > best_score:
+            best_style = style
+            best_score = score
+
+    return best_style
+
+
 def neutralize_option_colors_if_no_template_rgb(
     cfg: "PPTConfig", template_style: TemplateSlideStyle
 ) -> None:

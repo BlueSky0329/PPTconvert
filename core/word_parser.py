@@ -38,22 +38,22 @@ QUESTION_START_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "year_area",
         re.compile(
-            r"^(?P<label>[\uFF08(]\s*\d{4}(?:\s*[\u00b7.\uFF0E-]\s*[^)\uFF09]+)?\s*[)\uFF09])\s*(?P<stem>.*)$"
+            r"^(?P<label>[\uFF08(]\s*\d{4}(?:\s*[\u00b7.\uFF0E-]\s*[^)\uFF09]+)?\s*[)\uFF09])\s*(?P<stem>[\s\S]*)$"
         ),
     ),
     (
         "chinese_number",
         re.compile(
-            r"^\u7b2c\s*(?P<number>\d{1,3})\s*\u9898(?:\s*[\uff1a:.\uFF0E\u3001)\uFF09]\s*)?(?P<stem>.*)$"
+            r"^\u7b2c\s*(?P<number>\d{1,3})\s*\u9898(?:\s*[\uff1a:.\uFF0E\u3001)\uFF09]\s*)?(?P<stem>[\s\S]*)$"
         ),
     ),
     (
         "numeric_paren",
-        re.compile(r"^[\uFF08(]\s*(?P<number>\d{1,3})\s*[)\uFF09]\s*(?P<stem>.*)$"),
+        re.compile(r"^[\uFF08(]\s*(?P<number>\d{1,3})\s*[)\uFF09]\s*(?P<stem>[\s\S]*)$"),
     ),
     (
         "numeric_plain",
-        re.compile(r"^(?P<number>\d{1,3})\s*[.\uFF0E\u3001)\uFF09]\s*(?P<stem>.*)$"),
+        re.compile(r"^(?P<number>\d{1,3})\s*[.\uFF0E\u3001)\uFF09]\s*(?P<stem>[\s\S]*)$"),
     ),
 )
 

@@ -6,6 +6,7 @@ from core.project_quality import annotate_project_quality
 from PIL import Image
 
 from core.ppt_generator import PPTGenerator
+from core.template_style import TemplateSlideStyle, TextBoxRect
 from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, QuestionNode, Section
 from gui.app import PPTConvertApp
 
@@ -34,6 +35,130 @@ class GuiPreviewBehaviorTest(unittest.TestCase):
         if selected == str(self.app._pdf_preview_slide_tab):
             return "slide"
         return selected
+
+    def test_workspace_tabs_only_include_pdf_and_word(self):
+        labels = [
+            self.app._workspace_notebook.tab(tab_id, "text").strip()
+            for tab_id in self.app._workspace_notebook.tabs()
+        ]
+        self.assertEqual(labels, ["PDF 试卷整理", "Word 生成 PPT"])
+
+    def test_open_ppt_settings_switches_to_word_workspace(self):
+        self.app._workspace_notebook.select(self.app._pdf_workspace_tab)
+        self.app._open_ppt_settings_tab()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        self.assertEqual(str(self.app._workspace_notebook.select()), str(self.app._word_workspace_tab))
+        self.assertEqual(str(self.app._word_settings_notebook.select()), str(self.app._word_settings_layout_tab))
+
+    def test_start_word_preview_flow_stays_in_word_workspace(self):
+        self.app._workspace_notebook.select(self.app._pdf_workspace_tab)
+        original_parse = self.app._parse_word_file
+        try:
+            self.app.questions = [SimpleNamespace(number=1)]
+            self.app._parse_word_file = lambda skip_confirm=False: True
+            ok = self.app._start_word_preview_flow()
+        finally:
+            self.app._parse_word_file = original_parse
+            self.app.questions = []
+
+        self.app.root.update_idletasks()
+        self.app.root.update()
+        self.assertTrue(ok)
+        self.assertEqual(str(self.app._workspace_notebook.select()), str(self.app._word_workspace_tab))
+
+    def test_open_word_editor_workspace_switches_to_editor(self):
+        self.app._workspace_notebook.select(self.app._word_workspace_tab)
+        original_match = self.app._word_project_matches_current_file
+        try:
+            self.app._word_project_matches_current_file = lambda: True
+            self.app._open_word_editor_workspace()
+        finally:
+            self.app._word_project_matches_current_file = original_match
+
+        self.app.root.update_idletasks()
+        self.app.root.update()
+        self.assertEqual(str(self.app._workspace_notebook.select()), str(self.app._pdf_workspace_tab))
+
+    def test_word_flow_buttons_follow_parse_state(self):
+        original_match = self.app._word_project_matches_current_file
+        original_word = self.app.word_path.get()
+        original_output = self.app.output_path.get()
+        original_questions = list(self.app.questions)
+        try:
+            self.app.questions = []
+            self.app.word_path.set("")
+            self.app.output_path.set("")
+            self.app._word_project_matches_current_file = lambda: False
+            self.app._refresh_word_flow_ui()
+            self.assertEqual(str(self.app._word_parse_btn.cget("state")), "disabled")
+            self.assertEqual(str(self.app._word_generate_btn.cget("state")), "disabled")
+            self.assertEqual(str(self.app._word_convert_btn.cget("state")), "disabled")
+            self.assertEqual(str(self.app._word_editor_btn.cget("state")), "disabled")
+
+            self.app.word_path.set(r"C:\tmp\sample.docx")
+            self.app.output_path.set(r"C:\tmp\sample.pptx")
+            self.app._refresh_word_flow_ui()
+            self.assertEqual(str(self.app._word_parse_btn.cget("state")), "normal")
+            self.assertEqual(str(self.app._word_convert_btn.cget("state")), "normal")
+            self.assertEqual(str(self.app._word_generate_btn.cget("state")), "disabled")
+            self.assertEqual(str(self.app._word_editor_btn.cget("state")), "disabled")
+
+            self.app.questions = [SimpleNamespace(number=1)]
+            self.app._word_project_matches_current_file = lambda: True
+            self.app._refresh_word_flow_ui()
+            self.assertEqual(str(self.app._word_generate_btn.cget("state")), "normal")
+            self.assertEqual(str(self.app._word_editor_btn.cget("state")), "normal")
+            self.assertIn("生成 PPT", self.app._word_flow_status_var.get())
+        finally:
+            self.app._word_project_matches_current_file = original_match
+            self.app.word_path.set(original_word)
+            self.app.output_path.set(original_output)
+            self.app.questions = original_questions
+            self.app._refresh_word_flow_ui()
+
+    def test_pdf_handoff_actions_default_to_word_generation(self):
+        original_project = self.app.pdf_project
+        original_context = dict(self.app._pdf_project_context)
+        original_step = self.app._pdf_wizard_step
+        try:
+            self.app.pdf_project = None
+            self.app._pdf_project_context = {}
+            self.app._pdf_wizard_step = 2
+            self.app._refresh_pdf_wizard_ui()
+            self.assertEqual(str(self.app._pdf_handoff_btn.cget("text")), "去 Word 生成 PPT")
+            self.assertEqual(str(self.app._pdf_export_handoff_btn.cget("text")), "去 Word 生成 PPT")
+        finally:
+            self.app.pdf_project = original_project
+            self.app._pdf_project_context = original_context
+            self.app._pdf_wizard_step = original_step
+            self.app._refresh_pdf_wizard_ui()
+
+    def test_pdf_handoff_actions_return_to_word_for_word_source(self):
+        original_project = self.app.pdf_project
+        original_context = dict(self.app._pdf_project_context)
+        original_step = self.app._pdf_wizard_step
+        try:
+            project = self._build_flagged_project()
+            self.app.pdf_project = project
+            self.app._pdf_project_context = {
+                "source_kind": "word",
+                "docx_path": r"C:\\tmp\\sample.docx",
+                "asset_dir": "assets",
+                "document_subject_hint": "auto",
+            }
+            self.app._pdf_wizard_step = 2
+            self.app._refresh_pdf_wizard_ui()
+            self.assertEqual(str(self.app._pdf_handoff_btn.cget("text")), "返回 Word 生成 PPT")
+            self.assertEqual(str(self.app._pdf_export_handoff_btn.cget("text")), "返回 Word 生成 PPT")
+            self.assertIn("回到 Word 工作流直接生成 PPT", self.app._pdf_export_handoff_label.cget("text"))
+            self.assertIn("返回生成", self.app._pdf_next_btn.cget("text"))
+        finally:
+            self.app.pdf_project = original_project
+            self.app._pdf_project_context = original_context
+            self.app._pdf_wizard_step = original_step
+            self.app._refresh_pdf_wizard_ui()
 
     def _build_flagged_project(self) -> ExamProject:
         project = ExamProject(
@@ -420,6 +545,46 @@ class GuiPreviewBehaviorTest(unittest.TestCase):
         self.assertAlmostEqual(question.ppt_layout["stem"]["x"], 0.0, places=3)
         self.assertGreater(question.ppt_layout["stem"]["w"], 0.95)
         self.assertEqual(project.repair_log[-1].action, "align_question_ppt_layout")
+
+    def test_partial_template_analysis_keeps_manual_config_visible(self):
+        self.app.use_template.set(True)
+        self.app._template_mode = "partial"
+        self.app._template_style_preview = TemplateSlideStyle(
+            stem_rect=TextBoxRect(0, 0, 100, 40),
+            source_slide_index=1,
+        )
+        self.app._refresh_template_mode_ui()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        self.assertEqual(self.app._config_notebook.winfo_manager(), "pack")
+        self.assertEqual(self.app._tpl_overlay_label.winfo_manager(), "")
+
+        self.app.use_template.set(False)
+        self.app._refresh_template_mode_ui()
+
+    def test_full_template_analysis_hides_manual_config(self):
+        self.app.use_template.set(True)
+        self.app._template_mode = "full"
+        self.app._template_style_preview = TemplateSlideStyle(
+            stem_rect=TextBoxRect(0, 0, 100, 40),
+            option_rects=[
+                TextBoxRect(0, 60, 40, 20),
+                TextBoxRect(50, 60, 40, 20),
+                TextBoxRect(0, 90, 40, 20),
+                TextBoxRect(50, 90, 40, 20),
+            ],
+            source_slide_index=1,
+        )
+        self.app._refresh_template_mode_ui()
+        self.app.root.update_idletasks()
+        self.app.root.update()
+
+        self.assertEqual(self.app._config_notebook.winfo_manager(), "")
+        self.assertEqual(self.app._tpl_overlay_label.winfo_manager(), "pack")
+
+        self.app.use_template.set(False)
+        self.app._refresh_template_mode_ui()
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import core.learned_subject_model as learned_subject_model
 from core.project_quality import annotate_project_quality, is_flagged_question
-from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, QuestionNode, Section
+from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, PaperSource, QuestionNode, Section
 
 
 class DummyDecisionSubjectModel:
@@ -60,6 +60,204 @@ class ProjectQualityTest(unittest.TestCase):
         self.assertIn("blank_option", {issue.code for issue in question.review_issues})
         self.assertEqual(question.suggested_subject, "common_sense")
 
+    def test_annotate_project_quality_downgrades_single_blank_option_when_three_slots_are_recovered(self):
+        project = ExamProject(
+            title="示例",
+            sections=[
+                Section(
+                    kind="quant",
+                    title="数量关系",
+                    questions=[
+                        QuestionNode(
+                            source_number="176",
+                            stem="",
+                            stem_assets=[AssetRef(kind="stem_image", path="stem.png", source_page=1)],
+                            options=[
+                                OptionNode(letter="A", text="", image_path="a.png"),
+                                OptionNode(letter="B", text=""),
+                                OptionNode(letter="C", text="", image_path="c.png"),
+                                OptionNode(letter="D", text="", image_path="d.png"),
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        annotate_project_quality(project)
+        question = project.sections[0].questions[0]
+        self.assertIn("source_text_missing", {issue.code for issue in question.review_issues})
+        self.assertNotIn("blank_option", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_marks_source_missing_visual_question(self):
+        project = ExamProject(
+            title="示例",
+            source=PaperSource(pdf_path="missing-visual.pdf"),
+            sections=[
+                Section(
+                    kind="quant",
+                    title="数量关系",
+                    questions=[
+                        QuestionNode(
+                            source_number="474",
+                            stem="问以下哪个坐标图能准确表示甲、乙生产线产量之差与总生产时间之间的关系（）",
+                            options=[],
+                            page_numbers=[53],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        with patch("core.project_quality._pages_have_visual_candidates", return_value=False):
+            summary = annotate_project_quality(project)
+
+        question = project.sections[0].questions[0]
+        self.assertEqual(summary.source_defect_questions, 1)
+        self.assertIn("source_visual_missing", {issue.code for issue in question.review_issues})
+        self.assertNotIn("option_count", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_marks_source_missing_text_placeholder(self):
+        project = ExamProject(
+            title="示例",
+            sections=[
+                Section(
+                    kind="reasoning",
+                    title="判断推理",
+                    questions=[
+                        QuestionNode(
+                            source_number="970",
+                            stem="缺失",
+                            options=[],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        summary = annotate_project_quality(project)
+        question = project.sections[0].questions[0]
+
+        self.assertEqual(summary.source_defect_questions, 1)
+        self.assertIn("source_text_missing", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_marks_missing_option_placeholders_as_source_missing(self):
+        project = ExamProject(
+            title="示例",
+            sections=[
+                Section(
+                    kind="quant",
+                    title="数量关系",
+                    questions=[
+                        QuestionNode(
+                            source_number="56",
+                            stem="某药物剂量判断题",
+                            options=[
+                                OptionNode(letter="A", text="缺失"),
+                                OptionNode(letter="B", text="40毫克"),
+                                OptionNode(letter="C", text="缺失"),
+                                OptionNode(letter="D", text="缺失"),
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        summary = annotate_project_quality(project)
+        question = project.sections[0].questions[0]
+
+        self.assertEqual(summary.source_defect_questions, 1)
+        self.assertIn("source_text_missing", {issue.code for issue in question.review_issues})
+        self.assertNotIn("duplicate_option_text", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_marks_empty_placeholder_between_consecutive_questions_as_source_missing(self):
+        project = ExamProject(
+            title="示例",
+            sections=[
+                Section(
+                    kind="reasoning",
+                    title="判断推理",
+                    questions=[
+                        QuestionNode(
+                            source_number="1332",
+                            stem="上一题图形题",
+                            stem_assets=[AssetRef(kind="stem_image", path="a.png", source_page=244)],
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                        QuestionNode(
+                            source_number="1333",
+                            stem="",
+                            options=[],
+                        ),
+                        QuestionNode(
+                            source_number="1334",
+                            stem="下一题图形题",
+                            stem_assets=[AssetRef(kind="stem_image", path="b.png", source_page=245)],
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        summary = annotate_project_quality(project)
+        question = project.sections[0].questions[1]
+
+        self.assertEqual(summary.source_defect_questions, 1)
+        self.assertIn("source_text_missing", {issue.code for issue in question.review_issues})
+        self.assertNotIn("missing_stem", {issue.code for issue in question.review_issues})
+        self.assertNotIn("option_count", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_marks_partial_inline_options_before_next_question_as_source_missing(self):
+        project = ExamProject(
+            title="示例",
+            sections=[
+                Section(
+                    kind="verbal",
+                    title="言语理解",
+                    questions=[
+                        QuestionNode(
+                            source_number="1911",
+                            stem=(
+                                "这段文字中，盘口壶的例子意在说明()。"
+                                "A.类型学是常用的考古研究方法"
+                                "B.新技术手段如何帮助考古分析"
+                            ),
+                            options=[],
+                        ),
+                        QuestionNode(
+                            source_number="1912",
+                            stem="随着中国文化在全球的传播范围愈来愈广，下列说法与文意相符的是()。",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        summary = annotate_project_quality(project)
+        question = project.sections[0].questions[0]
+
+        self.assertEqual(summary.source_defect_questions, 1)
+        self.assertIn("source_text_missing", {issue.code for issue in question.review_issues})
+        self.assertNotIn("option_count", {issue.code for issue in question.review_issues})
+
     def test_annotate_project_quality_flags_number_gap_and_duplicate_number(self):
         project = ExamProject(
             title="示例",
@@ -110,6 +308,134 @@ class ProjectQualityTest(unittest.TestCase):
         self.assertIn("number_gap", {issue.code for issue in second.review_issues})
         self.assertIn("duplicate_number", {issue.code for issue in second.review_issues})
         self.assertIn("duplicate_number", {issue.code for issue in third.review_issues})
+
+    def test_annotate_project_quality_ignores_source_gap_number_jump(self):
+        project = ExamProject(
+            title="示例",
+            source=PaperSource(pdf_path="reasoning-gap.pdf"),
+            sections=[
+                Section(
+                    kind="reasoning",
+                    title="判断推理",
+                    questions=[
+                        QuestionNode(
+                            source_number="565",
+                            stem="上一题",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                            page_numbers=[108],
+                        ),
+                        QuestionNode(
+                            source_number="567",
+                            stem="下一题",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                            page_numbers=[108],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        with patch("core.project_quality._page_text_map", return_value={108: "565. 上一题\n567. 下一题"}):
+            annotate_project_quality(project)
+
+        question = project.sections[0].questions[1]
+        self.assertNotIn("number_gap", {issue.code for issue in question.review_issues})
+
+    def test_annotate_project_quality_ignores_politics_chapter_number_reset(self):
+        project = ExamProject(
+            title="政治理论题本",
+            sections=[
+                Section(
+                    kind="politics",
+                    title="政治理论",
+                    questions=[
+                        QuestionNode(
+                            source_number="1",
+                            stem="（2025·联考）关于新时代中国特色社会主义思想，下列说法正确的是：",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                        QuestionNode(
+                            source_number="2",
+                            stem="（2025·联考）关于高质量发展的理解，下列说法错误的是：",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                        QuestionNode(
+                            source_number="1",
+                            stem="（2025·上海）下列关于马克思主义哲学的说法不正确的是：",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        annotate_project_quality(project)
+        reset_question = project.sections[0].questions[2]
+
+        self.assertNotIn("number_order", {issue.code for issue in reset_question.review_issues})
+
+    def test_annotate_project_quality_ignores_politics_reset_to_small_number(self):
+        project = ExamProject(
+            title="政治理论题本",
+            sections=[
+                Section(
+                    kind="politics",
+                    title="政治理论",
+                    questions=[
+                        QuestionNode(
+                            source_number="29",
+                            stem="（2025·北京）上一章节的最后一道题。",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                        QuestionNode(
+                            source_number="10",
+                            stem="（2025·江苏）新章节重新编号后的题目。",
+                            options=[
+                                OptionNode(letter="A", text="甲"),
+                                OptionNode(letter="B", text="乙"),
+                                OptionNode(letter="C", text="丙"),
+                                OptionNode(letter="D", text="丁"),
+                            ],
+                        ),
+                    ],
+                )
+            ],
+        )
+
+        annotate_project_quality(project)
+        reset_question = project.sections[0].questions[1]
+
+        self.assertNotIn("number_order", {issue.code for issue in reset_question.review_issues})
 
     def test_annotate_project_quality_flags_empty_material(self):
         project = ExamProject(
