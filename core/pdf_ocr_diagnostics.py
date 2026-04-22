@@ -22,6 +22,8 @@ _QUESTION_OCR_ISSUE_CODES = {
     "number_order",
     "duplicate_number",
 }
+_OCR_PROBE_PAGE_LIMIT = 3
+_OCR_PROBE_SAMPLE_CHARS = 80
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,20 @@ class OCRQuestionSample:
         }
 
 
+@dataclass(frozen=True)
+class OCRRecoveryPreview:
+    page_number: int
+    sample_text: str
+    line_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "page_number": self.page_number,
+            "sample_text": self.sample_text,
+            "line_count": self.line_count,
+        }
+
+
 @dataclass
 class PDFOCRDiagnosticReport:
     pdf_path: str = ""
@@ -73,6 +89,8 @@ class PDFOCRDiagnosticReport:
     fitz_available: bool = False
     likely_scanned_pdf: bool = False
     likely_ocr_noise: bool = False
+    ocr_available: bool = False
+    ocr_recoverable_samples: list[OCRRecoveryPreview] = field(default_factory=list)
     issues: list[OCRDiagnosticIssue] = field(default_factory=list)
     question_samples: list[OCRQuestionSample] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
@@ -92,6 +110,10 @@ class PDFOCRDiagnosticReport:
             "fitz_available": self.fitz_available,
             "likely_scanned_pdf": self.likely_scanned_pdf,
             "likely_ocr_noise": self.likely_ocr_noise,
+            "ocr_available": self.ocr_available,
+            "ocr_recoverable_samples": [
+                preview.to_dict() for preview in self.ocr_recoverable_samples
+            ],
             "issues": [issue.to_dict() for issue in self.issues],
             "question_samples": [sample.to_dict() for sample in self.question_samples],
             "suggestions": list(self.suggestions),
@@ -110,6 +132,8 @@ class PDFOCRDiagnosticReport:
             parts.append(f"碎字/乱码 {self.suspicious_text_questions} 题")
         if self.fragmented_questions:
             parts.append(f"结构碎裂 {self.fragmented_questions} 题")
+        if self.ocr_recoverable_samples:
+            parts.append(f"OCR 预览 {len(self.ocr_recoverable_samples)} 页")
         return "；".join(parts)
 
 
@@ -187,28 +211,74 @@ def _collect_pdf_page_signals(pdf_path: str | None) -> dict[str, Any]:
     page_count = 0
     low_text_pages = 0
     image_dominant_pages = 0
+    image_dominant_page_numbers: list[int] = []
     with fitz.open(path) as doc:
         page_count = len(doc)
-        for page in doc:
+        for page_index, page in enumerate(doc):
             text_len = len((page.get_text("text") or "").strip())
             image_count = len(page.get_images(full=True))
             if text_len < 24:
                 low_text_pages += 1
             if image_count > 0 and text_len < 40:
                 image_dominant_pages += 1
+                image_dominant_page_numbers.append(page_index + 1)
     return {
         "fitz_available": True,
         "page_count": page_count,
         "low_text_pages": low_text_pages,
         "image_dominant_pages": image_dominant_pages,
+        "image_dominant_page_numbers": image_dominant_page_numbers,
     }
 
 
-def diagnose_project_ocr_risks(project: ExamProject, *, pdf_path: str | None = None) -> PDFOCRDiagnosticReport:
+def _probe_ocr_recovery(
+    pdf_path: str | None,
+    page_numbers: list[int],
+    *,
+    limit: int = _OCR_PROBE_PAGE_LIMIT,
+) -> list[OCRRecoveryPreview]:
+    if not pdf_path or not page_numbers:
+        return []
+    from core.pdf_ocr_engine import is_ocr_available, ocr_pdf_page
+
+    if not is_ocr_available():
+        return []
+    previews: list[OCRRecoveryPreview] = []
+    for page_number in page_numbers[:limit]:
+        lines = ocr_pdf_page(pdf_path, page_number)
+        if not lines:
+            continue
+        joined = " ".join(line.text.strip() for line in lines if line.text.strip())
+        sample = joined[:_OCR_PROBE_SAMPLE_CHARS]
+        if len(joined) > _OCR_PROBE_SAMPLE_CHARS:
+            sample = sample.rstrip() + "..."
+        previews.append(
+            OCRRecoveryPreview(
+                page_number=page_number,
+                sample_text=sample,
+                line_count=len(lines),
+            )
+        )
+    return previews
+
+
+def diagnose_project_ocr_risks(
+    project: ExamProject,
+    *,
+    pdf_path: str | None = None,
+    include_ocr_probe: bool = False,
+) -> PDFOCRDiagnosticReport:
+    """对当前 ExamProject 做扫描/OCR 风险诊断。
+
+    ``include_ocr_probe=True`` 时，若判定为扫描版且 OCR 引擎可用，会在前若干张
+    图像主导页上跑一遍 OCR，用结果样本填充 ``ocr_recoverable_samples``。
+    该选项会显著增加耗时（每页 ~1-3s CPU），默认关闭。
+    """
     quality = annotate_project_quality(project)
-    page_signals = _collect_pdf_page_signals(pdf_path or project.source.pdf_path)
+    resolved_pdf_path = pdf_path or project.source.pdf_path
+    page_signals = _collect_pdf_page_signals(resolved_pdf_path)
     report = PDFOCRDiagnosticReport(
-        pdf_path=str(pdf_path or project.source.pdf_path or ""),
+        pdf_path=str(resolved_pdf_path or ""),
         question_count=quality.question_count,
         flagged_questions=quality.flagged_questions,
         severe_questions=quality.severe_questions,
@@ -325,6 +395,33 @@ def diagnose_project_ocr_risks(project: ExamProject, *, pdf_path: str | None = N
             )
         )
         report.suggestions.append("图片题较多时，建议在 GUI 里逐题查看题干图和选项图。")
+
+    try:
+        from core.pdf_ocr_engine import is_ocr_available
+
+        report.ocr_available = is_ocr_available()
+    except Exception:
+        report.ocr_available = False
+
+    if report.likely_scanned_pdf and not report.ocr_available:
+        report.suggestions.append(
+            "扫描版 PDF 建议安装 OCR 引擎（pip install -r requirements-ocr.txt），"
+            "以便后续自动回收文字。"
+        )
+
+    if include_ocr_probe and report.likely_scanned_pdf and report.ocr_available:
+        raw_page_numbers = page_signals.get("image_dominant_page_numbers") or []
+        probe_page_numbers = [int(pn) for pn in raw_page_numbers if int(pn) > 0]
+        report.ocr_recoverable_samples = _probe_ocr_recovery(
+            resolved_pdf_path,
+            probe_page_numbers,
+        )
+        if report.ocr_recoverable_samples:
+            report.suggestions.append(
+                f"已通过 OCR 预览回收 {len(report.ocr_recoverable_samples)} 页文字，"
+                "后续可作为扫描版重建的依据。"
+            )
+
     if not report.suggestions:
         report.suggestions.append("当前没有明显的扫描/OCR 高风险信号，仍建议抽查待确认题。")
 
@@ -347,8 +444,13 @@ def auto_repair_ocr_project(
     service: AIRepairService | None = None,
     only_flagged: bool = True,
     limit: int = 18,
+    include_ocr_probe: bool = True,
 ) -> OCRAutoRepairSummary:
-    diagnostics_before = diagnose_project_ocr_risks(project, pdf_path=pdf_path)
+    diagnostics_before = diagnose_project_ocr_risks(
+        project,
+        pdf_path=pdf_path,
+        include_ocr_probe=include_ocr_probe,
+    )
     section_subject_changes = apply_all_safe_subject_suggestions(project)
     annotate_project_quality(project)
     repair_service = service or AIRepairService(mode="policy")
@@ -358,7 +460,11 @@ def auto_repair_ocr_project(
         only_flagged=only_flagged,
         limit=limit,
     )
-    diagnostics_after = diagnose_project_ocr_risks(project, pdf_path=pdf_path)
+    diagnostics_after = diagnose_project_ocr_risks(
+        project,
+        pdf_path=pdf_path,
+        include_ocr_probe=include_ocr_probe,
+    )
     return OCRAutoRepairSummary(
         diagnostics_before=diagnostics_before,
         diagnostics_after=diagnostics_after,
