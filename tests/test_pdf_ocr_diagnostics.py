@@ -132,12 +132,20 @@ class OCRProbeFieldTest(unittest.TestCase):
 
     def test_default_does_not_run_probe(self):
         project = self._build_image_only_project()
-        with patch(
-            "core.pdf_ocr_diagnostics._probe_ocr_recovery"
-        ) as probe_mock:
+        with (
+            patch("core.pdf_ocr_engine.is_ocr_dependency_available", return_value=True)
+            as dependency_mock,
+            patch(
+                "core.pdf_ocr_engine.is_ocr_available",
+                side_effect=AssertionError("default diagnosis should not load OCR"),
+            ),
+            patch("core.pdf_ocr_diagnostics._probe_ocr_recovery") as probe_mock,
+        ):
             report = diagnose_project_ocr_risks(project)
+        dependency_mock.assert_called_once()
         probe_mock.assert_not_called()
         self.assertTrue(report.likely_scanned_pdf)
+        self.assertTrue(report.ocr_available)
         self.assertEqual(report.ocr_recoverable_samples, [])
 
     def test_probe_skipped_when_engine_unavailable(self):
@@ -181,7 +189,7 @@ class OCRProbeFieldTest(unittest.TestCase):
 
     def test_report_to_dict_contains_new_fields(self):
         project = self._build_image_only_project()
-        with patch("core.pdf_ocr_engine.is_ocr_available", return_value=False):
+        with patch("core.pdf_ocr_engine.is_ocr_dependency_available", return_value=False):
             report = diagnose_project_ocr_risks(project)
         payload = report.to_dict()
         self.assertIn("ocr_available", payload)

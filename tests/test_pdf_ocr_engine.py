@@ -12,6 +12,7 @@ from core.pdf_ocr_engine import (
     _parse_rapidocr_result,
     clear_ocr_cache,
     is_ocr_available,
+    is_ocr_dependency_available,
     ocr_pdf_page,
     synthesize_text_segments,
 )
@@ -54,6 +55,21 @@ class IsOCRAvailableTest(unittest.TestCase):
         with patch.dict("os.environ", {pdf_ocr_engine._DISABLE_ENV: "1"}, clear=False):
             pdf_ocr_engine.reset_engine_cache()
             self.assertFalse(is_ocr_available())
+            self.assertFalse(is_ocr_dependency_available())
+
+    def test_dependency_check_does_not_load_engine(self):
+        with (
+            patch.object(
+                pdf_ocr_engine,
+                "_load_engine",
+                side_effect=AssertionError("dependency check should stay lightweight"),
+            ),
+            patch(
+                "core.pdf_ocr_engine.importlib.util.find_spec",
+                return_value=object(),
+            ),
+        ):
+            self.assertTrue(is_ocr_dependency_available())
 
 
 class SynthesizeTextSegmentsTest(unittest.TestCase):
@@ -205,6 +221,31 @@ class CachePathHelpersTest(unittest.TestCase):
         self.assertIn("abc123", path_a.name)
         self.assertIn("p7", path_a.name)
         self.assertIn("dpi220", path_a.name)
+
+    def test_fingerprint_uses_nanosecond_mtime(self):
+        class FakeStat:
+            st_size = 1234
+
+            def __init__(self, mtime_ns: int):
+                self.st_mtime_ns = mtime_ns
+
+        class FakePdfPath:
+            def __init__(self):
+                self._stats = [
+                    FakeStat(1_700_000_000_000_000_001),
+                    FakeStat(1_700_000_000_000_000_999),
+                ]
+
+            def stat(self):
+                return self._stats.pop(0)
+
+            def resolve(self):
+                return "C:/sample.pdf"
+
+        fake_pdf = FakePdfPath()
+        fingerprint_a = _fingerprint_pdf(fake_pdf)  # type: ignore[arg-type]
+        fingerprint_b = _fingerprint_pdf(fake_pdf)  # type: ignore[arg-type]
+        self.assertNotEqual(fingerprint_a, fingerprint_b)
 
 
 if __name__ == "__main__":

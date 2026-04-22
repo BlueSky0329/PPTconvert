@@ -397,9 +397,11 @@ def diagnose_project_ocr_risks(
         report.suggestions.append("图片题较多时，建议在 GUI 里逐题查看题干图和选项图。")
 
     try:
-        from core.pdf_ocr_engine import is_ocr_available
+        from core.pdf_ocr_engine import is_ocr_available, is_ocr_dependency_available
 
-        report.ocr_available = is_ocr_available()
+        report.ocr_available = (
+            is_ocr_available() if include_ocr_probe else is_ocr_dependency_available()
+        )
     except Exception:
         report.ocr_available = False
 

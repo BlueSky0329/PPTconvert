@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -96,6 +97,16 @@ def _load_engine() -> Any:
     return _ENGINE_CACHE
 
 
+def is_ocr_dependency_available() -> bool:
+    """只检查可选 OCR 包是否存在，不初始化模型。"""
+    if _ocr_disabled_via_env():
+        return False
+    try:
+        return importlib.util.find_spec("rapidocr_onnxruntime") is not None
+    except Exception:
+        return False
+
+
 def is_ocr_available() -> bool:
     return _load_engine() is not None
 
@@ -108,7 +119,7 @@ def reset_engine_cache() -> None:
 
 def _fingerprint_pdf(pdf_path: Path) -> str:
     stat = pdf_path.stat()
-    raw = f"{pdf_path.resolve()}|{stat.st_size}|{int(stat.st_mtime)}".encode("utf-8")
+    raw = f"{pdf_path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8")
     return hashlib.md5(raw).hexdigest()
 
 
