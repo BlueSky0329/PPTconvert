@@ -13,6 +13,7 @@ from PIL import Image, ImageFilter
 from core import pdf_exam_extract as pdf_extract
 from core.pdf_exam_extract import ExtractedImageRegion, extract_pdf_line_items_with_metadata
 from core.pdf_exam_models import ObjectiveSection, ParsedExam, RichLine
+from core.explanation_filter import filter_explanation_questions
 from core.pdf_exam_parse import parse_line_items
 from core.project_quality import annotate_project_quality
 from core.subject_inference import preferred_subject_title, should_merge_subject_sections
@@ -2416,7 +2417,30 @@ def build_exam_project_from_pdf(
     asset_dir: Optional[str] = None,
     document_subject_hint: SubjectKind | None = None,
 ) -> ExamProject:
-    items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
+    from core.pdf_ocr_engine import is_ocr_available
+    from ingest.pdf.ocr_ingest import looks_scanned, ocr_line_items
+
+    temp_dir: Optional[str] = None
+    image_regions: Mapping = {}
+    scanned_notice: Optional[str] = None
+    use_native_layout = True
+    if looks_scanned(pdf_path):
+        # 扫描件无文字层：原生抽取会得到 0 题，改用本地 OCR 兜底。
+        if is_ocr_available():
+            items = ocr_line_items(pdf_path)
+            use_native_layout = False
+            scanned_notice = (
+                "已识别为扫描件：已用本地 OCR 抽取文字（图片与精确版式可能不完整，"
+                "请重点核对题干与选项）。"
+            )
+        else:
+            items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
+            scanned_notice = (
+                "⚠ 这份 PDF 像扫描件且无文字层，但未安装 OCR：执行 "
+                "pip install -r requirements-ocr.txt 后重试可显著改善识别。"
+            )
+    else:
+        items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
     try:
         exam = parse_line_items(
             items,
@@ -2424,15 +2448,23 @@ def build_exam_project_from_pdf(
             document_subject_hint=document_subject_hint,
             source_name=os.path.basename(pdf_path),
         )  # type: ignore[arg-type]
-        layout_lines = extract_pdf_text_lines(pdf_path)
+        layout_lines = extract_pdf_text_lines(pdf_path) if use_native_layout else []
         project = build_project_from_parsed_exam(
             exam,
             source_pdf_path=pdf_path,
             layout_lines=layout_lines,
             image_regions=image_regions,
         )
+        # 剥离"真题+解析"合订版 / 纯答案册里被误当题目的解析条目。
+        # 干净卷无解析条目，此步为 no-op；只有改动后才重算质检。
+        filter_info = filter_explanation_questions(project)
+        if scanned_notice:
+            project.import_notices.append(scanned_notice)
+        if filter_info.get("category") != "clean":
+            annotate_project_quality(project)
         target_asset_dir = asset_dir or tempfile.mkdtemp(prefix="pptconvert_project_assets_")
         _materialize_project_assets(project, target_asset_dir)
         return project
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)

@@ -151,6 +151,9 @@ class ExamProject:
     selected_ranges: list[QuestionRange] = field(default_factory=list)
     repair_session_id: str = ""
     repair_log: list["RepairLogEntry"] = field(default_factory=list)
+    # 导入期面向用户的提示（如"这是答案册，请改用试卷文件"）。属于本次导入事件，
+    # 不随工程长期保存——manifest 回载时不恢复。
+    import_notices: list[str] = field(default_factory=list)
 
     def iter_questions(self):
         for section in self.sections:
