@@ -302,7 +302,8 @@ def _is_boilerplate_line(line: str) -> bool:
         return True
     if _REASONING_SUBSECTION_TITLE.match(s):
         return True
-    if "参考时限" in s and "共" in s and "题" in s:
+    # 「数量关系(共15 题，参考时限…)」带科目名的是篇题，不能当 boilerplate 跳过。
+    if "参考时限" in s and "共" in s and "题" in s and not _detect_subject_section_kind(s):
         return True
     if s.startswith("请开始答题"):
         return True
@@ -1062,6 +1063,9 @@ def _is_subject_section_title(line: str, kind: SubjectKind) -> bool:
     if re.match(rf"^[{_CN_NUM}\d]+\s*[、．。.]?\s*(?:{label_pattern})", s):
         return True
     if re.match(rf"^[（(]\s*[一二三四五六七八九十\d]+\s*[）)]\s*(?:{label_pattern})", s):
+        return True
+    # 「数量关系(共15 题，参考时限15 分钟)」式篇题：科目名后紧跟「(共N题…」。
+    if re.match(rf"^(?:{label_pattern})\s*[（(]\s*共\s*\d+\s*[题道]", s):
         return True
     if len(s) <= 36:
         core = re.sub(r"[\s「」〖〗\[\]（）():：共\d题项道\s]+", "", s)
