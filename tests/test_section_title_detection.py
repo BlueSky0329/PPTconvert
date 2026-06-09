@@ -26,6 +26,11 @@ class CountSuffixSectionTitleTest(unittest.TestCase):
         self.assertTrue(_is_boilerplate_line("(共15 题，参考时限15 分钟)"))
         self.assertIsNone(_detect_subject_section_kind("(共15 题，参考时限15 分钟)"))
 
+    def test_quant_section_aliases(self):
+        # 老上海卷用「数理能力」指代数量关系
+        self.assertEqual(_detect_subject_section_kind("数理能力"), "quant")
+        self.assertEqual(_detect_subject_section_kind("数理能力(共20 题，参考时限20 分钟)"), "quant")
+
     def test_count_suffix_across_subjects(self):
         for line, kind in [
             ("言语理解与表达(共40 题，参考时限35 分钟)", "verbal"),

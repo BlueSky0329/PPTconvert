@@ -268,7 +268,7 @@ _SECTION_LABELS: dict[SubjectKind, tuple[str, ...]] = {
     "politics": ("政治理论",),
     "common_sense": ("常识判断",),
     "verbal": ("言语理解与表达", "言语理解和表达"),
-    "quant": ("数量关系",),
+    "quant": ("数量关系", "数理能力", "数学能力"),
     "reasoning": ("判断推理",),
     "data": ("资料分析",),
 }
