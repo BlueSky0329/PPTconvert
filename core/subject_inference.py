@@ -45,6 +45,10 @@ _KEYWORDS: dict[SubjectKind, tuple[str, ...]] = {
         "党内",
         "社会主义",
         "马克思主义",
+        "马克思",
+        "恩格斯",
+        "列宁",
+        "毛泽东",
         "二十大",
         "民族复兴",
         "党章",
@@ -305,6 +309,39 @@ _POLITICS_ANCHORS: tuple[str, ...] = (
     "高质量发展",
     "全面依法治国",
     "马克思主义",
+    "二十大",
+    "十九大",
+    "二十届",
+    "党中央",
+    "党的创新理论",
+    "新时代中国特色社会主义思想",
+    "恩格斯",
+    "毛泽东",
+    "全面从严治党",
+    "新发展理念",
+)
+# 几乎只出现在政治理论题里的强锚点：命中即给 politics 一个无条件底分，
+# 不依赖选项结构，修复"政治题被单向冲进常识/言语/unknown"的漏判。
+_STRONG_POLITICS_ANCHORS: tuple[str, ...] = (
+    "习近平",
+    "总书记",
+    "二十大",
+    "十九大",
+    "二十届",
+    "党中央",
+    "中共中央",
+    "中央一号文件",
+    "中央经济工作会议",
+    "中央政治局",
+    "政府工作报告",
+    "党的创新理论",
+    "新时代中国特色社会主义思想",
+    "马克思主义",
+    "恩格斯",
+    "毛泽东",
+    "全面从严治党",
+    "全面依法治国",
+    "中国式现代化",
 )
 _LEGAL_SCENARIO_MARKERS: tuple[str, ...] = (
     "根据我国",
@@ -1560,7 +1597,19 @@ def infer_subject_diagnostics(
         _append_signal(matched_signals, "common_sense", "知识判断型选项")
     politics_anchor_count = sum(1 for marker in _POLITICS_ANCHORS if marker and marker in full_text)
     politics_anchor = politics_anchor_count >= 1
-    strong_politics_anchor = politics_anchor_count >= 2 or ("习近平" in full_text and "总书记" in full_text)
+    has_strong_politics_anchor = any(marker in full_text for marker in _STRONG_POLITICS_ANCHORS)
+    strong_politics_anchor = (
+        has_strong_politics_anchor
+        or politics_anchor_count >= 2
+        or ("习近平" in full_text and "总书记" in full_text)
+    )
+    # 强政治锚点（习近平/党的二十大/中央文件/马克思…）几乎只出现在政治题里，
+    # 给一个不依赖选项结构的底分，并压低常识/言语，修复政治题单向漏判。
+    if has_strong_politics_anchor:
+        scores["politics"] += 2.0
+        scores["common_sense"] -= 0.8
+        scores["verbal"] -= 1.2
+        _append_signal(matched_signals, "politics", "政治强锚点")
     if politics_anchor and (statement_option_count >= 3 or combo_option_count >= 3):
         scores["politics"] += 1.1 if strong_politics_anchor else 0.9
         _append_signal(matched_signals, "politics", "政策理论判断")
