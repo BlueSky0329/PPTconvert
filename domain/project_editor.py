@@ -505,6 +505,29 @@ def move_question_to_kind(project: ExamProject, question: QuestionNode, target_k
     return True
 
 
+def move_question_in_container(project: ExamProject, question: QuestionNode, direction: int) -> bool:
+    """在同一篇题 / 材料内上移(-1)或下移(1)一道题，修正切题后的题序。返回是否成功。"""
+    if direction not in (-1, 1):
+        return False
+    container, index, _section, _material = _question_container(project, question)
+    if container is None:
+        return False
+    target_index = index + direction
+    if target_index < 0 or target_index >= len(container):
+        return False
+    container[index], container[target_index] = container[target_index], container[index]
+    return True
+
+
+def set_question_answer(question: QuestionNode, answer: str | None) -> None:
+    """设置 / 清空题目答案，只保留 A-Z 字母并去重（如 "a, b" -> "AB"，空 -> None）。"""
+    letters: list[str] = []
+    for char in (answer or "").upper():
+        if "A" <= char <= "Z" and char not in letters:
+            letters.append(char)
+    question.answer = "".join(letters) or None
+
+
 def insert_material_after(project: ExamProject, target: MaterialSet, header: str = "新材料") -> bool:
     for section in project.sections:
         if section.kind != "data":
