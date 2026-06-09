@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 import unittest
 
-from domain.models import AssetRef, ExamProject, OptionNode, QuestionNode, Section
+from domain.models import AssetRef, ExamProject, MaterialSet, OptionNode, QuestionNode, Section
 from domain.project_editor import (
     move_question_in_container,
     reassign_stem_assets_to_options,
+    set_material_body,
     set_question_answer,
 )
 
@@ -52,6 +53,16 @@ class ReassignStemToOptionsTest(unittest.TestCase):
         self.assertEqual(changed, 4)
         self.assertEqual([o.image_path for o in q.options], ["/img0.png", "/img1.png", "/img2.png", "/img3.png"])
         self.assertEqual(q.stem_assets, [])
+
+
+class SetMaterialBodyTest(unittest.TestCase):
+    def test_replace_material_body(self):
+        material = MaterialSet(material_id="m1", header="材料一", body="旧正文", body_lines=["旧正文"])
+        set_material_body(material, "新正文第一行\n新正文第二行")
+        self.assertIn("新正文第一行", material.body)
+        self.assertIn("新正文第二行", material.body)
+        self.assertNotIn("旧正文", material.body)
+        self.assertEqual(material.body_lines, ["新正文第一行", "新正文第二行"])
 
 
 if __name__ == "__main__":

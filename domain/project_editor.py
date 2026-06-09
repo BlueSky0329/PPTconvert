@@ -230,6 +230,12 @@ def rename_material(material: MaterialSet, new_header: str) -> None:
     material.header = (new_header or "").strip()
 
 
+def set_material_body(material: MaterialSet, text: str) -> None:
+    """整体替换资料分析材料正文（同步 body 与 body_lines），用于修正材料文字 / OCR 误识。"""
+    material.body_lines = (text or "").splitlines()
+    _refresh_material_body(material)
+
+
 def prepend_material_body_text(material: MaterialSet, text: str) -> bool:
     normalized = (text or "").strip()
     if not normalized:
