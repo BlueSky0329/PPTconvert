@@ -382,6 +382,129 @@ def locate_question(project: ExamProject, target: QuestionNode) -> tuple[Optiona
     return None, None
 
 
+def _question_container(
+    project: ExamProject, target: QuestionNode
+) -> tuple[Optional[list[QuestionNode]], int, Optional[Section], Optional[MaterialSet]]:
+    """返回承载 target 的题目列表、下标、所属 section / material。找不到返回 (None, -1, None, None)。"""
+    for section in project.sections:
+        if section.kind == "data":
+            for material in section.material_sets:
+                if target in material.questions:
+                    return material.questions, material.questions.index(target), section, material
+        else:
+            if target in section.questions:
+                return section.questions, section.questions.index(target), section, None
+    return None, -1, None, None
+
+
+def split_question_options(
+    project: ExamProject,
+    question: QuestionNode,
+    split_index: int,
+    *,
+    new_number: str = "",
+    new_stem: str = "",
+) -> Optional[QuestionNode]:
+    """把 ``question`` 第 ``split_index``（0-based）及之后的选项拆成新的一道题，插在其后。
+
+    用于切题把两道题的选项粘连成一题的情形。新题题干由调用方给（可空，留给用户填）。
+    答案保序：仍留在原题的答案选项归原题、被移走的归新题。返回新题或 None。
+    """
+    container, index, _section, _material = _question_container(project, question)
+    if container is None:
+        return None
+    options = question.options or []
+    if split_index <= 0 or split_index >= len(options):
+        return None
+    matched, unmatched = _capture_answer_targets(question)
+    moved = options[split_index:]
+    question.options = options[:split_index]
+    new_question = QuestionNode(
+        source_number=(new_number or "").strip(),
+        stem=(new_stem or "").strip(),
+        options=moved,
+    )
+    _reletter_options(question)
+    _reletter_options(new_question)
+    _restore_answer_targets(question, [opt for opt in matched if opt in question.options], unmatched)
+    _restore_answer_targets(new_question, [opt for opt in matched if opt in new_question.options], [])
+    container.insert(index + 1, new_question)
+    return new_question
+
+
+def merge_with_next_question(project: ExamProject, question: QuestionNode) -> bool:
+    """把同一容器内的下一题合并进 ``question``（题干拼接、选项/题干图/页码追加），删除下一题。
+
+    用于切题把一道题（常因跨页）拆成两题的情形。答案保序。返回是否合并成功。
+    """
+    container, index, _section, _material = _question_container(project, question)
+    if container is None or index + 1 >= len(container):
+        return False
+    nxt = container[index + 1]
+    current_matched, current_unmatched = _capture_answer_targets(question)
+    next_matched, next_unmatched = _capture_answer_targets(nxt)
+    next_stem = (nxt.stem or "").strip()
+    if next_stem:
+        base_stem = (question.stem or "").strip()
+        question.stem = (base_stem + ("　" if base_stem else "") + next_stem).strip()
+    question.options.extend(nxt.options)
+    question.stem_assets.extend(nxt.stem_assets)
+    seen_pages = set(question.page_numbers)
+    for page in nxt.page_numbers:
+        if page not in seen_pages:
+            question.page_numbers.append(page)
+            seen_pages.add(page)
+    _reletter_options(question)
+    _restore_answer_targets(
+        question,
+        current_matched + next_matched,
+        current_unmatched + next_unmatched,
+    )
+    container.remove(nxt)
+    _cleanup_project(project)
+    return True
+
+
+def insert_blank_question_after(project: ExamProject, target: QuestionNode) -> Optional[QuestionNode]:
+    """在 ``target`` 之后插入一道空白题（4 个空选项），供手动补录被漏识别的整道题。"""
+    container, index, _section, _material = _question_container(project, target)
+    if container is None:
+        return None
+    new_question = QuestionNode(
+        source_number="",
+        stem="",
+        options=[OptionNode(letter=letter, text="") for letter in "ABCD"],
+    )
+    container.insert(index + 1, new_question)
+    return new_question
+
+
+def move_question_to_kind(project: ExamProject, question: QuestionNode, target_kind: str) -> bool:
+    """把单道客观题移到目标科目的篇题（没有则新建），用于单题分错科目。
+
+    不支持 data（资料分析题靠材料组织，应走跨材料移动）。返回是否成功。
+    """
+    normalized = (target_kind or "").strip().lower()
+    if normalized in ("", "data"):
+        return False
+    container, _index, section, material = _question_container(project, question)
+    if container is None or material is not None or section is None:
+        return False
+    if section.kind == normalized:
+        return False
+    container.remove(question)
+    target = next(
+        (sec for sec in project.sections if sec.kind == normalized and not sec.material_sets),
+        None,
+    )
+    if target is None:
+        target = Section(kind=normalized, title=SUBJECT_DISPLAY_NAMES.get(normalized, "未知科目"))
+        project.sections.append(target)
+    target.questions.append(question)
+    _cleanup_project(project)
+    return True
+
+
 def insert_material_after(project: ExamProject, target: MaterialSet, header: str = "新材料") -> bool:
     for section in project.sections:
         if section.kind != "data":
