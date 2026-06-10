@@ -95,9 +95,23 @@ class MetaFieldExtractor(BaseEstimator, TransformerMixin):
         return [dict((row or {}).get(self.field, {}) or {}) for row in X]
 
 
+_RESOLVE_CACHE: dict[str, Path] = {}
+
+
+def _resolve_cached(path: Path) -> Path:
+    """resolve() 是热路径上最贵的文件系统调用；同一路径字符串在单次运行内不会变。
+    门控决策（env / 可信目录比较）仍每次现算，测试改环境后行为不受影响。"""
+    key = str(path)
+    cached = _RESOLVE_CACHE.get(key)
+    if cached is None:
+        cached = path.resolve()
+        _RESOLVE_CACHE[key] = cached
+    return cached
+
+
 def _is_default_model_path(path: Path) -> bool:
     try:
-        return path.resolve() == _DEFAULT_MODEL_PATH.resolve()
+        return _resolve_cached(path) == _resolve_cached(_DEFAULT_MODEL_PATH)
     except Exception:
         return False
 
@@ -113,7 +127,7 @@ def _pickle_model_loading_enabled(path: Path) -> bool:
 
 def _is_trusted_model_path(path: Path) -> bool:
     try:
-        resolved = path.resolve()
+        resolved = _resolve_cached(path)
     except Exception:
         return False
     if os.environ.get("PPTCONVERT_TRUST_SUBJECT_MODEL", "").strip() == "1":
@@ -214,7 +228,7 @@ def _load_bundle(model_path: Path | None = None) -> dict[str, Any] | None:
         return None
     if not _is_trusted_model_path(path):
         return None
-    key = (str(path.resolve()), path.stat().st_mtime)
+    key = (str(_resolve_cached(path)), path.stat().st_mtime)
     if _CACHE_KEY == key:
         return _CACHE_BUNDLE
     try:
@@ -229,6 +243,10 @@ def _load_bundle(model_path: Path | None = None) -> dict[str, Any] | None:
     _CACHE_KEY = key
     _CACHE_BUNDLE = bundle
     return bundle
+
+
+_PREDICTION_CACHE: dict[tuple, "LearnedSubjectPrediction | None"] = {}
+_PREDICTION_CACHE_MAX = 8192
 
 
 def predict_subject_distribution(
@@ -254,6 +272,15 @@ def predict_subject_distribution(
         image_count=image_count,
         material_header=material_header,
     )
+    # 同一道题在解析与质检阶段会重复推断；sklearn 单样本调用固定开销大，
+    # 按 (模型版本, 特征内容) 缓存结果。模型换文件 / 重训后 _CACHE_KEY 变化即失效。
+    cache_key = (
+        _CACHE_KEY,
+        record.get("text", ""),
+        tuple(sorted((record.get("meta") or {}).items())),
+    )
+    if cache_key in _PREDICTION_CACHE:
+        return _PREDICTION_CACHE[cache_key]
     try:
         if hasattr(model, "predict_proba"):
             probs = list(model.predict_proba([record])[0])
@@ -271,4 +298,8 @@ def predict_subject_distribution(
         label: max(0.0, min(1.0, float(prob)))
         for label, prob in zip(labels, probs)
     }
-    return LearnedSubjectPrediction(probabilities=probabilities)
+    prediction = LearnedSubjectPrediction(probabilities=probabilities)
+    if len(_PREDICTION_CACHE) >= _PREDICTION_CACHE_MAX:
+        _PREDICTION_CACHE.clear()
+    _PREDICTION_CACHE[cache_key] = prediction
+    return prediction

@@ -33,7 +33,10 @@ def _normalize_text(text: str) -> str:
     return unicodedata.normalize("NFKC", (text or "").strip())
 
 
-def extract_pdf_text_lines(pdf_path: str) -> list[PageTextLine]:
+def extract_pdf_text_lines(
+    pdf_path: str,
+    page_dict_cache: dict[int, dict] | None = None,
+) -> list[PageTextLine]:
     legacy_extract.require_fitz()
     if legacy_extract.fitz is None:  # pragma: no cover
         return []
@@ -43,7 +46,8 @@ def extract_pdf_text_lines(pdf_path: str) -> list[PageTextLine]:
     try:
         for page_index in range(len(doc)):
             page = doc[page_index]
-            data = page.get_text("dict")
+            # 复用抽取阶段缓存的每页文本字典，缺页时回退现取。
+            data = (page_dict_cache or {}).get(page_index) or page.get_text("dict")
             blocks = legacy_extract._order_page_blocks(page, list(data.get("blocks") or []))
             for block in blocks:
                 if block.get("type") != 0:

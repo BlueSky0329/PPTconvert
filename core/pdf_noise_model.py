@@ -111,9 +111,22 @@ def _keyword_count(text: str, needles: tuple[str, ...]) -> int:
     return sum(1 for needle in needles if needle and needle in text)
 
 
+_RESOLVE_CACHE: dict[str, Path] = {}
+
+
+def _resolve_cached(path: Path) -> Path:
+    """resolve() 在每个噪声候选上都会被调用；同一路径在单次运行内不会变。"""
+    key = str(path)
+    cached = _RESOLVE_CACHE.get(key)
+    if cached is None:
+        cached = path.resolve()
+        _RESOLVE_CACHE[key] = cached
+    return cached
+
+
 def _is_default_model_path(path: Path) -> bool:
     try:
-        return path.resolve() == _DEFAULT_MODEL_PATH.resolve()
+        return _resolve_cached(path) == _resolve_cached(_DEFAULT_MODEL_PATH)
     except Exception:
         return False
 
@@ -129,7 +142,7 @@ def _pickle_model_loading_enabled(path: Path) -> bool:
 
 def _is_trusted_model_path(path: Path) -> bool:
     try:
-        resolved = path.resolve()
+        resolved = _resolve_cached(path)
     except Exception:
         return False
     if os.environ.get(_TRUST_MODEL_ENV, "").strip() == "1":
@@ -296,7 +309,7 @@ def _load_bundle(model_path: Path | None = None) -> dict[str, Any] | None:
         return None
     if not _is_trusted_model_path(path):
         return None
-    key = (str(path.resolve()), path.stat().st_mtime)
+    key = (str(_resolve_cached(path)), path.stat().st_mtime)
     if _CACHE_KEY == key:
         return _CACHE_BUNDLE
     try:

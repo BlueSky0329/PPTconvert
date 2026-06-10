@@ -576,14 +576,23 @@ def iter_pdf_text_line_records(pdf_path: str) -> Iterator[dict[str, Any]]:
         doc.close()
 
 
+# 单次构建内可在抽取与版式两遍之间共享每页 get_text("dict") 结果；
+# 只对中小篇幅文档启用（套卷与常见单科题本），避免几百页大部头
+# 在低内存机器上撑出内存峰值。
+_PAGE_DICT_CACHE_MAX_PAGES = 120
+
+
 def extract_pdf_line_items_with_metadata(
     pdf_path: str,
     temp_dir: str | None = None,
+    page_dict_cache: dict[int, dict] | None = None,
 ) -> tuple[list[tuple[str, str | None]], str, dict[str, ExtractedImageRegion]]:
     """
     按页内块顺序提取：每个元素为 (text_line, image_path)。
     image_path 非空表示该行应插入对应图片（text 通常为空）。
     返回 (行列表, 临时目录)；临时目录内含抽取的图片，调用方可视情况 shutil.rmtree。
+    传入 page_dict_cache 时会把每页的 get_text("dict") 结果写入（小文档），
+    供随后版式抽取复用，免去第二次全量文本解析。
     """
     require_fitz()
     out_dir = temp_dir or tempfile.mkdtemp(prefix="pptconvert_pdf_")
@@ -593,11 +602,14 @@ def extract_pdf_line_items_with_metadata(
     image_regions: dict[str, ExtractedImageRegion] = {}
     doc = fitz.open(pdf_path)
     img_counter = 0
+    fill_cache = page_dict_cache is not None and len(doc) <= _PAGE_DICT_CACHE_MAX_PAGES
     try:
         for page_index in range(len(doc)):
             page = doc[page_index]
             prefix = f"p{page_index + 1}"
             data = page.get_text("dict")
+            if fill_cache:
+                page_dict_cache[page_index] = data
             blocks = _order_page_blocks(page, _merge_page_image_blocks(page, list(data.get("blocks") or [])))
             for block in blocks:
                 btype = block.get("type")

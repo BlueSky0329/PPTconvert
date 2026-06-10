@@ -2424,6 +2424,8 @@ def build_exam_project_from_pdf(
     image_regions: Mapping = {}
     scanned_notice: Optional[str] = None
     use_native_layout = True
+    # 抽取与版式两遍共享每页 get_text("dict") 结果（小文档），省一次全量文本解析。
+    page_dict_cache: dict[int, dict] = {}
     if looks_scanned(pdf_path):
         # 扫描件无文字层：原生抽取会得到 0 题，改用本地 OCR 兜底。
         if is_ocr_available():
@@ -2434,13 +2436,17 @@ def build_exam_project_from_pdf(
                 "请重点核对题干与选项）。"
             )
         else:
-            items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
+            items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(
+                pdf_path, page_dict_cache=page_dict_cache
+            )
             scanned_notice = (
                 "⚠ 这份 PDF 像扫描件且无文字层，但未安装 OCR：执行 "
                 "pip install -r requirements-ocr.txt 后重试可显著改善识别。"
             )
     else:
-        items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(pdf_path)
+        items, temp_dir, image_regions = extract_pdf_line_items_with_metadata(
+            pdf_path, page_dict_cache=page_dict_cache
+        )
     try:
         exam = parse_line_items(
             items,
@@ -2448,7 +2454,12 @@ def build_exam_project_from_pdf(
             document_subject_hint=document_subject_hint,
             source_name=os.path.basename(pdf_path),
         )  # type: ignore[arg-type]
-        layout_lines = extract_pdf_text_lines(pdf_path) if use_native_layout else []
+        layout_lines = (
+            extract_pdf_text_lines(pdf_path, page_dict_cache=page_dict_cache)
+            if use_native_layout
+            else []
+        )
+        page_dict_cache.clear()
         project = build_project_from_parsed_exam(
             exam,
             source_pdf_path=pdf_path,
